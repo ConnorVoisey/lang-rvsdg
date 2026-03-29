@@ -1,0 +1,11 @@
+[package]
+name = "lang-rvsdg"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.102"
+color-eyre = "0.6.5"
+llvm-ir = { version = "0.11.3", features = ["llvm-17"] }
+rustc-hash = "2.1.1"
+tempfile = "3.27.0"
