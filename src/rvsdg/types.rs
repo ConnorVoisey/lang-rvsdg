@@ -9,6 +9,8 @@ pub struct FuncTypeId(u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct StructId(u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct VectorTypeId(u32);
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct AliasSetId(u32);
 
 pub const BOOL: TypeRef = TypeRef::Scalar(ScalarType::Bool);
@@ -45,6 +47,7 @@ pub enum TypeRef {
     Ptr(PtrTypeId),
     Array(ArrayTypeId),
     Struct(StructId),
+    Vector(VectorTypeId),
     Func(FuncTypeId),
 }
 
@@ -59,6 +62,15 @@ pub struct PtrType {
 pub struct ArrayType {
     pub element: TypeRef,
     pub len: u64,
+}
+
+/// Fixed-width SIMD vector type (e.g. `<4 x i32>`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct VectorType {
+    /// The scalar element type (must be a scalar or pointer)
+    pub element: TypeRef,
+    /// Number of lanes
+    pub lanes: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -86,12 +98,14 @@ pub struct StructDef {
 pub struct TypeArena {
     ptrs: Vec<PtrType>,
     arrays: Vec<ArrayType>,
+    vectors: Vec<VectorType>,
     funcs: Vec<FuncType>,
     structs: Vec<StructDef>,
 
     // Deduplication: avoid inserting the same type twice
     ptr_cache: FxHashMap<PtrType, PtrTypeId>,
     array_cache: FxHashMap<ArrayType, ArrayTypeId>,
+    vector_cache: FxHashMap<VectorType, VectorTypeId>,
     func_cache: FxHashMap<FuncType, FuncTypeId>,
     struct_cache: FxHashMap<StructDef, StructId>,
 }
@@ -114,6 +128,16 @@ impl TypeArena {
         let id = ArrayTypeId(self.arrays.len() as u32);
         self.arrays.push(info.clone());
         self.array_cache.insert(info, id);
+        id
+    }
+
+    pub fn intern_vector(&mut self, info: VectorType) -> VectorTypeId {
+        if let Some(&id) = self.vector_cache.get(&info) {
+            return id;
+        }
+        let id = VectorTypeId(self.vectors.len() as u32);
+        self.vectors.push(info);
+        self.vector_cache.insert(info, id);
         id
     }
 
@@ -143,6 +167,10 @@ impl TypeArena {
 
     pub fn get_array(&self, id: ArrayTypeId) -> &ArrayType {
         &self.arrays[id.0 as usize]
+    }
+
+    pub fn get_vector(&self, id: VectorTypeId) -> &VectorType {
+        &self.vectors[id.0 as usize]
     }
 
     pub fn get_fn(&self, id: FuncTypeId) -> &FuncType {

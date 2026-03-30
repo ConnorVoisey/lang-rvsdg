@@ -4,6 +4,7 @@ use crate::rvsdg::{
     types::{ScalarType, TypeRef},
 };
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Function {
     pub id: FuncId,
     pub name: String,
@@ -17,6 +18,7 @@ pub struct Function {
     pub linkage_type: FnLinkageType,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FnLinkageType {
     Internal,
     External,
@@ -51,6 +53,8 @@ impl RVSDGMod {
         func_id: FuncId,
         rb_fn: impl FnOnce(&mut RegionBuilder, State) -> FnResult,
     ) {
+        debug_assert!(self.functions[func_id.0 as usize].lambda_val.is_none());
+
         let mut rb = RegionBuilder::new_from_func(self, func_id);
         let region_id = rb.region_id();
         let state = rb.graph.regions[region_id.0 as usize].entry_state;

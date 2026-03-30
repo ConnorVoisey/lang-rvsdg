@@ -1,27 +1,34 @@
+mod aggregate;
+mod arithmetic;
+mod control_flow;
+mod memory;
+
 use crate::rvsdg::{
-    ArithFlags, BinaryOp, ConstValue, FCmpPred, FuncId, ICmpPred, RVSDGMod, Region, RegionId,
-    State, Value, ValueId, ValueKind, ValuesSpan,
-    func::CallResult,
-    types::{BOOL, I32, I64, ScalarType, TypeRef},
+    FuncId, RVSDGMod, Region, RegionId, State, Value, ValueId, ValueKind, ValuesSpan,
+    types::TypeRef,
 };
 
 /// Passed to a branch closure — represents being inside a gamma branch
 pub struct RegionBuilder<'a> {
-    pub region: RegionId,
+    pub region_id: RegionId,
     pub graph: &'a mut RVSDGMod,
 }
+
 impl<'a> RegionBuilder<'a> {
     pub fn new_empty(graph: &'a mut RVSDGMod, entry_state: State) -> Self {
         let region = RegionId(graph.regions.len() as u32);
         graph.regions.push(Region {
-            id: region,
             params: ValuesSpan { start: 0, len: 0 },
             results: ValuesSpan { start: 0, len: 0 },
             entry_state,
             nodes: vec![],
         });
-        Self { region, graph }
+        Self {
+            region_id: region,
+            graph,
+        }
     }
+
     pub fn new_from_func(graph: &'a mut RVSDGMod, func_id: FuncId) -> Self {
         let region = RegionId(graph.regions.len() as u32);
         let param_types = &graph.functions[func_id.0 as usize].params;
@@ -56,23 +63,25 @@ impl<'a> RegionBuilder<'a> {
         });
 
         graph.regions.push(Region {
-            id: region,
             params,
             entry_state,
             results: ValuesSpan { start: 0, len: 0 },
             nodes: vec![],
         });
-        Self { region, graph }
+        Self {
+            region_id: region,
+            graph,
+        }
     }
 
     #[inline]
     pub fn region_id(&self) -> RegionId {
-        self.region
+        self.region_id
     }
 
     #[inline]
     pub fn param(&self, index: u32) -> ValueId {
-        let span = self.graph.regions[self.region.0 as usize].params;
+        let span = self.graph.regions[self.region_id.0 as usize].params;
         debug_assert!(span.len as u32 > index);
         ValueId(span.start + index)
     }
@@ -82,7 +91,6 @@ impl<'a> RegionBuilder<'a> {
     pub fn add_region(&mut self, state: State) -> RegionId {
         let id = RegionId(self.graph.regions.len() as u32);
         self.graph.regions.push(Region {
-            id,
             entry_state: state,
             params: ValuesSpan { start: 0, len: 0 },
             results: ValuesSpan { start: 0, len: 0 },
@@ -92,123 +100,89 @@ impl<'a> RegionBuilder<'a> {
     }
 
     #[inline]
-    pub fn add_value(&mut self, data: Value) -> ValueId {
+    pub(crate) fn add_value(&mut self, data: Value) -> ValueId {
         let id = ValueId(self.graph.values.len() as u32);
         self.graph.values.push(data);
+        let region = self.graph.get_region_mut(self.region_id());
+        region.nodes.push(id);
         id
     }
+}
 
-    #[inline]
-    pub fn add_const(&mut self, ty: TypeRef, const_val: ConstValue) -> ValueId {
-        // TODO: add constant dedupe here
-        self.add_value(Value {
-            ty,
-            kind: ValueKind::Const(const_val),
-        })
-    }
+// ── Result types ────────────────────────────────────────────────
 
-    #[inline]
-    pub fn add_const_i32(&mut self, val: i32) -> ValueId {
-        self.add_const(I32, ConstValue::Int(val as i64))
-    }
+pub struct LoadResult {
+    pub state: State,
+    pub value: ValueId,
+}
 
-    #[inline]
-    pub fn add_const_i64(&mut self, val: i64) -> ValueId {
-        self.add_const(I64, ConstValue::Int(val))
-    }
+pub struct AllocaResult {
+    pub state: State,
+    pub ptr: ValueId,
+}
 
-    #[inline]
-    pub fn binary(
-        &mut self,
-        op: BinaryOp,
-        flags: ArithFlags,
-        left: ValueId,
-        right: ValueId,
-        ret_type: TypeRef,
-    ) -> ValueId {
-        self.add_value(Value {
-            ty: ret_type,
-            kind: ValueKind::Binary {
-                op,
-                flags,
-                left,
-                right,
-            },
-        })
-    }
+pub struct CompareAndSwapResult {
+    pub state: State,
+    pub old_value: ValueId,
+    pub success: ValueId,
+}
 
-    #[inline]
-    pub fn icmp(&mut self, pred: ICmpPred, left: ValueId, right: ValueId) -> ValueId {
-        self.add_value(Value {
-            ty: BOOL,
-            kind: ValueKind::ICmp { pred, left, right },
-        })
-    }
+pub struct IntrinsicResult {
+    pub state: State,
+    pub value: ValueId,
+}
 
-    #[inline]
-    pub fn fcmp(&mut self, pred: FCmpPred, left: ValueId, right: ValueId) -> ValueId {
-        self.add_value(Value {
-            ty: BOOL,
-            kind: ValueKind::FCmp { pred, left, right },
-        })
-    }
-
-    #[inline]
-    pub fn gamma(
-        &mut self,
-        condition: ValueId,
-        state: State,
-        inputs: Vec<ValueId>,
-        true_branch: impl FnOnce(&mut RegionBuilder) -> BranchResult,
-        false_branch: impl FnOnce(&mut RegionBuilder) -> BranchResult,
-    ) {
-        let _true_region = self.add_region(state);
-        let _false_region = self.add_region(state);
-
-        // TODO: construct RegionBuilders for branches and wire up gamma node
-        todo!()
-    }
-
-    #[inline]
-    pub fn call(&mut self, fn_id: FuncId, state: State, args: &[ValueId]) -> CallResult {
-        let args_span = self.graph.value_pool.push_slice(args);
-
-        // call value is the state node
-        let call_val = self.add_value(Value {
-            ty: TypeRef::Scalar(ScalarType::Void),
-            kind: ValueKind::Call {
-                state,
-                fn_id,
-                args: args_span,
-            },
-        });
-        let out_state = State(call_val);
-
-        let first_res = ValueId(self.graph.values.len() as u32);
-        let ret_types = &self.graph.functions[fn_id.0 as usize].return_types;
-        let result_count = ret_types.len() as u16;
-        for i in 0..result_count {
-            let ty = self.graph.functions[fn_id.0 as usize].return_types[i as usize];
-            self.add_value(Value {
-                ty,
-                kind: ValueKind::Project {
-                    call: call_val,
-                    index: i,
-                },
-            });
-        }
-
-        CallResult {
-            state: out_state,
-            first_result: first_res,
-            result_count,
-        }
-    }
+pub struct OverflowResult {
+    pub state: State,
+    pub value: ValueId,
+    pub overflow: ValueId,
 }
 
 pub struct BranchResult {
     pub state: State,
     pub values: Vec<ValueId>,
+}
+
+pub struct GammaResult {
+    pub state: State,
+    pub first_result: ValueId,
+    pub result_count: u16,
+}
+
+impl GammaResult {
+    pub fn result(&self, index: u16) -> ValueId {
+        debug_assert!(index < self.result_count);
+        ValueId(self.first_result.0 + index as u32)
+    }
+}
+
+pub struct ThetaResult {
+    pub state: State,
+    pub first_result: ValueId,
+    pub result_count: u16,
+}
+
+impl ThetaResult {
+    pub fn result(&self, index: u16) -> ValueId {
+        debug_assert!(index < self.result_count);
+        ValueId(self.first_result.0 + index as u32)
+    }
+}
+
+pub struct PhiBody {
+    pub values: Vec<ValueId>,
+}
+
+pub struct PhiResult {
+    pub first_result: ValueId,
+    pub result_count: u16,
+}
+
+impl PhiResult {
+    pub fn result(&self, index: u16) -> ValueId {
+        debug_assert!(index < self.result_count);
+        ValueId(self.first_result.0 + index as u32)
+    }
 }
 
 pub struct LoopResult {
