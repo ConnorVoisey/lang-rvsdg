@@ -6,7 +6,7 @@ pub mod ops;
 pub mod types;
 pub mod value;
 
-pub use constant::{ConstId, ConstantDef, ConstantKind, ConstantPool};
+pub use constant::{ConstId, ConstIdPool, ConstIdsSpan, ConstantDef, ConstantKind, ConstantPool};
 pub use global::{GlobalDef, GlobalInit, GlobalLinkage};
 pub use ops::{
     ArithFlags, AtomicRMWOp, BinaryOp, CastOp, FCmpPred, ICmpPred, IntrinsicOp, MemoryOrdering,
@@ -17,7 +17,15 @@ pub use value::{ConstValue, Value, ValueKind};
 use func::Function;
 use types::{TypeArena, TypeRef};
 
+pub use target_lexicon::Triple;
+
+#[derive(Debug)]
 pub struct RVSDGMod {
+    /// Target triple (e.g. x86_64-unknown-linux-gnu)
+    pub target: Triple,
+    /// LLVM data layout string — encodes pointer sizes, alignments, endianness
+    /// for the target. Preserved verbatim for roundtripping through LLVM.
+    pub data_layout: String,
     pub types: TypeArena,
     pub values: Vec<Value>,
     pub regions: Vec<Region>,
@@ -29,8 +37,10 @@ pub struct RVSDGMod {
 }
 
 impl RVSDGMod {
-    pub fn new() -> Self {
+    pub fn new(target: Triple, data_layout: String) -> Self {
         Self {
+            target,
+            data_layout,
             types: TypeArena::default(),
             values: vec![],
             regions: vec![],
@@ -40,6 +50,11 @@ impl RVSDGMod {
             value_pool: ValuePool(vec![]),
             region_pool: RegionPool(vec![]),
         }
+    }
+
+    /// Create a module targeting the host platform with an empty data layout.
+    pub fn new_host() -> Self {
+        Self::new(Triple::host(), String::new())
     }
 
     #[inline]
@@ -68,6 +83,8 @@ impl RVSDGMod {
             is_constant,
             linkage,
             alignment: None,
+            section: None,
+            visibility: Visibility::default(),
         });
         id
     }
@@ -147,6 +164,7 @@ pub struct RegionsSpan {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct State(pub ValueId);
 
+#[derive(Debug, Clone)]
 pub struct Region {
     pub params: ValuesSpan,
     pub entry_state: State,
@@ -160,4 +178,16 @@ pub enum InlineHint {
     Never,
     Auto,
     Always,
+}
+
+/// ELF/Mach-O symbol visibility — controls linker behavior for shared libraries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum Visibility {
+    /// Symbol is visible to other shared objects
+    #[default]
+    Default,
+    /// Symbol is resolved within the defining shared object only
+    Hidden,
+    /// Like Hidden but the symbol can be overridden by a Default symbol
+    Protected,
 }

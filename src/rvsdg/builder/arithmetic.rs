@@ -1,6 +1,6 @@
 use crate::rvsdg::{
-    ArithFlags, BinaryOp, CastOp, ConstValue, FCmpPred, ICmpPred, IntrinsicOp, State, UnaryOp,
-    Value, ValueId, ValueKind,
+    ArithFlags, BinaryOp, CastOp, ConstValue, FCmpPred, FuncId, ICmpPred, IntrinsicOp, State,
+    UnaryOp, Value, ValueId, ValueKind,
     constant::ConstId,
     types::{BOOL, I32, I64, TypeRef},
 };
@@ -9,7 +9,7 @@ use super::{IntrinsicResult, OverflowResult, RegionBuilder};
 
 impl<'a> RegionBuilder<'a> {
     #[inline]
-    pub fn add_const(&mut self, ty: TypeRef, const_val: ConstValue) -> ValueId {
+    pub fn constant(&mut self, ty: TypeRef, const_val: ConstValue) -> ValueId {
         // TODO: add constant dedupe here
         self.add_value(Value {
             ty,
@@ -26,6 +26,14 @@ impl<'a> RegionBuilder<'a> {
     }
 
     #[inline]
+    pub fn func_addr(&mut self, func_id: FuncId, ptr_type: TypeRef) -> ValueId {
+        self.add_value(Value {
+            ty: ptr_type,
+            kind: ValueKind::FuncAddr(func_id),
+        })
+    }
+
+    #[inline]
     pub fn const_pool_ref(&mut self, const_id: ConstId, ty: TypeRef) -> ValueId {
         self.add_value(Value {
             ty,
@@ -34,13 +42,13 @@ impl<'a> RegionBuilder<'a> {
     }
 
     #[inline]
-    pub fn add_const_i32(&mut self, val: i32) -> ValueId {
-        self.add_const(I32, ConstValue::Int(val as i64))
+    pub fn const_i32(&mut self, val: i32) -> ValueId {
+        self.constant(I32, ConstValue::Int(val as i64))
     }
 
     #[inline]
-    pub fn add_const_i64(&mut self, val: i64) -> ValueId {
-        self.add_const(I64, ConstValue::Int(val))
+    pub fn const_i64(&mut self, val: i64) -> ValueId {
+        self.constant(I64, ConstValue::Int(val))
     }
 
     #[inline]

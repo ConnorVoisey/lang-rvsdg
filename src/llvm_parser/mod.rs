@@ -2,9 +2,8 @@ use llvm_ir::Module;
 
 use crate::rvsdg::RVSDGMod;
 
-pub struct LLVMParser {
-    module: Module,
-}
+#[derive(Debug)]
+pub struct LLVMParser {}
 
 impl LLVMParser {
     pub fn parser_from_mod(module: Module) -> RVSDGMod {

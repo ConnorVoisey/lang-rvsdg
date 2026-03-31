@@ -80,6 +80,8 @@ pub struct FuncType {
     pub is_var_arg: bool,
 }
 
+// TODO: `name` fields on StructField and StructDef are heap-allocated Strings.
+// Consider string interning if profiling shows this is a bottleneck.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct StructField {
     pub name: Option<String>,
@@ -94,7 +96,7 @@ pub struct StructDef {
     pub size: u64,
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct TypeArena {
     ptrs: Vec<PtrType>,
     arrays: Vec<ArrayType>,

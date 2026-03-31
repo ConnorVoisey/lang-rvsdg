@@ -15,13 +15,18 @@ pub struct Value {
     pub kind: ValueKind,
 }
 
+// Size: 32 bytes. Driven by Load/Store/AtomicLoad variants at 25 bytes payload.
+// Most variants are 4-16 bytes but boxing the large ones would add pointer chases
+// on the most frequently accessed operations — not worth the tradeoff.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ValueKind {
     Const(ConstValue),
     /// Reference to a constant in the constant pool (aggregates, strings, etc.)
     ConstPoolRef(ConstId),
-    /// Produces a pointer to a global variable or function.
+    /// Produces a pointer to a global variable.
     GlobalRef(GlobalId),
+    /// Produces a function pointer from a known function.
+    FuncAddr(FuncId),
     Unary {
         op: UnaryOp,
         operand: ValueId,
@@ -104,12 +109,20 @@ pub enum ValueKind {
         addr: ValueId,
         /// The type being loaded
         loaded_type: TypeRef,
+        /// Alignment in bytes (None = natural alignment for the type)
+        align: Option<u32>,
+        /// Volatile loads cannot be reordered, eliminated, or duplicated
+        volatile: bool,
     },
     /// Write a value to memory. The value node itself is the output state.
     Store {
         state: State,
         addr: ValueId,
         value: ValueId,
+        /// Alignment in bytes (None = natural alignment for the type)
+        align: Option<u32>,
+        /// Volatile stores cannot be reordered, eliminated, or duplicated
+        volatile: bool,
     },
     /// Stack allocation. The value node itself is the output state;
     /// use Project { index: 0 } to get the pointer.
@@ -126,6 +139,7 @@ pub enum ValueKind {
         addr: ValueId,
         loaded_type: TypeRef,
         ordering: MemoryOrdering,
+        align: Option<u32>,
     },
     /// Atomic store. The node itself is the output state.
     AtomicStore {
@@ -133,6 +147,7 @@ pub enum ValueKind {
         addr: ValueId,
         value: ValueId,
         ordering: MemoryOrdering,
+        align: Option<u32>,
     },
     /// Atomic read-modify-write. Output state is the node;
     /// Project { index: 0 } for the old value.
@@ -197,6 +212,12 @@ pub enum ValueKind {
     Call {
         state: State,
         fn_id: FuncId,
+        args: ValuesSpan,
+    },
+    /// Indirect call through a function pointer.
+    CallIndirect {
+        state: State,
+        callee: ValueId,
         args: ValuesSpan,
     },
     Project {

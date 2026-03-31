@@ -9,6 +9,7 @@ use crate::rvsdg::{
 };
 
 /// Passed to a branch closure — represents being inside a gamma branch
+#[derive(Debug)]
 pub struct RegionBuilder<'a> {
     pub region_id: RegionId,
     pub graph: &'a mut RVSDGMod,
@@ -31,17 +32,17 @@ impl<'a> RegionBuilder<'a> {
 
     pub fn new_from_func(graph: &'a mut RVSDGMod, func_id: FuncId) -> Self {
         let region = RegionId(graph.regions.len() as u32);
-        let param_types = &graph.functions[func_id.0 as usize].params;
+        let fn_params = &graph.functions[func_id.0 as usize].params;
 
-        let param_count = param_types.len() as u16;
+        let param_count = fn_params.len() as u16;
         let params = {
             let val_start = graph.values.len() as u32;
-            for (i, param_ty) in param_types.iter().enumerate() {
+            for (i, param) in fn_params.iter().enumerate() {
                 graph.values.push(Value {
-                    ty: *param_ty,
+                    ty: param.ty,
                     kind: ValueKind::RegionParam {
                         index: i as u32,
-                        ty: *param_ty,
+                        ty: param.ty,
                     },
                 });
             }
@@ -57,7 +58,7 @@ impl<'a> RegionBuilder<'a> {
         graph.values.push(Value {
             ty: TypeRef::State,
             kind: ValueKind::RegionParam {
-                index: param_types.len() as u32,
+                index: fn_params.len() as u32,
                 ty: TypeRef::State,
             },
         });
@@ -111,38 +112,50 @@ impl<'a> RegionBuilder<'a> {
 
 // ── Result types ────────────────────────────────────────────────
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LoadResult {
     pub state: State,
     pub value: ValueId,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AllocaResult {
     pub state: State,
     pub ptr: ValueId,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompareAndSwapResult {
     pub state: State,
     pub old_value: ValueId,
     pub success: ValueId,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IntrinsicResult {
     pub state: State,
     pub value: ValueId,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OverflowResult {
     pub state: State,
     pub value: ValueId,
     pub overflow: ValueId,
 }
 
+// TODO: BranchResult, LoopResult, and PhiBody each allocate a Vec<ValueId> per
+// closure invocation. These are short-lived (created in the closure, consumed
+// immediately by the builder). For typical branches returning 1-3 values this is
+// likely fine, but profile real-world code to determine if SmallVec<[ValueId; 4]>
+// would be worthwhile.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BranchResult {
     pub state: State,
     pub values: Vec<ValueId>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GammaResult {
     pub state: State,
     pub first_result: ValueId,
@@ -156,6 +169,7 @@ impl GammaResult {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ThetaResult {
     pub state: State,
     pub first_result: ValueId,
@@ -169,10 +183,12 @@ impl ThetaResult {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PhiBody {
     pub values: Vec<ValueId>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PhiResult {
     pub first_result: ValueId,
     pub result_count: u16,
@@ -185,6 +201,7 @@ impl PhiResult {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoopResult {
     /// If true, loop continues; if false, loop exits
     pub condition: ValueId,
@@ -209,12 +226,12 @@ mod test {
         //   return c;
         // }
 
-        let mut rvsdg_mod = RVSDGMod::new();
+        let mut rvsdg_mod = RVSDGMod::new_host();
         let main_fn =
             rvsdg_mod.declare_fn(String::from("main"), &[], &[I32], FnLinkageType::Internal);
         rvsdg_mod.define_fn(main_fn, |rb, state| {
-            let a = rb.add_const_i32(5);
-            let b = rb.add_const_i32(3);
+            let a = rb.const_i32(5);
+            let b = rb.const_i32(3);
             let c = rb.binary(BinaryOp::Add, ArithFlags::default(), a, b, I32);
             FnResult {
                 state,
@@ -229,7 +246,7 @@ mod test {
         //   return x < y;
         // }
 
-        let mut rvsdg_mod = RVSDGMod::new();
+        let mut rvsdg_mod = RVSDGMod::new_host();
         let check_fn = rvsdg_mod.declare_fn(
             String::from("check"),
             &[I32, I32],
@@ -260,7 +277,7 @@ mod test {
         //   return c;
         // }
 
-        let mut rvsdg_mod = RVSDGMod::new();
+        let mut rvsdg_mod = RVSDGMod::new_host();
 
         let check_fn = rvsdg_mod.declare_fn(
             String::from("check"),
@@ -281,8 +298,8 @@ mod test {
         let main_fn =
             rvsdg_mod.declare_fn(String::from("main"), &[], &[I32], FnLinkageType::Internal);
         rvsdg_mod.define_fn(main_fn, |rb, entry_state| {
-            let a = rb.add_const_i32(5);
-            let b = rb.add_const_i32(3);
+            let a = rb.const_i32(5);
+            let b = rb.const_i32(3);
             let call_res = rb.call(check_fn, entry_state, &[a, b]);
             let c = call_res.result(0);
             FnResult {

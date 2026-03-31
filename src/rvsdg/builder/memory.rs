@@ -7,13 +7,22 @@ use super::{AllocaResult, CompareAndSwapResult, LoadResult, RegionBuilder};
 
 impl<'a> RegionBuilder<'a> {
     #[inline]
-    pub fn load(&mut self, state: State, addr: ValueId, loaded_type: TypeRef) -> LoadResult {
+    pub fn load(
+        &mut self,
+        state: State,
+        addr: ValueId,
+        loaded_type: TypeRef,
+        align: Option<u32>,
+        volatile: bool,
+    ) -> LoadResult {
         let load_val = self.add_value(Value {
             ty: TypeRef::State,
             kind: ValueKind::Load {
                 state,
                 addr,
                 loaded_type,
+                align,
+                volatile,
             },
         });
         let value = self.add_value(Value {
@@ -30,10 +39,23 @@ impl<'a> RegionBuilder<'a> {
     }
 
     #[inline]
-    pub fn store(&mut self, state: State, addr: ValueId, value: ValueId) -> State {
+    pub fn store(
+        &mut self,
+        state: State,
+        addr: ValueId,
+        value: ValueId,
+        align: Option<u32>,
+        volatile: bool,
+    ) -> State {
         let store_val = self.add_value(Value {
             ty: TypeRef::State,
-            kind: ValueKind::Store { state, addr, value },
+            kind: ValueKind::Store {
+                state,
+                addr,
+                value,
+                align,
+                volatile,
+            },
         });
         State(store_val)
     }
@@ -74,6 +96,7 @@ impl<'a> RegionBuilder<'a> {
         addr: ValueId,
         loaded_type: TypeRef,
         ordering: MemoryOrdering,
+        align: Option<u32>,
     ) -> LoadResult {
         let load_val = self.add_value(Value {
             ty: TypeRef::State,
@@ -82,6 +105,7 @@ impl<'a> RegionBuilder<'a> {
                 addr,
                 loaded_type,
                 ordering,
+                align,
             },
         });
         let value = self.add_value(Value {
@@ -104,6 +128,7 @@ impl<'a> RegionBuilder<'a> {
         addr: ValueId,
         value: ValueId,
         ordering: MemoryOrdering,
+        align: Option<u32>,
     ) -> State {
         let val = self.add_value(Value {
             ty: TypeRef::State,
@@ -112,6 +137,7 @@ impl<'a> RegionBuilder<'a> {
                 addr,
                 value,
                 ordering,
+                align,
             },
         });
         State(val)
@@ -151,6 +177,7 @@ impl<'a> RegionBuilder<'a> {
     }
 
     #[inline]
+    #[allow(clippy::too_many_arguments)]
     pub fn compare_and_swap(
         &mut self,
         state: State,

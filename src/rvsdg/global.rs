@@ -1,5 +1,8 @@
-use crate::rvsdg::{constant::ConstId, types::TypeRef};
+use crate::rvsdg::{Visibility, constant::ConstId, types::TypeRef};
 
+// TODO: `name` and `section` are heap-allocated Strings.
+// Consider string interning if profiling shows this is a bottleneck.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GlobalDef {
     pub name: String,
     pub ty: TypeRef,
@@ -7,6 +10,9 @@ pub struct GlobalDef {
     pub is_constant: bool,
     pub linkage: GlobalLinkage,
     pub alignment: Option<u32>,
+    /// Place this global in a specific object file section (e.g. ".rodata", ".bss")
+    pub section: Option<String>,
+    pub visibility: Visibility,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

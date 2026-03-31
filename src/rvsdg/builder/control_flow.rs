@@ -12,6 +12,10 @@ impl<'a> RegionBuilder<'a> {
     /// N-way conditional branch. Condition value selects which region executes:
     /// 0 → first branch, 1 → second, etc. All branches must return the same
     /// number and types of values.
+    // TODO: `inputs` requires the caller to collect all live values into a slice,
+    // which may cause a Vec allocation for complex branches with many live variables
+    // (20-50+ in real programs). Profile real-world code to determine if an
+    // incremental builder API (gamma_begin/add_input/build) would be worthwhile.
     #[inline]
     pub fn gamma_n(
         &mut self,
@@ -80,7 +84,7 @@ impl<'a> RegionBuilder<'a> {
     }
 
     /// Two-way if/else convenience. Condition is a bool: true → first branch,
-    /// false → second branch.
+    /// false → second branch. See `gamma_n` for the inputs allocation note.
     #[inline]
     pub fn gamma(
         &mut self,
@@ -291,6 +295,47 @@ impl<'a> RegionBuilder<'a> {
             let ty = self.graph.functions[fn_id.0 as usize].return_types[i as usize];
             self.add_value(Value {
                 ty,
+                kind: ValueKind::Project {
+                    call: call_val,
+                    index: i,
+                },
+            });
+        }
+
+        CallResult {
+            state: out_state,
+            first_result: first_res,
+            result_count,
+        }
+    }
+
+    /// Call through a function pointer. The caller must provide the return types
+    /// since they can't be looked up from the function table.
+    #[inline]
+    pub fn call_indirect(
+        &mut self,
+        callee: ValueId,
+        state: State,
+        args: &[ValueId],
+        return_types: &[TypeRef],
+    ) -> CallResult {
+        let args_span = self.graph.value_pool.push_slice(args);
+
+        let call_val = self.add_value(Value {
+            ty: TypeRef::Scalar(ScalarType::Void),
+            kind: ValueKind::CallIndirect {
+                state,
+                callee,
+                args: args_span,
+            },
+        });
+        let out_state = State(call_val);
+
+        let first_res = ValueId(self.graph.values.len() as u32);
+        let result_count = return_types.len() as u16;
+        for i in 0..result_count {
+            self.add_value(Value {
+                ty: return_types[i as usize],
                 kind: ValueKind::Project {
                     call: call_val,
                     index: i,

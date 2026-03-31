@@ -1,3 +1,7 @@
+#![warn(missing_debug_implementations)]
+// TODO: enable once the API surface is more stable
+// #![warn(missing_docs)]
+
 use crate::llvm_parser::LLVMParser;
 use llvm_ir::Module;
 use std::path::Path;
@@ -29,7 +33,7 @@ fn c_file_to_mod(c_file_path: &Path) -> color_eyre::Result<Module> {
         .stdin(clang_cmd.stdout.unwrap())
         .stdout(Stdio::piped())
         .status()?;
-    let module = match Module::from_bc_path(&bc_output.path()) {
+    let module = match Module::from_bc_path(bc_output.path()) {
         Ok(v) => v,
         Err(e) => panic!("{}", e),
     };
