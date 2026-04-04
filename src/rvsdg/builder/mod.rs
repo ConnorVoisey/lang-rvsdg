@@ -226,7 +226,7 @@ mod test {
         //   return c;
         // }
 
-        let mut rvsdg_mod = RVSDGMod::new_host();
+        let mut rvsdg_mod = RVSDGMod::new_host(String::from("test"));
         let main_fn =
             rvsdg_mod.declare_fn(String::from("main"), &[], &[I32], FnLinkageType::Internal);
         rvsdg_mod.define_fn(main_fn, |rb, state| {
@@ -246,7 +246,7 @@ mod test {
         //   return x < y;
         // }
 
-        let mut rvsdg_mod = RVSDGMod::new_host();
+        let mut rvsdg_mod = RVSDGMod::new_host(String::from("test"));
         let check_fn = rvsdg_mod.declare_fn(
             String::from("check"),
             &[I32, I32],
@@ -277,7 +277,7 @@ mod test {
         //   return c;
         // }
 
-        let mut rvsdg_mod = RVSDGMod::new_host();
+        let mut rvsdg_mod = RVSDGMod::new_host(String::from("test"));
 
         let check_fn = rvsdg_mod.declare_fn(
             String::from("check"),

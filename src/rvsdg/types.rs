@@ -39,6 +39,24 @@ pub enum ScalarType {
 
     Void,
 }
+impl ScalarType {
+    pub fn is_float(&self) -> bool {
+        match self {
+            ScalarType::F32 | ScalarType::F64 => true,
+            _ => false,
+        }
+    }
+    pub fn is_int(&self) -> bool {
+        match self {
+            ScalarType::I8
+            | ScalarType::I16
+            | ScalarType::I32
+            | ScalarType::I64
+            | ScalarType::I128 => true,
+            _ => false,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TypeRef {

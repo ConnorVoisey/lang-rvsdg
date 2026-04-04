@@ -2,27 +2,27 @@ pub mod builder;
 pub mod constant;
 pub mod func;
 pub mod global;
+pub mod lower_to_llvm;
 pub mod ops;
 pub mod types;
 pub mod value;
 
 pub use constant::{ConstId, ConstIdPool, ConstIdsSpan, ConstantDef, ConstantKind, ConstantPool};
+use func::Function;
 pub use global::{GlobalDef, GlobalInit, GlobalLinkage};
 pub use ops::{
     ArithFlags, AtomicRMWOp, BinaryOp, CastOp, FCmpPred, ICmpPred, IntrinsicOp, MemoryOrdering,
     UnaryOp,
 };
-pub use value::{ConstValue, Value, ValueKind};
-
-use func::Function;
-use types::{TypeArena, TypeRef};
-
 pub use target_lexicon::Triple;
+use types::{TypeArena, TypeRef};
+pub use value::{ConstValue, Value, ValueKind};
 
 #[derive(Debug)]
 pub struct RVSDGMod {
     /// Target triple (e.g. x86_64-unknown-linux-gnu)
     pub target: Triple,
+    pub mod_name: String,
     /// LLVM data layout string — encodes pointer sizes, alignments, endianness
     /// for the target. Preserved verbatim for roundtripping through LLVM.
     pub data_layout: String,
@@ -37,8 +37,9 @@ pub struct RVSDGMod {
 }
 
 impl RVSDGMod {
-    pub fn new(target: Triple, data_layout: String) -> Self {
+    pub fn new(mod_name: String, target: Triple, data_layout: String) -> Self {
         Self {
+            mod_name,
             target,
             data_layout,
             types: TypeArena::default(),
@@ -53,8 +54,8 @@ impl RVSDGMod {
     }
 
     /// Create a module targeting the host platform with an empty data layout.
-    pub fn new_host() -> Self {
-        Self::new(Triple::host(), String::new())
+    pub fn new_host(mod_name: String) -> Self {
+        Self::new(mod_name, Triple::host(), String::new())
     }
 
     #[inline]

@@ -1,6 +1,10 @@
 use llvm_ir::Module;
 
-use crate::rvsdg::RVSDGMod;
+use crate::rvsdg::{
+    ArithFlags, BinaryOp, RVSDGMod,
+    func::{FnLinkageType, FnResult},
+    types::I32,
+};
 
 #[derive(Debug)]
 pub struct LLVMParser {}
@@ -17,6 +21,19 @@ impl LLVMParser {
                 }
             }
         }
-        todo!()
+
+        let mut rvsdg = RVSDGMod::new_host(String::from("test"));
+        let main_fn = rvsdg.declare_fn(String::from("main"), &[], &[I32], FnLinkageType::External);
+        rvsdg.define_fn(main_fn, |rb, entry_state| {
+            let a = rb.const_i32(5);
+            let b = rb.const_i32(-5);
+            let sum = rb.binary(BinaryOp::Add, ArithFlags::default(), a, b, I32);
+            FnResult {
+                state: entry_state,
+                values: vec![sum],
+            }
+        });
+        rvsdg.output_with_llvm().unwrap();
+        rvsdg
     }
 }
