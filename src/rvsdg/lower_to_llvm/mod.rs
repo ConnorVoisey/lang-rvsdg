@@ -1,6 +1,5 @@
 use crate::rvsdg::{
-    ConstId, ConstValue, ConstantDef, ConstantKind, FuncId, GlobalId, GlobalInit, RVSDGMod, Region,
-    RegionId, ValueId, ValueKind,
+    FuncId, GlobalId, GlobalInit, GlobalLinkage, RVSDGMod, Region, ValueId, ValueKind,
     func::{FnLinkageType, Function},
     types::{ScalarType, TypeRef},
 };
@@ -18,18 +17,19 @@ use inkwell::{
 use std::{error::Error, path::Path, process::Command};
 
 pub mod binary;
+pub mod const_val;
 pub mod unary;
 pub mod value;
 
 #[derive(Debug)]
-struct LLVMBuilderCtx<'a, 'ctx> {
+pub struct LLVMBuilderCtx<'a, 'ctx> {
     context: &'ctx Context,
     module: &'a Module<'ctx>,
     builder: &'a Builder<'ctx>,
 }
 
 #[derive(Debug)]
-struct ValueMapper<'ctx> {
+pub struct ValueMapper<'ctx> {
     values: Vec<Option<BasicValueEnum<'ctx>>>,
     fns: Vec<Option<FunctionValue<'ctx>>>,
     globals: Vec<Option<GlobalValue<'ctx>>>,
@@ -49,16 +49,6 @@ impl<'ctx> ValueMapper<'ctx> {
     }
     fn set_val(&mut self, value_id: ValueId, value_enum: BasicValueEnum<'ctx>) {
         self.values[value_id.0 as usize] = Some(value_enum);
-    }
-
-    fn get_int(&self, value_id: ValueId) -> IntValue<'ctx> {
-        self.get_val(value_id).unwrap().into_int_value()
-    }
-    fn get_float(&self, value_id: ValueId) -> FloatValue<'ctx> {
-        self.get_val(value_id).unwrap().into_float_value()
-    }
-    fn get_ptr(&self, value_id: ValueId) -> PointerValue<'ctx> {
-        self.get_val(value_id).unwrap().into_pointer_value()
     }
 
     fn get_fn(&self, func_id: FuncId) -> &Option<FunctionValue<'ctx>> {
@@ -148,6 +138,9 @@ impl RVSDGMod {
             self.register_fn(llvm_builder, mapper, func);
         }
         for func in self.functions.iter() {
+            if func.lambda_val.is_none() {
+                continue; // declaration only, no body to lower
+            }
             self.lower_fn(llvm_builder, mapper, func)?;
         }
         llvm_builder
@@ -170,73 +163,16 @@ impl RVSDGMod {
                 // TODO: replace the address space with the RVSDG address space,
                 // Inkwell stores this as an i16, we store as a string
                 .add_global(llvm_type, None, &global.name);
+            glob.set_constant(global.is_constant);
+            glob.set_linkage(global.linkage.to_llvm());
             match global.initializer {
                 GlobalInit::Extern => (),
-                GlobalInit::Init(const_id) => todo!(),
+                GlobalInit::Init(const_id) => {
+                    let const_val = self.lower_const_id(llvm_builder, mapper, const_id);
+                    glob.set_initializer(&const_val as &dyn BasicValue);
+                }
             };
             mapper.set_global(GlobalId(i as u32), glob);
-        }
-    }
-
-    fn lower_const_id<'a, 'ctx>(
-        &self,
-        llvm_builder: &LLVMBuilderCtx<'a, 'ctx>,
-        mapper: &mut ValueMapper<'ctx>,
-        const_id: ConstId,
-    ) -> BasicValueEnum<'ctx> {
-        let constant = self.constants.get(const_id);
-        self.lower_const_def(llvm_builder, mapper, constant)
-    }
-
-    fn lower_const_def<'a, 'ctx>(
-        &self,
-        llvm_builder: &LLVMBuilderCtx<'a, 'ctx>,
-        mapper: &mut ValueMapper<'ctx>,
-        constant: &ConstantDef,
-    ) -> BasicValueEnum<'ctx> {
-        match &constant.kind {
-            ConstantKind::Scalar(const_value) => {
-                self.lower_const_value(llvm_builder, mapper, const_value, constant.ty)
-            }
-            ConstantKind::Zero => todo!(),
-            ConstantKind::Aggregate(const_ids_span) => todo!(),
-            ConstantKind::String(items) => {
-                BasicValueEnum::ArrayValue(llvm_builder.context.const_string(items, false))
-            }
-            ConstantKind::GlobalAddr(global_id) => todo!(),
-            ConstantKind::Undef => todo!(),
-        }
-    }
-
-    fn lower_const_value<'a, 'ctx>(
-        &self,
-        llvm_builder: &LLVMBuilderCtx<'a, 'ctx>,
-        mapper: &mut ValueMapper<'ctx>,
-        const_value: &ConstValue,
-        ty: TypeRef,
-    ) -> BasicValueEnum<'ctx> {
-        match const_value {
-            ConstValue::Int(val) => match ty {
-                TypeRef::Scalar(scalar_type) => BasicValueEnum::IntValue(
-                    scalar_type
-                        .to_int_type(llvm_builder.context)
-                        .const_int(*val as u64, false),
-                ),
-                t => unreachable!("int constant should have scalar type, got: {t:?}"),
-            },
-            ConstValue::F32(val) => {
-                BasicValueEnum::FloatValue(llvm_builder.context.f32_type().const_float(*val as f64))
-            }
-            ConstValue::F64(val) => {
-                BasicValueEnum::FloatValue(llvm_builder.context.f64_type().const_float(*val as f64))
-            }
-            ConstValue::NullPtr => BasicValueEnum::PointerValue(
-                llvm_builder
-                    .context
-                    .ptr_type(AddressSpace::default())
-                    .const_null(),
-            ),
-            ConstValue::Poison => todo!(),
         }
     }
 
@@ -246,19 +182,25 @@ impl RVSDGMod {
         mapper: &mut ValueMapper<'ctx>,
         rvsdg_func: &Function,
     ) {
-        // since LLVM only supports single returns,
-        // for now just panic if theres too much
-        assert_eq!(rvsdg_func.return_types.len(), 1);
+        assert!(
+            rvsdg_func.return_types.len() < 2,
+            "LLVM does not support more than one return value"
+        );
 
-        let fn_return_type = rvsdg_func.return_types[0];
         let param_types = rvsdg_func
             .params
             .iter()
             .map(|param| self.type_to_basic_meta_llvm(llvm_builder.context, param.ty))
             .collect::<Vec<_>>();
-        let llvm_fn_type = self
-            .type_to_basic_type_llvm(llvm_builder.context, fn_return_type)
-            .fn_type(&param_types, rvsdg_func.is_var_arg);
+        let llvm_fn_type = if let Some(&ret_ty) = rvsdg_func.return_types.first() {
+            self.type_to_basic_type_llvm(llvm_builder.context, ret_ty)
+                .fn_type(&param_types, rvsdg_func.is_var_arg)
+        } else {
+            llvm_builder
+                .context
+                .void_type()
+                .fn_type(&param_types, rvsdg_func.is_var_arg)
+        };
 
         let func_ty = llvm_builder.module.add_function(
             &rvsdg_func.name,
@@ -346,10 +288,11 @@ impl RVSDGMod {
             TypeRef::Ptr(_) => {
                 BasicTypeEnum::PointerType(context.ptr_type(AddressSpace::default()))
             }
-            TypeRef::Array(array_type_id) => BasicTypeEnum::ArrayType(
-                self.type_to_basic_type_llvm(context, self.types.get_array(array_type_id).element)
-                    .into_array_type(),
-            ),
+            TypeRef::Array(array_type_id) => {
+                let arr = self.types.get_array(array_type_id);
+                let elem = self.type_to_basic_type_llvm(context, arr.element);
+                BasicTypeEnum::ArrayType(elem.array_type(arr.len as u32))
+            }
             TypeRef::Struct(struct_id) => todo!(),
             TypeRef::Vector(vector_type_id) => todo!(),
             TypeRef::Func(func_type_id) => todo!(),
@@ -377,10 +320,11 @@ impl RVSDGMod {
             TypeRef::Ptr(_) => {
                 BasicMetadataTypeEnum::PointerType(context.ptr_type(AddressSpace::default()))
             }
-            TypeRef::Array(array_type_id) => BasicMetadataTypeEnum::ArrayType(
-                self.type_to_basic_type_llvm(context, self.types.get_array(array_type_id).element)
-                    .into_array_type(),
-            ),
+            TypeRef::Array(array_type_id) => {
+                let arr = self.types.get_array(array_type_id);
+                let elem = self.type_to_basic_type_llvm(context, arr.element);
+                BasicMetadataTypeEnum::ArrayType(elem.array_type(arr.len as u32))
+            }
             TypeRef::Struct(struct_id) => todo!(),
             TypeRef::Vector(vector_type_id) => todo!(),
             TypeRef::Func(func_type_id) => todo!(),
@@ -398,6 +342,18 @@ impl FnLinkageType {
             FnLinkageType::Weak => Linkage::WeakAny,
             FnLinkageType::WeakODR => Linkage::WeakODR,
             FnLinkageType::AvailableExternally => Linkage::AvailableExternally,
+        }
+    }
+}
+
+impl GlobalLinkage {
+    fn to_llvm(&self) -> Linkage {
+        match self {
+            GlobalLinkage::Internal => Linkage::Internal,
+            GlobalLinkage::External => Linkage::External,
+            GlobalLinkage::LinkOnce => Linkage::LinkOnceAny,
+            GlobalLinkage::Weak => Linkage::WeakAny,
+            GlobalLinkage::Common => Linkage::Common,
         }
     }
 }

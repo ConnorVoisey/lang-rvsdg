@@ -32,7 +32,12 @@ impl RVSDGMod {
             ValueKind::ConstPoolRef(const_id) => {
                 Some(self.lower_const_id(llvm_builder, mapper, const_id))
             }
-            ValueKind::GlobalRef(global_id) => todo!(),
+            ValueKind::GlobalRef(global_id) => {
+                let glob = mapper
+                    .get_global(global_id)
+                    .expect("global should have be lowered to llvm earlier");
+                Some(BasicValueEnum::PointerValue(glob.as_pointer_value()))
+            }
             ValueKind::FuncAddr(func_id) => todo!(),
             ValueKind::Unary { op, operand } => {
                 Some(self.lower_unary(llvm_builder, mapper, rvsdg_func, op, operand)?)
@@ -283,7 +288,13 @@ impl RVSDGMod {
                     LLVMValueKind::Instruction(_) => None,
                 }
             }
-            ValueKind::Project { call, index } => todo!(),
+            ValueKind::Project { call, index } => {
+                // Ensure the call node has been lowered (it may produce a value or None for void)
+                let call_val = self.lower_value(llvm_builder, mapper, rvsdg_func, call)?;
+                // For single-return functions, index 0 is the data result
+                // State projections (which have no LLVM representation) will find None here
+                call_val
+            }
             ValueKind::RegionParam { index, ty } => {
                 unreachable!("RegionParam should have been pre-populated in the mapper")
             }
