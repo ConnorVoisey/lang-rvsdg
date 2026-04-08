@@ -4,7 +4,6 @@ use crate::rvsdg::{
     lower_to_llvm::{LLVMBuilderCtx, ValueMapper},
 };
 use inkwell::{
-    basic_block::BasicBlock,
     builder::BuilderError,
     values::{BasicValue, BasicValueEnum},
 };

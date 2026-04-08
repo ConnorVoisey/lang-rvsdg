@@ -57,10 +57,10 @@ impl<'a> RegionBuilder<'a> {
     pub fn extract_field(
         &mut self,
         aggregate: ValueId,
-        indices: &[ValueId],
+        indices: &[u32],
         field_type: TypeRef,
     ) -> ValueId {
-        let indices_span = self.graph.value_pool.push_slice(indices);
+        let indices_span = self.graph.u32_pool.push_slice(indices);
         self.add_value(Value {
             ty: field_type,
             kind: ValueKind::ExtractField {

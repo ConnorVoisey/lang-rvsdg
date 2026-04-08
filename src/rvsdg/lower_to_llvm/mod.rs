@@ -293,7 +293,7 @@ impl RVSDGMod {
         ty: TypeRef,
     ) -> BasicTypeEnum<'b> {
         match ty {
-            TypeRef::State => todo!(),
+            TypeRef::State => unreachable!(),
             TypeRef::Scalar(scalar_type) => match scalar_type {
                 ScalarType::Bool => BasicTypeEnum::IntType(context.bool_type()),
                 ScalarType::I8 => BasicTypeEnum::IntType(context.i8_type()),

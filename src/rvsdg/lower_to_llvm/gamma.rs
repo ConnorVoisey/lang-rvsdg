@@ -106,6 +106,8 @@ impl RVSDGMod {
         llvm_builder.builder.position_at_end(merge_bb);
         let num_results = region_results.first().map(|(r, _)| r.len()).unwrap_or(0);
 
+        // Project slots are always directly after the gamma value, so we can write to them by
+        // adding 1 to the gamma id and the index
         for result_idx in 0..num_results {
             let phi_type = region_results[0].0[result_idx].get_type();
             let phi = llvm_builder.builder.build_phi(phi_type, "gamma.phi")?;

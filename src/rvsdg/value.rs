@@ -1,5 +1,5 @@
 use crate::rvsdg::{
-    FuncId, GlobalId, RegionId, RegionsSpan, State, ValueId, ValuesSpan,
+    FuncId, GlobalId, RegionId, RegionsSpan, State, U32Span, ValueId, ValuesSpan,
     constant::ConstId,
     ops::{
         ArithFlags, AtomicRMWOp, BinaryOp, CastOp, FCmpPred, ICmpPred, IntrinsicOp, MemoryOrdering,
@@ -81,7 +81,7 @@ pub enum ValueKind {
     ExtractField {
         aggregate: ValueId,
         /// Constant index path (e.g. [0, 1] for the second field of the first nested struct)
-        indices: ValuesSpan,
+        indices: U32Span,
     },
     /// Write a field into a by-value aggregate, producing a new aggregate.
     /// Indices are compile-time constants that walk nested aggregates.

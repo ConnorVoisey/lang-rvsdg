@@ -34,6 +34,7 @@ pub struct RVSDGMod {
     pub constants: ConstantPool,
     pub value_pool: ValuePool,
     pub region_pool: RegionPool,
+    pub u32_pool: U32Pool,
 }
 
 impl RVSDGMod {
@@ -50,6 +51,7 @@ impl RVSDGMod {
             constants: ConstantPool::default(),
             value_pool: ValuePool(vec![]),
             region_pool: RegionPool(vec![]),
+            u32_pool: U32Pool(vec![]),
         }
     }
 
@@ -156,6 +158,30 @@ impl RegionPool {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RegionsSpan {
+    pub start: u32,
+    pub len: u16,
+}
+
+#[derive(Debug, Clone)]
+pub struct U32Pool(Vec<u32>);
+
+impl U32Pool {
+    pub fn push_slice(&mut self, values: &[u32]) -> U32Span {
+        let start = self.0.len() as u32;
+        self.0.extend_from_slice(values);
+        U32Span {
+            start,
+            len: values.len() as u16,
+        }
+    }
+
+    pub fn get(&self, values: U32Span) -> &[u32] {
+        &self.0[values.start as usize..(values.start as usize + values.len as usize)]
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct U32Span {
     pub start: u32,
     pub len: u16,
 }

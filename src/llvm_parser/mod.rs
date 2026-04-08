@@ -1,66 +1,72 @@
-use llvm_ir::Module;
-
 use crate::rvsdg::{
-    ArithFlags, BinaryOp, GlobalInit, GlobalLinkage, RVSDGMod,
+    GlobalInit, GlobalLinkage, RVSDGMod,
+    builder::LoopResult,
     func::{FnLinkageType, FnResult},
-    types::{ArrayType, I32, PtrType, ScalarType, TypeRef},
+    types::{ArrayType, I64, I32, PtrType, ScalarType, TypeRef},
+    value::ConstValue,
 };
 
-#[derive(Debug)]
-pub struct LLVMParser {}
+const BUF_SIZE: usize = 8192;
 
-impl LLVMParser {
-    pub fn parser_from_mod(module: Module) -> RVSDGMod {
-        for func in module.functions {
-            for param in func.parameters {
-                dbg!(param);
+/// Build the `yes` program: writes "y\n" to stdout in an infinite loop
+/// using a large buffer for throughput.
+pub fn build_yes() -> RVSDGMod {
+    let mut rvsdg = RVSDGMod::new_host(String::from("yes"));
+
+    // Build a BUF_SIZE buffer filled with repeating "y\n"
+    let buf: Vec<u8> = b"y\n".iter().copied().cycle().take(BUF_SIZE).collect();
+    let arr_id = rvsdg.types.intern_array(ArrayType {
+        element: TypeRef::Scalar(ScalarType::I8),
+        len: BUF_SIZE as u64,
+    });
+    let buf_type = TypeRef::Array(arr_id);
+    let buf_ptr_type = TypeRef::Ptr(rvsdg.types.intern_ptr(PtrType {
+        pointee: Some(buf_type),
+        alias_set: None,
+        no_escape: false,
+    }));
+    let buf_const_id = rvsdg.constants.string(buf_type, buf);
+    let buf_global = rvsdg.define_global(
+        String::from("yes_buf"),
+        buf_type,
+        GlobalInit::Init(buf_const_id),
+        true,
+        GlobalLinkage::Internal,
+    );
+
+    // Declare write(fd: i32, buf: ptr, count: i64) -> i64
+    let write_fn = rvsdg.declare_fn(
+        String::from("write"),
+        &[I32, buf_ptr_type, I64],
+        &[I64],
+        FnLinkageType::External,
+    );
+
+    // main() -> i32
+    let main_fn = rvsdg.declare_fn(String::from("main"), &[], &[I32], FnLinkageType::External);
+    let bool_ty = TypeRef::Scalar(ScalarType::Bool);
+    rvsdg.define_fn(main_fn, |rb, entry_state| {
+        let buf_ptr = rb.global_ref(buf_global, buf_ptr_type);
+        let stdout_fd = rb.const_i32(1);
+        let buf_len = rb.const_i64(BUF_SIZE as i64);
+
+        // do { write(1, buf, BUF_SIZE) } while(true)
+        let res = rb.theta(entry_state, &[], |rb| {
+            let call_res = rb.call(write_fn, entry_state, &[stdout_fd, buf_ptr, buf_len]);
+            let always_true = rb.constant(bool_ty, ConstValue::Int(1));
+            LoopResult {
+                condition: always_true,
+                next_state: call_res.state,
+                next_vars: vec![],
             }
-            for bb in func.basic_blocks {
-                for inst in bb.instrs {
-                    dbg!(inst);
-                }
-            }
+        });
+
+        let zero = rb.const_i32(0);
+        FnResult {
+            state: res.state,
+            values: vec![zero],
         }
+    });
 
-        let c_str = "hello\0";
-        let c_str_len = c_str.len();
-        let c_str_vec = c_str.as_bytes().to_vec();
-        let mut rvsdg = RVSDGMod::new_host(String::from("test"));
-        let main_fn = rvsdg.declare_fn(String::from("main"), &[], &[I32], FnLinkageType::External);
-        let arr_id = rvsdg.types.intern_array(ArrayType {
-            element: TypeRef::Scalar(ScalarType::I8),
-            len: c_str_len as u64,
-        });
-        let c_str_type = TypeRef::Array(arr_id);
-        let c_str_ptr_type = TypeRef::Ptr(rvsdg.types.intern_ptr(PtrType {
-            pointee: Some(c_str_type),
-            alias_set: None,
-            no_escape: false,
-        }));
-        let puts_fn = rvsdg.declare_fn(
-            String::from("puts"),
-            &[c_str_ptr_type],
-            &[I32],
-            FnLinkageType::External,
-        );
-        let c_str_const_id = rvsdg.constants.string(c_str_type, c_str_vec);
-        let str = rvsdg.define_global(
-            String::from("string"),
-            c_str_type,
-            GlobalInit::Init(c_str_const_id),
-            true,
-            GlobalLinkage::Internal,
-        );
-        rvsdg.define_fn(main_fn, |rb, entry_state| {
-            let str_val = rb.global_ref(str, c_str_ptr_type);
-            let puts_res = rb.call(puts_fn, entry_state, &[str_val]);
-            let zero = rb.const_i32(0);
-            FnResult {
-                state: puts_res.state,
-                values: vec![zero],
-            }
-        });
-        rvsdg.output_with_llvm().unwrap();
-        rvsdg
-    }
+    rvsdg
 }

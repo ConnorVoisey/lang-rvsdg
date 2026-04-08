@@ -2,7 +2,7 @@
 // TODO: enable once the API surface is more stable
 // #![warn(missing_docs)]
 
-use crate::llvm_parser::LLVMParser;
+use crate::llvm_parser::build_yes;
 use llvm_ir::Module;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -42,6 +42,7 @@ fn c_file_to_mod(c_file_path: &Path) -> color_eyre::Result<Module> {
 }
 pub fn compile_c_file(c_file_path: &Path) -> color_eyre::Result<()> {
     let module = c_file_to_mod(c_file_path)?;
-    LLVMParser::parser_from_mod(module);
+    let rvsdg = build_yes();
+    rvsdg.output_with_llvm().unwrap();
     Ok(())
 }

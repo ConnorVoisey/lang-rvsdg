@@ -1,17 +1,15 @@
 use crate::rvsdg::{
-    FCmpPred, ICmpPred, RVSDGMod, RegionId, ValueId, ValueKind,
+    FCmpPred, ICmpPred, RVSDGMod, ValueId, ValueKind,
     func::Function,
     lower_to_llvm::{LLVMBuilderCtx, ValueMapper},
     types::TypeRef,
 };
 use inkwell::{
     FloatPredicate, IntPredicate,
-    basic_block::BasicBlock,
     builder::BuilderError,
     types::BasicType,
     values::{
-        BasicMetadataValueEnum, BasicValue, BasicValueEnum, FunctionValue,
-        ValueKind as LLVMValueKind,
+        BasicMetadataValueEnum, BasicValueEnum, InstructionValue, ValueKind as LLVMValueKind,
     },
 };
 
@@ -131,7 +129,22 @@ impl RVSDGMod {
                 value,
             } => todo!(),
             ValueKind::ShuffleLanes { left, right, mask } => todo!(),
-            ValueKind::ExtractField { aggregate, indices } => todo!(),
+            ValueKind::ExtractField { aggregate, indices } => {
+                let mut agg = self.expect_value(llvm_builder, mapper, rvsdg_func, aggregate)?;
+                let idx_slice = self.u32_pool.get(indices);
+                for &idx in idx_slice {
+                    agg = match agg {
+                        BasicValueEnum::ArrayValue(av) => llvm_builder
+                            .builder
+                            .build_extract_value(av, idx, "extract")?,
+                        BasicValueEnum::StructValue(sv) => llvm_builder
+                            .builder
+                            .build_extract_value(sv, idx, "extract")?,
+                        _ => panic!("extractvalue requires an aggregate (array or struct) value"),
+                    };
+                }
+                Some(agg)
+            }
             ValueKind::InsertField {
                 aggregate,
                 value,
@@ -144,12 +157,37 @@ impl RVSDGMod {
                 inbounds,
             } => todo!(),
             ValueKind::Load {
-                state,
+                state: _,
                 addr,
                 loaded_type,
                 align,
                 volatile,
-            } => todo!(),
+            } => {
+                let ptr = self.expect_value(llvm_builder, mapper, rvsdg_func, addr)?;
+                let pointee_type = self.type_to_basic_type_llvm(llvm_builder.context, loaded_type);
+                let load = llvm_builder.builder.build_load(
+                    pointee_type,
+                    ptr.into_pointer_value(),
+                    "load",
+                )?;
+                let inst = llvm_builder
+                    .builder
+                    .get_insert_block()
+                    .unwrap()
+                    .get_last_instruction()
+                    .unwrap();
+                // build_load always produces an instruction-backed value
+                if let Some(a) = align {
+                    inst.set_alignment(a).unwrap();
+                }
+                if volatile {
+                    inst.set_volatile(true).unwrap();
+                }
+                // Load is a multi-output node (state + value). Write value to Project slot.
+                let project_id = ValueId(value_id.0 + 1);
+                mapper.set_val(project_id, load);
+                None
+            }
             ValueKind::Store {
                 state,
                 addr,
