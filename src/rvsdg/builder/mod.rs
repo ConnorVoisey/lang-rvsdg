@@ -30,6 +30,42 @@ impl<'a> RegionBuilder<'a> {
         }
     }
 
+    pub fn new_with_params(
+        graph: &'a mut RVSDGMod,
+        entry_state: State,
+        param_types: &[TypeRef],
+    ) -> Self {
+        let region = RegionId(graph.regions.len() as u32);
+
+        let params = {
+            let val_start = graph.values.len() as u32;
+            for (i, &ty) in param_types.iter().enumerate() {
+                graph.values.push(Value {
+                    ty,
+                    kind: ValueKind::RegionParam {
+                        index: i as u32,
+                        ty,
+                    },
+                });
+            }
+            ValuesSpan {
+                start: val_start,
+                len: param_types.len() as u16,
+            }
+        };
+
+        graph.regions.push(Region {
+            params,
+            entry_state,
+            results: ValuesSpan { start: 0, len: 0 },
+            nodes: vec![],
+        });
+        Self {
+            region_id: region,
+            graph,
+        }
+    }
+
     pub fn new_from_func(graph: &'a mut RVSDGMod, func_id: FuncId) -> Self {
         let region = RegionId(graph.regions.len() as u32);
         let fn_params = &graph.functions[func_id.0 as usize].params;

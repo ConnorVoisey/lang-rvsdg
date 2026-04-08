@@ -10,14 +10,15 @@ use inkwell::{
     module::{Linkage, Module},
     targets::{CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetTriple},
     types::{BasicMetadataTypeEnum, BasicType, BasicTypeEnum, FloatType, IntType},
-    values::{
-        BasicValue, BasicValueEnum, FloatValue, FunctionValue, GlobalValue, IntValue, PointerValue,
-    },
+    values::{BasicValue, BasicValueEnum, FunctionValue, GlobalValue},
 };
 use std::{error::Error, path::Path, process::Command};
 
 pub mod binary;
 pub mod const_val;
+pub mod gamma;
+pub mod test_utils;
+pub mod theta;
 pub mod unary;
 pub mod value;
 
@@ -67,6 +68,24 @@ impl<'ctx> ValueMapper<'ctx> {
 }
 
 impl RVSDGMod {
+    /// Lower the RVSDG module into an LLVM module without emitting files.
+    /// The caller owns the context and module lifetime.
+    pub fn lower_to_llvm_module<'ctx>(
+        &self,
+        context: &'ctx Context,
+    ) -> Result<Module<'ctx>, BuilderError> {
+        let module = context.create_module(&self.mod_name);
+        let builder = context.create_builder();
+        let llvm_builder = LLVMBuilderCtx {
+            context,
+            module: &module,
+            builder: &builder,
+        };
+        let mut value_mapper = ValueMapper::new(self);
+        self.lower_mod(&llvm_builder, &mut value_mapper)?;
+        Ok(module)
+    }
+
     pub fn output_with_llvm(&self) -> Result<(), Box<dyn Error>> {
         // initialise things
         Target::initialize_native(&InitializationConfig::default())
@@ -231,8 +250,9 @@ impl RVSDGMod {
                 // register the regions inputs to the llvm functions parameters so that they can be
                 // referenced by project inside the region
                 let region = &self.regions[region_id.0 as usize];
-                for (i, param) in self.value_pool.get(region.params).iter().enumerate() {
-                    mapper.set_val(*param, func.get_nth_param(i as u32).unwrap());
+                for i in 0..region.params.len as u32 {
+                    let param_id = ValueId(region.params.start + i);
+                    mapper.set_val(param_id, func.get_nth_param(i).unwrap());
                 }
 
                 self.lower_region(llvm_builder, mapper, rvsdg_func, region)?;

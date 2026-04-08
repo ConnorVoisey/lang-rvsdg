@@ -30,8 +30,13 @@ impl<'a> RegionBuilder<'a> {
         let mut branch_regions: Vec<RegionId> = Vec::with_capacity(branches.len());
         let mut result_count: Option<u16> = None;
 
+        let param_types: Vec<TypeRef> = inputs
+            .iter()
+            .map(|&id| self.graph.values[id.0 as usize].ty)
+            .collect();
+
         for branch in branches {
-            let mut rb = RegionBuilder::new_empty(self.graph, state);
+            let mut rb = RegionBuilder::new_with_params(self.graph, state, &param_types);
             let res = branch(&mut rb);
             let count = res.values.len() as u16;
             match result_count {
@@ -95,9 +100,13 @@ impl<'a> RegionBuilder<'a> {
         false_branch: impl FnOnce(&mut RegionBuilder) -> BranchResult,
     ) -> GammaResult {
         let inputs_span = self.graph.value_pool.push_slice(inputs);
+        let param_types: Vec<TypeRef> = inputs
+            .iter()
+            .map(|&id| self.graph.values[id.0 as usize].ty)
+            .collect();
 
         let (true_region, result_count) = {
-            let mut rb = RegionBuilder::new_empty(self.graph, state);
+            let mut rb = RegionBuilder::new_with_params(self.graph, state, &param_types);
             let res = true_branch(&mut rb);
             let count = res.values.len() as u16;
             let results = rb.graph.value_pool.push_slice(&res.values);
@@ -106,7 +115,7 @@ impl<'a> RegionBuilder<'a> {
         };
 
         let false_region = {
-            let mut rb = RegionBuilder::new_empty(self.graph, state);
+            let mut rb = RegionBuilder::new_with_params(self.graph, state, &param_types);
             let res = false_branch(&mut rb);
             debug_assert_eq!(
                 res.values.len() as u16,
@@ -166,8 +175,13 @@ impl<'a> RegionBuilder<'a> {
         let loop_span = self.graph.value_pool.push_slice(loop_vars);
         let result_count = loop_vars.len() as u16;
 
+        let param_types: Vec<TypeRef> = loop_vars
+            .iter()
+            .map(|&id| self.graph.values[id.0 as usize].ty)
+            .collect();
+
         let (region, condition) = {
-            let mut rb = RegionBuilder::new_empty(self.graph, state);
+            let mut rb = RegionBuilder::new_with_params(self.graph, state, &param_types);
             let res = loop_body(&mut rb);
             debug_assert_eq!(
                 res.next_vars.len() as u16,
@@ -185,7 +199,7 @@ impl<'a> RegionBuilder<'a> {
                 loop_vars: loop_span,
                 condition,
                 state,
-                region,
+                region_id: region,
             },
         });
         let out_state = State(theta_val);

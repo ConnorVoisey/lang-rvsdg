@@ -1,14 +1,18 @@
 use crate::rvsdg::{
-    FCmpPred, ICmpPred, RVSDGMod, ValueId, ValueKind,
+    FCmpPred, ICmpPred, RVSDGMod, RegionId, ValueId, ValueKind,
     func::Function,
     lower_to_llvm::{LLVMBuilderCtx, ValueMapper},
     types::TypeRef,
 };
 use inkwell::{
     FloatPredicate, IntPredicate,
+    basic_block::BasicBlock,
     builder::BuilderError,
     types::BasicType,
-    values::{BasicMetadataValueEnum, BasicValueEnum, ValueKind as LLVMValueKind},
+    values::{
+        BasicMetadataValueEnum, BasicValue, BasicValueEnum, FunctionValue,
+        ValueKind as LLVMValueKind,
+    },
 };
 
 impl RVSDGMod {
@@ -194,15 +198,31 @@ impl RVSDGMod {
             ValueKind::Theta {
                 loop_vars,
                 condition,
-                state,
+                state: _,
+                region_id: region,
+            } => self.lower_theta(
+                llvm_builder,
+                mapper,
+                rvsdg_func,
+                value_id,
+                loop_vars,
+                condition,
                 region,
-            } => todo!(),
+            )?,
             ValueKind::Gamma {
                 condition,
                 inputs,
-                state,
+                state: _,
                 regions,
-            } => todo!(),
+            } => self.lower_gamma(
+                llvm_builder,
+                mapper,
+                rvsdg_func,
+                value_id,
+                condition,
+                inputs,
+                regions,
+            )?,
             ValueKind::Phi { region, rv_count } => todo!(),
             ValueKind::Call {
                 state: _,
@@ -288,12 +308,19 @@ impl RVSDGMod {
                     LLVMValueKind::Instruction(_) => None,
                 }
             }
-            ValueKind::Project { call, index } => {
-                // Ensure the call node has been lowered (it may produce a value or None for void)
-                let call_val = self.lower_value(llvm_builder, mapper, rvsdg_func, call)?;
-                // For single-return functions, index 0 is the data result
-                // State projections (which have no LLVM representation) will find None here
-                call_val
+            ValueKind::Project { call, index: _ } => {
+                // Ensure the parent node has been lowered.
+                // Multi-output nodes (gamma, theta, call) write their results
+                // directly to the Project slots in the mapper during lowering.
+                // Single-output nodes return their value which we use as fallback.
+                self.lower_value(llvm_builder, mapper, rvsdg_func, call)?;
+                // Check if the parent populated our slot in the mapper
+                if let Some(val) = mapper.get_val(value_id) {
+                    Some(*val)
+                } else {
+                    // Fallback for single-output nodes (e.g. Call returning one value)
+                    *mapper.get_val(call)
+                }
             }
             ValueKind::RegionParam { index, ty } => {
                 unreachable!("RegionParam should have been pre-populated in the mapper")

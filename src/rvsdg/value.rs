@@ -192,7 +192,7 @@ pub enum ValueKind {
         loop_vars: ValuesSpan,
         condition: ValueId,
         state: State,
-        region: RegionId,
+        region_id: RegionId,
     },
     /// N-way conditional branch. The condition selects which region to execute:
     /// 0 → first region, 1 → second, etc. For a 2-way if/else, condition is a bool.
