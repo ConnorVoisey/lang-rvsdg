@@ -145,7 +145,7 @@ impl RVSDGMod {
         })
     }
 
-    fn call_overloaded_intrinsic<'a, 'ctx>(
+    pub(crate) fn call_overloaded_intrinsic<'a, 'ctx>(
         &self,
         llvm_builder: &LLVMBuilderCtx<'a, 'ctx>,
         intrinsic_name: &str,

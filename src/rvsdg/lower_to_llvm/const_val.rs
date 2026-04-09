@@ -101,7 +101,10 @@ impl RVSDGMod {
                 .get_global(*global_id)
                 .expect("global should have been set during lower_globals")
                 .as_basic_value_enum(),
-            ConstantKind::Undef => todo!(),
+            ConstantKind::Undef => {
+                let llvm_type = self.type_to_basic_type_llvm(llvm_builder.context, constant.ty);
+                Self::get_undef(llvm_type)
+            }
         }
     }
 
@@ -140,7 +143,38 @@ impl RVSDGMod {
                     .ptr_type(AddressSpace::default())
                     .const_null(),
             ),
-            ConstValue::Poison => todo!(),
+            ConstValue::Poison => {
+                let llvm_type = self.type_to_basic_type_llvm(llvm_builder.context, ty);
+                Self::get_poison(llvm_type)
+            }
+        }
+    }
+
+    fn get_undef<'ctx>(llvm_type: BasicTypeEnum<'ctx>) -> BasicValueEnum<'ctx> {
+        match llvm_type {
+            BasicTypeEnum::IntType(t) => BasicValueEnum::IntValue(t.get_undef()),
+            BasicTypeEnum::FloatType(t) => BasicValueEnum::FloatValue(t.get_undef()),
+            BasicTypeEnum::PointerType(t) => BasicValueEnum::PointerValue(t.get_undef()),
+            BasicTypeEnum::ArrayType(t) => BasicValueEnum::ArrayValue(t.get_undef()),
+            BasicTypeEnum::StructType(t) => BasicValueEnum::StructValue(t.get_undef()),
+            BasicTypeEnum::VectorType(t) => BasicValueEnum::VectorValue(t.get_undef()),
+            BasicTypeEnum::ScalableVectorType(t) => {
+                BasicValueEnum::ScalableVectorValue(t.get_undef())
+            }
+        }
+    }
+
+    fn get_poison<'ctx>(llvm_type: BasicTypeEnum<'ctx>) -> BasicValueEnum<'ctx> {
+        match llvm_type {
+            BasicTypeEnum::IntType(t) => BasicValueEnum::IntValue(t.get_poison()),
+            BasicTypeEnum::FloatType(t) => BasicValueEnum::FloatValue(t.get_poison()),
+            BasicTypeEnum::PointerType(t) => BasicValueEnum::PointerValue(t.get_poison()),
+            BasicTypeEnum::ArrayType(t) => BasicValueEnum::ArrayValue(t.get_poison()),
+            BasicTypeEnum::StructType(t) => BasicValueEnum::StructValue(t.get_poison()),
+            BasicTypeEnum::VectorType(t) => BasicValueEnum::VectorValue(t.get_poison()),
+            BasicTypeEnum::ScalableVectorType(t) => {
+                BasicValueEnum::ScalableVectorValue(t.get_poison())
+            }
         }
     }
 }
@@ -830,6 +864,100 @@ mod tests {
             FnResult {
                 state,
                 values: vec![sum],
+            }
+        });
+        assert_eq!(jit_run_i32(&rvsdg, "test"), 42);
+    }
+
+    #[test]
+    fn const_undef_i32_compiles() {
+        // undef i32 used in an add — the result is undef but should not crash
+        let mut rvsdg = RVSDGMod::new_host(String::from("test"));
+        let undef_id = rvsdg.constants.intern(crate::rvsdg::ConstantDef {
+            ty: I32,
+            kind: crate::rvsdg::ConstantKind::Undef,
+        });
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], FnLinkageType::External);
+        rvsdg.define_fn(func_id, |rb, state| {
+            let u = rb.const_pool_ref(undef_id, I32);
+            let v = rb.const_i32(0);
+            // undef + 0 = undef, but the program should compile and run
+            let result = rb.binary(BinaryOp::Add, ArithFlags::default(), u, v, I32);
+            FnResult {
+                state,
+                values: vec![result],
+            }
+        });
+        // Just verify it doesn't crash — the value is undefined
+        let _ = jit_run_i32(&rvsdg, "test");
+    }
+
+    #[test]
+    fn const_undef_f32_compiles() {
+        let mut rvsdg = RVSDGMod::new_host(String::from("test"));
+        let undef_id = rvsdg.constants.intern(crate::rvsdg::ConstantDef {
+            ty: F32,
+            kind: crate::rvsdg::ConstantKind::Undef,
+        });
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[F32], FnLinkageType::External);
+        rvsdg.define_fn(func_id, |rb, state| {
+            let u = rb.const_pool_ref(undef_id, F32);
+            FnResult {
+                state,
+                values: vec![u],
+            }
+        });
+        let _ = jit_run_f32(&rvsdg, "test");
+    }
+
+    #[test]
+    fn const_poison_i32_compiles() {
+        // poison i32 — should compile and run without crashing
+        let mut rvsdg = RVSDGMod::new_host(String::from("test"));
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], FnLinkageType::External);
+        rvsdg.define_fn(func_id, |rb, state| {
+            let p = rb.constant(I32, ConstValue::Poison);
+            let v = rb.const_i32(0);
+            let result = rb.binary(BinaryOp::Add, ArithFlags::default(), p, v, I32);
+            FnResult {
+                state,
+                values: vec![result],
+            }
+        });
+        let _ = jit_run_i32(&rvsdg, "test");
+    }
+
+    #[test]
+    fn const_poison_f32_compiles() {
+        let mut rvsdg = RVSDGMod::new_host(String::from("test"));
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[F32], FnLinkageType::External);
+        rvsdg.define_fn(func_id, |rb, state| {
+            let p = rb.constant(F32, ConstValue::Poison);
+            FnResult {
+                state,
+                values: vec![p],
+            }
+        });
+        let _ = jit_run_f32(&rvsdg, "test");
+    }
+
+    #[test]
+    fn const_undef_overwritten() {
+        // Start with undef, overwrite with 42 via ternary(true, 42, undef)
+        let mut rvsdg = RVSDGMod::new_host(String::from("test"));
+        let undef_id = rvsdg.constants.intern(crate::rvsdg::ConstantDef {
+            ty: I32,
+            kind: crate::rvsdg::ConstantKind::Undef,
+        });
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], FnLinkageType::External);
+        rvsdg.define_fn(func_id, |rb, state| {
+            let u = rb.const_pool_ref(undef_id, I32);
+            let v = rb.const_i32(42);
+            let cond = rb.constant(BOOL, ConstValue::Int(1));
+            let result = rb.ternary(cond, v, u, I32);
+            FnResult {
+                state,
+                values: vec![result],
             }
         });
         assert_eq!(jit_run_i32(&rvsdg, "test"), 42);

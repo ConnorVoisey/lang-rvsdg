@@ -75,10 +75,10 @@ impl<'a> RegionBuilder<'a> {
         &mut self,
         aggregate: ValueId,
         value: ValueId,
-        indices: &[ValueId],
+        indices: &[u32],
         aggregate_type: TypeRef,
     ) -> ValueId {
-        let indices_span = self.graph.value_pool.push_slice(indices);
+        let indices_span = self.graph.u32_pool.push_slice(indices);
         self.add_value(Value {
             ty: aggregate_type,
             kind: ValueKind::InsertField {

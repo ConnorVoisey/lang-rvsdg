@@ -8,9 +8,7 @@ use inkwell::{
     FloatPredicate, IntPredicate,
     builder::BuilderError,
     types::BasicType,
-    values::{
-        BasicMetadataValueEnum, BasicValueEnum, InstructionValue, ValueKind as LLVMValueKind,
-    },
+    values::{BasicMetadataValueEnum, BasicValueEnum, ValueKind as LLVMValueKind},
 };
 
 impl RVSDGMod {
@@ -40,7 +38,14 @@ impl RVSDGMod {
                     .expect("global should have be lowered to llvm earlier");
                 Some(BasicValueEnum::PointerValue(glob.as_pointer_value()))
             }
-            ValueKind::FuncAddr(func_id) => todo!(),
+            ValueKind::FuncAddr(func_id) => {
+                let func = mapper
+                    .get_fn(func_id)
+                    .expect("function should have been registered");
+                Some(BasicValueEnum::PointerValue(
+                    func.as_global_value().as_pointer_value(),
+                ))
+            }
             ValueKind::Unary { op, operand } => {
                 Some(self.lower_unary(llvm_builder, mapper, rvsdg_func, op, operand)?)
             }
@@ -121,14 +126,14 @@ impl RVSDGMod {
                     "select",
                 )?)
             }
-            ValueKind::Cast { op, value } => todo!(),
-            ValueKind::ExtractLane { vector, index } => todo!(),
-            ValueKind::InsertLane {
-                vector,
-                index,
-                value,
-            } => todo!(),
-            ValueKind::ShuffleLanes { left, right, mask } => todo!(),
+            ValueKind::Cast { op, value: operand } => {
+                Some(self.lower_cast(llvm_builder, mapper, rvsdg_func, op, operand, value)?)
+            }
+
+            ValueKind::ExtractLane { .. }
+            | ValueKind::InsertLane { .. }
+            | ValueKind::ShuffleLanes { .. } => todo!("lower simd values"),
+
             ValueKind::ExtractField { aggregate, indices } => {
                 let mut agg = self.expect_value(llvm_builder, mapper, rvsdg_func, aggregate)?;
                 let idx_slice = self.u32_pool.get(indices);
@@ -147,15 +152,80 @@ impl RVSDGMod {
             }
             ValueKind::InsertField {
                 aggregate,
-                value,
+                value: insert_val,
                 indices,
-            } => todo!(),
+            } => {
+                let agg = self.expect_value(llvm_builder, mapper, rvsdg_func, aggregate)?;
+                let val = self.expect_value(llvm_builder, mapper, rvsdg_func, insert_val)?;
+                let idx_slice = self.u32_pool.get(indices);
+                let b = &llvm_builder.builder;
+
+                // TODO: support multi-index insertvalue (e.g. insertvalue %s, i32 42, 0, 1)
+                // by extracting nested aggregates, inserting at the leaf, and inserting
+                // modified aggregates back up the chain.
+                assert_eq!(
+                    idx_slice.len(),
+                    1,
+                    "multi-index insertvalue not yet supported"
+                );
+
+                let result = match agg {
+                    BasicValueEnum::ArrayValue(av) => {
+                        b.build_insert_value(av, val, idx_slice[0], "insert")?
+                    }
+                    BasicValueEnum::StructValue(sv) => {
+                        b.build_insert_value(sv, val, idx_slice[0], "insert")?
+                    }
+                    _ => panic!("insertvalue requires an aggregate (array or struct) value"),
+                };
+                // AggregateValueEnum -> BasicValueEnum
+                Some(match result {
+                    inkwell::values::AggregateValueEnum::ArrayValue(av) => {
+                        BasicValueEnum::ArrayValue(av)
+                    }
+                    inkwell::values::AggregateValueEnum::StructValue(sv) => {
+                        BasicValueEnum::StructValue(sv)
+                    }
+                })
+            }
             ValueKind::PtrOffset {
                 base,
                 base_type,
                 indices,
                 inbounds,
-            } => todo!(),
+            } => {
+                let ptr = self.expect_value(llvm_builder, mapper, rvsdg_func, base)?;
+                let pointee_type = self.type_to_basic_type_llvm(llvm_builder.context, base_type);
+                let idx_ids = self.value_pool.get(indices).to_vec();
+                let idx_vals: Vec<_> = idx_ids
+                    .iter()
+                    .map(|&id| {
+                        self.expect_value(llvm_builder, mapper, rvsdg_func, id)
+                            .expect("failed to lower GEP index")
+                            .into_int_value()
+                    })
+                    .collect();
+                let result = if inbounds {
+                    unsafe {
+                        llvm_builder.builder.build_in_bounds_gep(
+                            pointee_type,
+                            ptr.into_pointer_value(),
+                            &idx_vals,
+                            "gep",
+                        )?
+                    }
+                } else {
+                    unsafe {
+                        llvm_builder.builder.build_gep(
+                            pointee_type,
+                            ptr.into_pointer_value(),
+                            &idx_vals,
+                            "gep",
+                        )?
+                    }
+                };
+                Some(BasicValueEnum::PointerValue(result))
+            }
             ValueKind::Load {
                 state: _,
                 addr,
@@ -163,76 +233,81 @@ impl RVSDGMod {
                 align,
                 volatile,
             } => {
-                let ptr = self.expect_value(llvm_builder, mapper, rvsdg_func, addr)?;
-                let pointee_type = self.type_to_basic_type_llvm(llvm_builder.context, loaded_type);
-                let load = llvm_builder.builder.build_load(
-                    pointee_type,
-                    ptr.into_pointer_value(),
-                    "load",
+                self.lower_load(
+                    llvm_builder,
+                    mapper,
+                    rvsdg_func,
+                    addr,
+                    loaded_type,
+                    align,
+                    volatile,
+                    value_id,
                 )?;
-                let inst = llvm_builder
-                    .builder
-                    .get_insert_block()
-                    .unwrap()
-                    .get_last_instruction()
-                    .unwrap();
-                // build_load always produces an instruction-backed value
-                if let Some(a) = align {
-                    inst.set_alignment(a).unwrap();
-                }
-                if volatile {
-                    inst.set_volatile(true).unwrap();
-                }
-                // Load is a multi-output node (state + value). Write value to Project slot.
-                let project_id = ValueId(value_id.0 + 1);
-                mapper.set_val(project_id, load);
                 None
             }
             ValueKind::Store {
-                state,
+                state: _,
                 addr,
                 value,
                 align,
                 volatile,
-            } => todo!(),
+            } => {
+                self.lower_store(
+                    llvm_builder,
+                    mapper,
+                    rvsdg_func,
+                    addr,
+                    value,
+                    align,
+                    volatile,
+                )?;
+
+                None
+            }
             ValueKind::Alloca {
-                state,
+                state: _,
                 elem_type,
                 count,
-            } => todo!(),
-            ValueKind::AtomicLoad {
-                state,
-                addr,
-                loaded_type,
-                ordering,
-                align,
-            } => todo!(),
-            ValueKind::AtomicStore {
-                state,
-                addr,
-                value,
-                ordering,
-                align,
-            } => todo!(),
-            ValueKind::AtomicReadModifyWrite {
-                state,
-                addr,
-                value,
-                op,
-                ordering,
-            } => todo!(),
+            } => {
+                self.lower_alloca(llvm_builder, mapper, rvsdg_func, value_id, elem_type, count)?;
+                None
+            }
+
+            ValueKind::AtomicLoad { .. }
+            | ValueKind::AtomicStore { .. }
+            | ValueKind::AtomicReadModifyWrite { .. } => todo!("lower atomics"),
+
             ValueKind::CompareAndSwap {
-                state,
+                state: _,
                 addr,
                 expected,
                 desired,
                 success_ordering,
                 failure_ordering,
-            } => todo!(),
-            ValueKind::Fence { state, ordering } => todo!(),
+            } => {
+                self.lower_cmpxchg(
+                    llvm_builder,
+                    mapper,
+                    rvsdg_func,
+                    value_id,
+                    addr,
+                    expected,
+                    desired,
+                    success_ordering,
+                    failure_ordering,
+                )?;
+                None
+            }
+            ValueKind::Fence { state: _, ordering } => todo!(),
             ValueKind::Freeze { value } => todo!(),
-            ValueKind::Intrinsic { op, state, args } => todo!(),
-            ValueKind::Lambda { region, func_id } => None,
+            ValueKind::Intrinsic { op, state: _, args } => {
+                self.lower_intrinsic(llvm_builder, mapper, rvsdg_func, op, args, value_id)?;
+                None
+            }
+            ValueKind::Lambda {
+                region: _,
+                func_id: _,
+            } => None,
             ValueKind::Theta {
                 loop_vars,
                 condition,
@@ -360,10 +435,13 @@ impl RVSDGMod {
                     *mapper.get_val(call)
                 }
             }
-            ValueKind::RegionParam { index, ty } => {
+            ValueKind::RegionParam { index: _, ty: _ } => {
                 unreachable!("RegionParam should have been pre-populated in the mapper")
             }
-            ValueKind::RegionResult { values, state } => None,
+            ValueKind::RegionResult {
+                values: _,
+                state: _,
+            } => None,
         };
 
         if let Some(val) = lowered_val {

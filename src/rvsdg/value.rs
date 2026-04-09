@@ -89,7 +89,7 @@ pub enum ValueKind {
         aggregate: ValueId,
         value: ValueId,
         /// Constant index path
-        indices: ValuesSpan,
+        indices: U32Span,
     },
     /// Compute a pointer to a field or element within an aggregate.
     /// LLVM's `getelementptr` — indices walk through nested structs/arrays.

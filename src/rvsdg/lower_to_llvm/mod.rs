@@ -15,8 +15,11 @@ use inkwell::{
 use std::{error::Error, path::Path, process::Command};
 
 pub mod binary;
+pub mod cast;
 pub mod const_val;
 pub mod gamma;
+pub mod intrinsic;
+pub mod memory;
 pub mod test_utils;
 pub mod theta;
 pub mod unary;
@@ -303,7 +306,9 @@ impl RVSDGMod {
                 ScalarType::I128 => BasicTypeEnum::IntType(context.i128_type()),
                 ScalarType::F32 => BasicTypeEnum::FloatType(context.f32_type()),
                 ScalarType::F64 => BasicTypeEnum::FloatType(context.f64_type()),
-                ScalarType::Void => todo!(),
+                // Void is not a BasicType in LLVM — it only appears as a function
+                // return type, never as a value/parameter/alloca type.
+                ScalarType::Void => unreachable!("void is not a basic type"),
             },
             TypeRef::Ptr(_) => {
                 BasicTypeEnum::PointerType(context.ptr_type(AddressSpace::default()))
@@ -313,9 +318,31 @@ impl RVSDGMod {
                 let elem = self.type_to_basic_type_llvm(context, arr.element);
                 BasicTypeEnum::ArrayType(elem.array_type(arr.len as u32))
             }
-            TypeRef::Struct(struct_id) => todo!(),
-            TypeRef::Vector(vector_type_id) => todo!(),
-            TypeRef::Func(func_type_id) => todo!(),
+            TypeRef::Struct(struct_id) => {
+                let def = self.types.get_struct(struct_id);
+                let field_types: Vec<BasicTypeEnum> = def
+                    .fields
+                    .iter()
+                    .map(|f| self.type_to_basic_type_llvm(context, f.field_type))
+                    .collect();
+                BasicTypeEnum::StructType(context.struct_type(&field_types, false))
+            }
+            TypeRef::Vector(vector_type_id) => {
+                let vec = self.types.get_vector(vector_type_id);
+                let elem = self.type_to_basic_type_llvm(context, vec.element);
+                match elem {
+                    BasicTypeEnum::IntType(t) => BasicTypeEnum::VectorType(t.vec_type(vec.lanes)),
+                    BasicTypeEnum::FloatType(t) => BasicTypeEnum::VectorType(t.vec_type(vec.lanes)),
+                    BasicTypeEnum::PointerType(t) => {
+                        BasicTypeEnum::VectorType(t.vec_type(vec.lanes))
+                    }
+                    _ => panic!("vector element must be scalar or pointer"),
+                }
+            }
+            // FuncType is not a BasicType — functions exist only as pointers
+            // (opaque ptr in LLVM 17+). If a TypeRef::Func reaches here, the
+            // caller has a bug.
+            TypeRef::Func(_) => unreachable!("function type is not a basic type"),
         }
     }
 
@@ -325,7 +352,8 @@ impl RVSDGMod {
         ty: TypeRef,
     ) -> BasicMetadataTypeEnum<'b> {
         match ty {
-            TypeRef::State => todo!(),
+            // State is an IR-only concept with no LLVM representation.
+            TypeRef::State => unreachable!("state has no LLVM type representation"),
             TypeRef::Scalar(scalar_type) => match scalar_type {
                 ScalarType::Bool => BasicMetadataTypeEnum::IntType(context.bool_type()),
                 ScalarType::I8 => BasicMetadataTypeEnum::IntType(context.i8_type()),
@@ -335,7 +363,7 @@ impl RVSDGMod {
                 ScalarType::I128 => BasicMetadataTypeEnum::IntType(context.i128_type()),
                 ScalarType::F32 => BasicMetadataTypeEnum::FloatType(context.f32_type()),
                 ScalarType::F64 => BasicMetadataTypeEnum::FloatType(context.f64_type()),
-                ScalarType::Void => todo!(),
+                ScalarType::Void => unreachable!("void is not a basic metadata type"),
             },
             TypeRef::Ptr(_) => {
                 BasicMetadataTypeEnum::PointerType(context.ptr_type(AddressSpace::default()))
@@ -345,9 +373,32 @@ impl RVSDGMod {
                 let elem = self.type_to_basic_type_llvm(context, arr.element);
                 BasicMetadataTypeEnum::ArrayType(elem.array_type(arr.len as u32))
             }
-            TypeRef::Struct(struct_id) => todo!(),
-            TypeRef::Vector(vector_type_id) => todo!(),
-            TypeRef::Func(func_type_id) => todo!(),
+            TypeRef::Struct(struct_id) => {
+                let def = self.types.get_struct(struct_id);
+                let field_types: Vec<BasicTypeEnum> = def
+                    .fields
+                    .iter()
+                    .map(|f| self.type_to_basic_type_llvm(context, f.field_type))
+                    .collect();
+                BasicMetadataTypeEnum::StructType(context.struct_type(&field_types, false))
+            }
+            TypeRef::Vector(vector_type_id) => {
+                let vec = self.types.get_vector(vector_type_id);
+                let elem = self.type_to_basic_type_llvm(context, vec.element);
+                match elem {
+                    BasicTypeEnum::IntType(t) => {
+                        BasicMetadataTypeEnum::VectorType(t.vec_type(vec.lanes))
+                    }
+                    BasicTypeEnum::FloatType(t) => {
+                        BasicMetadataTypeEnum::VectorType(t.vec_type(vec.lanes))
+                    }
+                    BasicTypeEnum::PointerType(t) => {
+                        BasicMetadataTypeEnum::VectorType(t.vec_type(vec.lanes))
+                    }
+                    _ => panic!("vector element must be scalar or pointer"),
+                }
+            }
+            TypeRef::Func(_) => unreachable!("function type is not a basic metadata type"),
         }
     }
 }
@@ -375,6 +426,553 @@ impl GlobalLinkage {
             GlobalLinkage::Weak => Linkage::WeakAny,
             GlobalLinkage::Common => Linkage::Common,
         }
+    }
+}
+
+#[cfg(test)]
+mod integration_tests {
+    use crate::rvsdg::{
+        ArithFlags, BinaryOp, CastOp, GlobalInit, GlobalLinkage, ICmpPred, IntrinsicOp, RVSDGMod,
+        builder::{BranchResult, LoopResult},
+        func::{FnLinkageType, FnResult},
+        lower_to_llvm::test_utils::test_utils::jit_run_i32,
+        types::{ArrayType, I32, I64, PtrType, StructDef, StructField, TypeRef},
+        value::ConstValue,
+    };
+
+    fn make_ptr_ty(rvsdg: &mut RVSDGMod, pointee: TypeRef) -> TypeRef {
+        TypeRef::Ptr(rvsdg.types.intern_ptr(PtrType {
+            pointee: Some(pointee),
+            alias_set: None,
+            no_escape: false,
+        }))
+    }
+
+    #[test]
+    fn struct_alloca_gep_store_load() {
+        // Allocate a struct { i32, i32 } on the stack, store fields via GEP, load and sum
+        let mut rvsdg = RVSDGMod::new_host(String::from("test"));
+        let struct_id = rvsdg.types.intern_struct(StructDef {
+            name: None,
+            fields: vec![
+                StructField {
+                    name: None,
+                    offset: 0,
+                    field_type: I32,
+                },
+                StructField {
+                    name: None,
+                    offset: 4,
+                    field_type: I32,
+                },
+            ],
+            size: 8,
+        });
+        let struct_ty = TypeRef::Struct(struct_id);
+        let struct_ptr_ty = make_ptr_ty(&mut rvsdg, struct_ty);
+        let i32_ptr_ty = make_ptr_ty(&mut rvsdg, I32);
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], FnLinkageType::External);
+        rvsdg.define_fn(func_id, |rb, state| {
+            let one = rb.const_i32(1);
+            let alloc = rb.alloca(state, struct_ty, one, struct_ptr_ty);
+
+            let zero = rb.const_i32(0);
+            let idx1 = rb.const_i32(1);
+
+            // GEP to field 0 and field 1
+            let f0_ptr = rb.ptr_offset(alloc.ptr, struct_ty, &[zero, zero], i32_ptr_ty, true);
+            let f1_ptr = rb.ptr_offset(alloc.ptr, struct_ty, &[zero, idx1], i32_ptr_ty, true);
+
+            let v30 = rb.const_i32(30);
+            let v12 = rb.const_i32(12);
+            let s1 = rb.store(alloc.state, f0_ptr, v30, None, false);
+            let s2 = rb.store(s1, f1_ptr, v12, None, false);
+
+            let l0 = rb.load(s2, f0_ptr, I32, None, false);
+            let l1 = rb.load(l0.state, f1_ptr, I32, None, false);
+            let sum = rb.binary(
+                BinaryOp::Add,
+                ArithFlags::default(),
+                l0.value,
+                l1.value,
+                I32,
+            );
+            FnResult {
+                state: l1.state,
+                values: vec![sum],
+            }
+        });
+        assert_eq!(jit_run_i32(&rvsdg, "test"), 42);
+    }
+
+    #[test]
+    fn multi_function_call() {
+        // Define add(a, b) -> i32, call it from main
+        let mut rvsdg = RVSDGMod::new_host(String::from("test"));
+        let add_fn = rvsdg.declare_fn(
+            String::from("add"),
+            &[I32, I32],
+            &[I32],
+            FnLinkageType::Internal,
+        );
+        rvsdg.define_fn(add_fn, |rb, state| {
+            let a = rb.param(0);
+            let b = rb.param(1);
+            let sum = rb.binary(BinaryOp::Add, ArithFlags::default(), a, b, I32);
+            FnResult {
+                state,
+                values: vec![sum],
+            }
+        });
+
+        let main_fn = rvsdg.declare_fn(String::from("test"), &[], &[I32], FnLinkageType::External);
+        rvsdg.define_fn(main_fn, |rb, state| {
+            let a = rb.const_i32(30);
+            let b = rb.const_i32(12);
+            let res = rb.call(add_fn, state, &[a, b]);
+            FnResult {
+                state: res.state,
+                values: vec![res.result(0)],
+            }
+        });
+        assert_eq!(jit_run_i32(&rvsdg, "test"), 42);
+    }
+
+    #[test]
+    fn loop_with_conditional_accumulator() {
+        // sum = 0; for i in 1..=10 { if i % 2 == 0 { sum += i } else { sum += 1 } }
+        // even: 2+4+6+8+10 = 30, odd count: 5
+        // total = 30 + 5 = 35
+        let mut rvsdg = RVSDGMod::new_host(String::from("test"));
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], FnLinkageType::External);
+        rvsdg.define_fn(func_id, |rb, state| {
+            let i = rb.const_i32(1);
+            let sum = rb.const_i32(0);
+            let res = rb.theta(state, &[i, sum], |rb| {
+                let loop_i = rb.param(0);
+                let loop_sum = rb.param(1);
+
+                let two = rb.const_i32(2);
+                let rem = rb.binary(
+                    BinaryOp::UnsignedRem,
+                    ArithFlags::default(),
+                    loop_i,
+                    two,
+                    I32,
+                );
+                let zero = rb.const_i32(0);
+                let is_even = rb.icmp(ICmpPred::Eq, rem, zero);
+
+                // if even { i } else { 1 }
+                let branch = rb.gamma(
+                    is_even,
+                    state,
+                    &[loop_i],
+                    |rb| BranchResult {
+                        state,
+                        values: vec![rb.param(0)],
+                    },
+                    |rb| BranchResult {
+                        state,
+                        values: vec![rb.const_i32(1)],
+                    },
+                );
+                let to_add = branch.result(0);
+                let next_sum =
+                    rb.binary(BinaryOp::Add, ArithFlags::default(), loop_sum, to_add, I32);
+
+                let one = rb.const_i32(1);
+                let next_i = rb.binary(BinaryOp::Add, ArithFlags::default(), loop_i, one, I32);
+                let ten = rb.const_i32(10);
+                let cond = rb.icmp(ICmpPred::SignedLe, next_i, ten);
+                LoopResult {
+                    condition: cond,
+                    next_state: state,
+                    next_vars: vec![next_i, next_sum],
+                }
+            });
+            FnResult {
+                state: res.state,
+                values: vec![res.result(1)],
+            }
+        });
+        assert_eq!(jit_run_i32(&rvsdg, "test"), 35);
+    }
+
+    #[test]
+    fn array_of_structs_via_globals() {
+        // Global array of 3 structs {i32, i32}, sum field 1 of each
+        // [{10, 1}, {20, 2}, {30, 3}] => sum of field 1 = 1 + 2 + 3 = 6
+        let mut rvsdg = RVSDGMod::new_host(String::from("test"));
+        let struct_id = rvsdg.types.intern_struct(StructDef {
+            name: None,
+            fields: vec![
+                StructField {
+                    name: None,
+                    offset: 0,
+                    field_type: I32,
+                },
+                StructField {
+                    name: None,
+                    offset: 4,
+                    field_type: I32,
+                },
+            ],
+            size: 8,
+        });
+        let struct_ty = TypeRef::Struct(struct_id);
+        let arr_ty_id = rvsdg.types.intern_array(ArrayType {
+            element: struct_ty,
+            len: 3,
+        });
+        let arr_ty = TypeRef::Array(arr_ty_id);
+
+        // Build aggregate: [{10,1}, {20,2}, {30,3}]
+        let s0_f0 = rvsdg.constants.scalar(I32, ConstValue::Int(10));
+        let s0_f1 = rvsdg.constants.scalar(I32, ConstValue::Int(1));
+        let s0 = rvsdg.constants.aggregate(struct_ty, &[s0_f0, s0_f1]);
+        let s1_f0 = rvsdg.constants.scalar(I32, ConstValue::Int(20));
+        let s1_f1 = rvsdg.constants.scalar(I32, ConstValue::Int(2));
+        let s1 = rvsdg.constants.aggregate(struct_ty, &[s1_f0, s1_f1]);
+        let s2_f0 = rvsdg.constants.scalar(I32, ConstValue::Int(30));
+        let s2_f1 = rvsdg.constants.scalar(I32, ConstValue::Int(3));
+        let s2 = rvsdg.constants.aggregate(struct_ty, &[s2_f0, s2_f1]);
+        let arr_const = rvsdg.constants.aggregate(arr_ty, &[s0, s1, s2]);
+
+        let global_id = rvsdg.define_global(
+            String::from("structs"),
+            arr_ty,
+            GlobalInit::Init(arr_const),
+            true,
+            GlobalLinkage::Internal,
+        );
+        let arr_ptr_ty = make_ptr_ty(&mut rvsdg, arr_ty);
+        let i32_ptr_ty = make_ptr_ty(&mut rvsdg, I32);
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], FnLinkageType::External);
+        rvsdg.define_fn(func_id, |rb, state| {
+            let arr_ptr = rb.global_ref(global_id, arr_ptr_ty);
+            let zero = rb.const_i32(0);
+            let field1_idx = rb.const_i32(1);
+
+            // Sum field 1 of each struct in a loop
+            let i = rb.const_i32(0);
+            let sum = rb.const_i32(0);
+            let res = rb.theta(state, &[i, sum], |rb| {
+                let loop_i = rb.param(0);
+                let loop_sum = rb.param(1);
+
+                // GEP arr[i].field1
+                let field_ptr = rb.ptr_offset(
+                    arr_ptr,
+                    arr_ty,
+                    &[zero, loop_i, field1_idx],
+                    i32_ptr_ty,
+                    true,
+                );
+                let loaded = rb.load(state, field_ptr, I32, None, false);
+                let next_sum = rb.binary(
+                    BinaryOp::Add,
+                    ArithFlags::default(),
+                    loop_sum,
+                    loaded.value,
+                    I32,
+                );
+
+                let one = rb.const_i32(1);
+                let next_i = rb.binary(BinaryOp::Add, ArithFlags::default(), loop_i, one, I32);
+                let three = rb.const_i32(3);
+                let cond = rb.icmp(ICmpPred::SignedLt, next_i, three);
+                LoopResult {
+                    condition: cond,
+                    next_state: loaded.state,
+                    next_vars: vec![next_i, next_sum],
+                }
+            });
+            FnResult {
+                state: res.state,
+                values: vec![res.result(1)],
+            }
+        });
+        assert_eq!(jit_run_i32(&rvsdg, "test"), 6);
+    }
+
+    #[test]
+    fn cast_loop_with_i64_accumulator() {
+        // Sum 1..10 using i64 accumulator, truncate back to i32
+        let mut rvsdg = RVSDGMod::new_host(String::from("test"));
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], FnLinkageType::External);
+        rvsdg.define_fn(func_id, |rb, state| {
+            let i = rb.const_i32(1);
+            let sum = rb.const_i64(0);
+            let res = rb.theta(state, &[i, sum], |rb| {
+                let loop_i = rb.param(0);
+                let loop_sum = rb.param(1);
+
+                // widen i to i64, add to sum
+                let wide_i = rb.cast(CastOp::SignExtend, loop_i, I64);
+                let next_sum =
+                    rb.binary(BinaryOp::Add, ArithFlags::default(), loop_sum, wide_i, I64);
+
+                let one = rb.const_i32(1);
+                let next_i = rb.binary(BinaryOp::Add, ArithFlags::default(), loop_i, one, I32);
+                let ten = rb.const_i32(10);
+                let cond = rb.icmp(ICmpPred::SignedLe, next_i, ten);
+                LoopResult {
+                    condition: cond,
+                    next_state: state,
+                    next_vars: vec![next_i, next_sum],
+                }
+            });
+            // truncate i64 sum back to i32
+            let result = rb.cast(CastOp::Truncate, res.result(1), I32);
+            FnResult {
+                state: res.state,
+                values: vec![result],
+            }
+        });
+        assert_eq!(jit_run_i32(&rvsdg, "test"), 55);
+    }
+
+    #[test]
+    fn fibonacci() {
+        // fib(10) = 55 via theta loop
+        // a = 0, b = 1; for _ in 0..10 { tmp = a + b; a = b; b = tmp }; return a
+        let mut rvsdg = RVSDGMod::new_host(String::from("test"));
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], FnLinkageType::External);
+        rvsdg.define_fn(func_id, |rb, state| {
+            let a = rb.const_i32(0);
+            let b = rb.const_i32(1);
+            let i = rb.const_i32(0);
+            let res = rb.theta(state, &[a, b, i], |rb| {
+                let loop_a = rb.param(0);
+                let loop_b = rb.param(1);
+                let loop_i = rb.param(2);
+
+                let next_a = loop_b;
+                let next_b = rb.binary(BinaryOp::Add, ArithFlags::default(), loop_a, loop_b, I32);
+
+                let one = rb.const_i32(1);
+                let next_i = rb.binary(BinaryOp::Add, ArithFlags::default(), loop_i, one, I32);
+                let ten = rb.const_i32(10);
+                let cond = rb.icmp(ICmpPred::SignedLt, next_i, ten);
+                LoopResult {
+                    condition: cond,
+                    next_state: state,
+                    next_vars: vec![next_a, next_b, next_i],
+                }
+            });
+            FnResult {
+                state: res.state,
+                values: vec![res.result(0)],
+            }
+        });
+        assert_eq!(jit_run_i32(&rvsdg, "test"), 55);
+    }
+
+    #[test]
+    fn saturating_clamp_in_loop() {
+        // Repeatedly add 100 using saturating add, 30 times
+        // Without saturation: 3000. With i32 saturation: still 3000 (no overflow)
+        // Then do it with a value close to MAX to actually saturate
+        let mut rvsdg = RVSDGMod::new_host(String::from("test"));
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], FnLinkageType::External);
+        rvsdg.define_fn(func_id, |rb, state| {
+            let val = rb.const_i32(i32::MAX - 50);
+            let i = rb.const_i32(0);
+            let res = rb.theta(state, &[val, i], |rb| {
+                let loop_val = rb.param(0);
+                let loop_i = rb.param(1);
+
+                let hundred = rb.const_i32(100);
+                let sat_res = rb.intrinsic(
+                    IntrinsicOp::SignedAddSaturate,
+                    state,
+                    &[loop_val, hundred],
+                    I32,
+                );
+
+                let one = rb.const_i32(1);
+                let next_i = rb.binary(BinaryOp::Add, ArithFlags::default(), loop_i, one, I32);
+                let three = rb.const_i32(3);
+                let cond = rb.icmp(ICmpPred::SignedLt, next_i, three);
+                LoopResult {
+                    condition: cond,
+                    next_state: sat_res.state,
+                    next_vars: vec![sat_res.value, next_i],
+                }
+            });
+            // After 3 iterations of adding 100 starting from MAX-50,
+            // first add: MAX-50+100 = MAX+50 -> saturates to MAX
+            // subsequent adds also saturate to MAX
+            FnResult {
+                state: res.state,
+                values: vec![res.result(0)],
+            }
+        });
+        assert_eq!(jit_run_i32(&rvsdg, "test"), i32::MAX);
+    }
+
+    #[test]
+    fn nested_gamma_with_arithmetic() {
+        // Nested conditionals:
+        // x = 15
+        // if x > 10 {
+        //     if x > 20 { 100 } else { x * 2 }
+        // } else {
+        //     0
+        // }
+        // => 15 > 10 is true, 15 > 20 is false, so x * 2 = 30
+        let mut rvsdg = RVSDGMod::new_host(String::from("test"));
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], FnLinkageType::External);
+        rvsdg.define_fn(func_id, |rb, state| {
+            let x = rb.const_i32(15);
+            let ten = rb.const_i32(10);
+            let cond1 = rb.icmp(ICmpPred::SignedGt, x, ten);
+            let outer = rb.gamma(
+                cond1,
+                state,
+                &[x],
+                |rb| {
+                    let inner_x = rb.param(0);
+                    let twenty = rb.const_i32(20);
+                    let cond2 = rb.icmp(ICmpPred::SignedGt, inner_x, twenty);
+                    let inner = rb.gamma(
+                        cond2,
+                        state,
+                        &[inner_x],
+                        |rb| BranchResult {
+                            state,
+                            values: vec![rb.const_i32(100)],
+                        },
+                        |rb| {
+                            let v = rb.param(0);
+                            let two = rb.const_i32(2);
+                            let result =
+                                rb.binary(BinaryOp::Mul, ArithFlags::default(), v, two, I32);
+                            BranchResult {
+                                state,
+                                values: vec![result],
+                            }
+                        },
+                    );
+                    BranchResult {
+                        state,
+                        values: vec![inner.result(0)],
+                    }
+                },
+                |rb| BranchResult {
+                    state,
+                    values: vec![rb.const_i32(0)],
+                },
+            );
+            FnResult {
+                state: outer.state,
+                values: vec![outer.result(0)],
+            }
+        });
+        assert_eq!(jit_run_i32(&rvsdg, "test"), 30);
+    }
+
+    #[test]
+    fn bubble_sort_array() {
+        // Sort [4, 2, 7, 1, 3] using nested loops with store/load via GEP
+        // Return first element (should be 1)
+        let mut rvsdg = RVSDGMod::new_host(String::from("test"));
+        let arr_ty_id = rvsdg.types.intern_array(ArrayType {
+            element: I32,
+            len: 5,
+        });
+        let arr_ty = TypeRef::Array(arr_ty_id);
+        let elems: Vec<_> = [4, 2, 7, 1, 3]
+            .iter()
+            .map(|&v| rvsdg.constants.scalar(I32, ConstValue::Int(v)))
+            .collect();
+        let arr_const = rvsdg.constants.aggregate(arr_ty, &elems);
+        let global_id = rvsdg.define_global(
+            String::from("arr"),
+            arr_ty,
+            GlobalInit::Init(arr_const),
+            false,
+            GlobalLinkage::Internal,
+        );
+        let arr_ptr_ty = make_ptr_ty(&mut rvsdg, arr_ty);
+        let i32_ptr_ty = make_ptr_ty(&mut rvsdg, I32);
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], FnLinkageType::External);
+        rvsdg.define_fn(func_id, |rb, state| {
+            let arr_ptr = rb.global_ref(global_id, arr_ptr_ty);
+            let zero = rb.const_i32(0);
+
+            // Outer loop: i from 0 to 4
+            let i_init = rb.const_i32(0);
+            let outer = rb.theta(state, &[i_init], |rb| {
+                let outer_i = rb.param(0);
+
+                // Inner loop: j from 0 to 4-i (simplified: just 0 to 4)
+                let j_init = rb.const_i32(0);
+                let inner = rb.theta(state, &[j_init], |rb| {
+                    let j = rb.param(0);
+                    let one = rb.const_i32(1);
+                    let j_plus_1 = rb.binary(BinaryOp::Add, ArithFlags::default(), j, one, I32);
+
+                    let ptr_j = rb.ptr_offset(arr_ptr, arr_ty, &[zero, j], i32_ptr_ty, true);
+                    let ptr_j1 =
+                        rb.ptr_offset(arr_ptr, arr_ty, &[zero, j_plus_1], i32_ptr_ty, true);
+
+                    let val_j = rb.load(state, ptr_j, I32, None, false);
+                    let val_j1 = rb.load(val_j.state, ptr_j1, I32, None, false);
+
+                    // if arr[j] > arr[j+1], swap
+                    let should_swap = rb.icmp(ICmpPred::SignedGt, val_j.value, val_j1.value);
+                    let swapped = rb.gamma(
+                        should_swap,
+                        val_j1.state,
+                        &[val_j.value, val_j1.value],
+                        |rb| {
+                            // swap: store j1 value at j, j value at j+1
+                            let a = rb.param(0);
+                            let b = rb.param(1);
+                            let s1 = rb.store(state, ptr_j, b, None, false);
+                            let s2 = rb.store(s1, ptr_j1, a, None, false);
+                            BranchResult {
+                                state: s2,
+                                values: vec![],
+                            }
+                        },
+                        |_rb| BranchResult {
+                            state,
+                            values: vec![],
+                        },
+                    );
+
+                    let four = rb.const_i32(4);
+                    let cond = rb.icmp(ICmpPred::SignedLt, j_plus_1, four);
+                    LoopResult {
+                        condition: cond,
+                        next_state: swapped.state,
+                        next_vars: vec![j_plus_1],
+                    }
+                });
+
+                let one = rb.const_i32(1);
+                let next_i = rb.binary(BinaryOp::Add, ArithFlags::default(), outer_i, one, I32);
+                let four = rb.const_i32(4);
+                let cond = rb.icmp(ICmpPred::SignedLt, next_i, four);
+                LoopResult {
+                    condition: cond,
+                    next_state: inner.state,
+                    next_vars: vec![next_i],
+                }
+            });
+
+            // Load first element (should be smallest = 1)
+            let first_ptr = rb.ptr_offset(arr_ptr, arr_ty, &[zero, zero], i32_ptr_ty, true);
+            let result = rb.load(outer.state, first_ptr, I32, None, false);
+            FnResult {
+                state: result.state,
+                values: vec![result.value],
+            }
+        });
+        assert_eq!(jit_run_i32(&rvsdg, "test"), 1);
     }
 }
 

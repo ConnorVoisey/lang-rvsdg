@@ -2,7 +2,7 @@ use crate::rvsdg::{
     GlobalInit, GlobalLinkage, RVSDGMod,
     builder::LoopResult,
     func::{FnLinkageType, FnResult},
-    types::{ArrayType, I64, I32, PtrType, ScalarType, TypeRef},
+    types::{ArrayType, I32, I64, PtrType, ScalarType, TypeRef},
     value::ConstValue,
 };
 
