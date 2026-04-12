@@ -9,11 +9,12 @@ pub mod value;
 
 pub use constant::{ConstId, ConstIdPool, ConstIdsSpan, ConstantDef, ConstantKind, ConstantPool};
 use func::Function;
-pub use global::{GlobalDef, GlobalInit, GlobalLinkage};
+pub use global::{GlobalDef, GlobalInit};
 pub use ops::{
     ArithFlags, AtomicRMWOp, BinaryOp, CastOp, FCmpPred, ICmpPred, IntrinsicOp, MemoryOrdering,
     UnaryOp,
 };
+use rustc_hash::FxHashMap;
 pub use target_lexicon::Triple;
 use types::{TypeArena, TypeRef};
 pub use value::{ConstValue, Value, ValueKind};
@@ -35,6 +36,10 @@ pub struct RVSDGMod {
     pub value_pool: ValuePool,
     pub region_pool: RegionPool,
     pub u32_pool: U32Pool,
+
+    // These maps should probably use &str instead of String
+    pub fn_map: FxHashMap<String, FuncId>,
+    pub global_map: FxHashMap<String, GlobalId>,
 }
 
 impl RVSDGMod {
@@ -52,6 +57,8 @@ impl RVSDGMod {
             value_pool: ValuePool(vec![]),
             region_pool: RegionPool(vec![]),
             u32_pool: U32Pool(vec![]),
+            fn_map: FxHashMap::default(),
+            global_map: FxHashMap::default(),
         }
     }
 
@@ -68,33 +75,6 @@ impl RVSDGMod {
     #[inline]
     pub fn get_region(&self, region_id: RegionId) -> &Region {
         &self.regions[region_id.0 as usize]
-    }
-
-    pub fn define_global(
-        &mut self,
-        name: String,
-        ty: TypeRef,
-        initializer: GlobalInit,
-        is_constant: bool,
-        linkage: GlobalLinkage,
-    ) -> GlobalId {
-        let id = GlobalId(self.globals.len() as u32);
-        self.globals.push(GlobalDef {
-            name,
-            ty,
-            initializer,
-            is_constant,
-            linkage,
-            alignment: None,
-            section: None,
-            visibility: Visibility::default(),
-        });
-        id
-    }
-
-    #[inline]
-    pub fn get_global(&self, id: GlobalId) -> &GlobalDef {
-        &self.globals[id.0 as usize]
     }
 
     #[inline]
@@ -217,4 +197,20 @@ pub enum Visibility {
     Hidden,
     /// Like Hidden but the symbol can be overridden by a Default symbol
     Protected,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Linkage {
+    Internal,
+    External,
+    /// Merged with other definitions, discarded if unused
+    LinkOnce,
+    /// Like LinkOnce but preserves the definition for inlining
+    LinkOnceODR,
+    /// Can be overridden by a stronger definition
+    Weak,
+    /// Like Weak but preserves the definition for inlining
+    WeakODR,
+    /// Available for inlining but not emitted if unused
+    AvailableExternally,
 }

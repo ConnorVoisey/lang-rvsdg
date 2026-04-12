@@ -342,8 +342,8 @@ impl RVSDGMod {
 #[cfg(test)]
 mod tests {
     use crate::rvsdg::{
-        ArithFlags, BinaryOp, ICmpPred, IntrinsicOp, RVSDGMod,
-        func::{FnLinkageType, FnResult},
+        IntrinsicOp, Linkage, RVSDGMod,
+        func::FnResult,
         lower_to_llvm::test_utils::test_utils::{jit_run_f32, jit_run_i32},
         types::{F32, I32},
         value::ConstValue,
@@ -354,7 +354,7 @@ mod tests {
     #[test]
     fn intrinsic_int_abs_positive() {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
-        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], FnLinkageType::External);
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg.define_fn(func_id, |rb, state| {
             let v = rb.const_i32(42);
             let res = rb.intrinsic(IntrinsicOp::IntAbs, state, &[v], I32);
@@ -369,7 +369,7 @@ mod tests {
     #[test]
     fn intrinsic_int_abs_negative() {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
-        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], FnLinkageType::External);
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg.define_fn(func_id, |rb, state| {
             let v = rb.const_i32(-42);
             let res = rb.intrinsic(IntrinsicOp::IntAbs, state, &[v], I32);
@@ -386,7 +386,7 @@ mod tests {
     #[test]
     fn intrinsic_signed_min() {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
-        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], FnLinkageType::External);
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg.define_fn(func_id, |rb, state| {
             let a = rb.const_i32(10);
             let b = rb.const_i32(-5);
@@ -402,7 +402,7 @@ mod tests {
     #[test]
     fn intrinsic_signed_max() {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
-        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], FnLinkageType::External);
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg.define_fn(func_id, |rb, state| {
             let a = rb.const_i32(10);
             let b = rb.const_i32(-5);
@@ -418,7 +418,7 @@ mod tests {
     #[test]
     fn intrinsic_unsigned_min() {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
-        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], FnLinkageType::External);
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg.define_fn(func_id, |rb, state| {
             let a = rb.const_i32(3);
             let b = rb.const_i32(7);
@@ -434,7 +434,7 @@ mod tests {
     #[test]
     fn intrinsic_unsigned_max() {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
-        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], FnLinkageType::External);
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg.define_fn(func_id, |rb, state| {
             let a = rb.const_i32(3);
             let b = rb.const_i32(7);
@@ -452,7 +452,7 @@ mod tests {
     #[test]
     fn intrinsic_sadd_sat_no_overflow() {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
-        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], FnLinkageType::External);
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg.define_fn(func_id, |rb, state| {
             let a = rb.const_i32(100);
             let b = rb.const_i32(200);
@@ -469,7 +469,7 @@ mod tests {
     fn intrinsic_sadd_sat_overflow() {
         // i32::MAX + 1 should saturate to i32::MAX
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
-        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], FnLinkageType::External);
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg.define_fn(func_id, |rb, state| {
             let a = rb.const_i32(i32::MAX);
             let b = rb.const_i32(1);
@@ -486,7 +486,7 @@ mod tests {
     fn intrinsic_usub_sat_clamp_to_zero() {
         // 3 - 10 unsigned saturates to 0
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
-        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], FnLinkageType::External);
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg.define_fn(func_id, |rb, state| {
             let a = rb.const_i32(3);
             let b = rb.const_i32(10);
@@ -504,7 +504,7 @@ mod tests {
     #[test]
     fn intrinsic_float_min() {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
-        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[F32], FnLinkageType::External);
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[F32], Linkage::External);
         rvsdg.define_fn(func_id, |rb, state| {
             let a = rb.constant(F32, ConstValue::f32_from_native(3.5));
             let b = rb.constant(F32, ConstValue::f32_from_native(1.5));
@@ -520,7 +520,7 @@ mod tests {
     #[test]
     fn intrinsic_float_max() {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
-        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[F32], FnLinkageType::External);
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[F32], Linkage::External);
         rvsdg.define_fn(func_id, |rb, state| {
             let a = rb.constant(F32, ConstValue::f32_from_native(3.5));
             let b = rb.constant(F32, ConstValue::f32_from_native(1.5));
@@ -537,7 +537,7 @@ mod tests {
     fn intrinsic_float_fma() {
         // fma(2.0, 3.0, 4.0) = 2*3 + 4 = 10
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
-        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[F32], FnLinkageType::External);
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[F32], Linkage::External);
         rvsdg.define_fn(func_id, |rb, state| {
             let a = rb.constant(F32, ConstValue::f32_from_native(2.0));
             let b = rb.constant(F32, ConstValue::f32_from_native(3.0));
@@ -555,7 +555,7 @@ mod tests {
     fn intrinsic_float_copysign() {
         // copysign(5.0, -1.0) = -5.0
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
-        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[F32], FnLinkageType::External);
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[F32], Linkage::External);
         rvsdg.define_fn(func_id, |rb, state| {
             let mag = rb.constant(F32, ConstValue::f32_from_native(5.0));
             let sign = rb.constant(F32, ConstValue::f32_from_native(-1.0));
@@ -574,7 +574,7 @@ mod tests {
     fn intrinsic_sadd_overflow_no_overflow() {
         // 100 + 200 = 300, no overflow => return result
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
-        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], FnLinkageType::External);
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg.define_fn(func_id, |rb, state| {
             let a = rb.const_i32(100);
             let b = rb.const_i32(200);
@@ -591,7 +591,7 @@ mod tests {
     fn intrinsic_sadd_overflow_flag() {
         // i32::MAX + 1 overflows => overflow flag is true (1)
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
-        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], FnLinkageType::External);
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg.define_fn(func_id, |rb, state| {
             let a = rb.const_i32(i32::MAX);
             let b = rb.const_i32(1);
@@ -610,7 +610,7 @@ mod tests {
     fn intrinsic_sadd_overflow_no_flag() {
         // 1 + 2 doesn't overflow => flag is 0
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
-        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], FnLinkageType::External);
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg.define_fn(func_id, |rb, state| {
             let a = rb.const_i32(1);
             let b = rb.const_i32(2);
@@ -628,7 +628,7 @@ mod tests {
     fn intrinsic_umul_overflow() {
         // Large unsigned multiply that overflows: 0x80000000 * 2 overflows u32
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
-        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], FnLinkageType::External);
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg.define_fn(func_id, |rb, state| {
             let a = rb.const_i32(0x40000000);
             let b = rb.const_i32(4);

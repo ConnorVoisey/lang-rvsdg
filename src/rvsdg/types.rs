@@ -103,7 +103,7 @@ pub struct FuncType {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct StructField {
     pub name: Option<String>,
-    pub offset: u64,
+    pub index: u64,
     pub field_type: TypeRef,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

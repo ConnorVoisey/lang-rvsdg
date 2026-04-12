@@ -117,14 +117,11 @@ impl RVSDGMod {
         ty: TypeRef,
     ) -> BasicValueEnum<'ctx> {
         match const_value {
-            ConstValue::Int(val) => match ty {
-                TypeRef::Scalar(scalar_type) => BasicValueEnum::IntValue(
-                    scalar_type
-                        .to_int_type(llvm_builder.context)
-                        .const_int(*val as u64, false),
-                ),
-                t => unreachable!("int constant should have scalar type, got: {t:?}"),
-            },
+            ConstValue::Int(val) => BasicValueEnum::IntValue(
+                self.type_to_basic_type_llvm(llvm_builder.context, ty)
+                    .into_int_type()
+                    .const_int(*val as u64, false),
+            ),
             ConstValue::F32(val) => BasicValueEnum::FloatValue(
                 llvm_builder
                     .context
@@ -182,8 +179,8 @@ impl RVSDGMod {
 #[cfg(test)]
 mod tests {
     use crate::rvsdg::{
-        ArithFlags, BinaryOp, GlobalInit, GlobalLinkage, ICmpPred, RVSDGMod,
-        func::{FnLinkageType, FnResult},
+        ArithFlags, BinaryOp, GlobalInit, ICmpPred, Linkage, RVSDGMod,
+        func::FnResult,
         lower_to_llvm::test_utils::test_utils::{
             jit_run_f32, jit_run_f64, jit_run_i32, jit_run_i64,
         },
@@ -194,7 +191,7 @@ mod tests {
     #[test]
     fn const_i32_positive() {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
-        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], FnLinkageType::External);
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg.define_fn(func_id, |rb, state| {
             let v = rb.const_i32(42);
             FnResult {
@@ -208,7 +205,7 @@ mod tests {
     #[test]
     fn const_i32_zero() {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
-        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], FnLinkageType::External);
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg.define_fn(func_id, |rb, state| {
             let v = rb.const_i32(0);
             FnResult {
@@ -222,7 +219,7 @@ mod tests {
     #[test]
     fn const_i32_negative() {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
-        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], FnLinkageType::External);
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg.define_fn(func_id, |rb, state| {
             let v = rb.const_i32(-1);
             FnResult {
@@ -236,7 +233,7 @@ mod tests {
     #[test]
     fn const_i32_max() {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
-        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], FnLinkageType::External);
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg.define_fn(func_id, |rb, state| {
             let v = rb.const_i32(i32::MAX);
             FnResult {
@@ -250,7 +247,7 @@ mod tests {
     #[test]
     fn const_i32_min() {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
-        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], FnLinkageType::External);
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg.define_fn(func_id, |rb, state| {
             let v = rb.const_i32(i32::MIN);
             FnResult {
@@ -265,7 +262,7 @@ mod tests {
     fn const_bool_true() {
         // bool true (1) used as condition in ternary => returns 10
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
-        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], FnLinkageType::External);
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg.define_fn(func_id, |rb, state| {
             let cond = rb.constant(BOOL, ConstValue::Int(1));
             let t = rb.const_i32(10);
@@ -282,7 +279,7 @@ mod tests {
     #[test]
     fn const_bool_false() {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
-        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], FnLinkageType::External);
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg.define_fn(func_id, |rb, state| {
             let cond = rb.constant(BOOL, ConstValue::Int(0));
             let t = rb.const_i32(10);
@@ -300,7 +297,7 @@ mod tests {
     fn const_i8_add() {
         // i8: 100 + 27 = 127, compare in i8
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
-        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], FnLinkageType::External);
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg.define_fn(func_id, |rb, state| {
             let a = rb.constant(I8, ConstValue::Int(100));
             let b = rb.constant(I8, ConstValue::Int(27));
@@ -322,7 +319,7 @@ mod tests {
     fn const_i16_mul() {
         // i16: 200 * 3 = 600, compare in i16
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
-        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], FnLinkageType::External);
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg.define_fn(func_id, |rb, state| {
             let a = rb.constant(I16, ConstValue::Int(200));
             let b = rb.constant(I16, ConstValue::Int(3));
@@ -343,7 +340,7 @@ mod tests {
     #[test]
     fn const_i64_add() {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
-        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I64], FnLinkageType::External);
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I64], Linkage::External);
         rvsdg.define_fn(func_id, |rb, state| {
             let a = rb.const_i64(3_000_000_000);
             let b = rb.const_i64(1_000_000_000);
@@ -359,7 +356,7 @@ mod tests {
     #[test]
     fn const_f32_value() {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
-        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[F32], FnLinkageType::External);
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[F32], Linkage::External);
         rvsdg.define_fn(func_id, |rb, state| {
             let a = rb.constant(F32, ConstValue::f32_from_native(3.5));
             let b = rb.constant(F32, ConstValue::f32_from_native(1.5));
@@ -375,7 +372,7 @@ mod tests {
     #[test]
     fn const_f32_negative() {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
-        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[F32], FnLinkageType::External);
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[F32], Linkage::External);
         rvsdg.define_fn(func_id, |rb, state| {
             let a = rb.constant(F32, ConstValue::f32_from_native(-2.5));
             let b = rb.constant(F32, ConstValue::f32_from_native(2.5));
@@ -391,7 +388,7 @@ mod tests {
     #[test]
     fn const_f64_value() {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
-        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[F64], FnLinkageType::External);
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[F64], Linkage::External);
         rvsdg.define_fn(func_id, |rb, state| {
             let a = rb.constant(F64, ConstValue::f64_from_native(1.0));
             let b = rb.constant(F64, ConstValue::f64_from_native(2.0));
@@ -408,7 +405,7 @@ mod tests {
     fn const_multiple_uses() {
         // Same constant used in multiple operations
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
-        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], FnLinkageType::External);
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg.define_fn(func_id, |rb, state| {
             let five = rb.const_i32(5);
             // 5 + 5 = 10, then 10 * 5 = 50
@@ -432,7 +429,7 @@ mod tests {
         });
         let arr_ty = TypeRef::Array(arr_ty_id);
         let str_id = rvsdg.constants.string(arr_ty, b"Hi".to_vec());
-        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], FnLinkageType::External);
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg.define_fn(func_id, |rb, state| {
             let s = rb.const_pool_ref(str_id, arr_ty);
             let h = rb.extract_field(s, &[0], I8);
@@ -464,7 +461,7 @@ mod tests {
             I32,
             GlobalInit::Init(init_id),
             true,
-            GlobalLinkage::Internal,
+            Linkage::Internal,
         );
         let ptr_ty_id = rvsdg.types.intern_ptr(PtrType {
             pointee: Some(I32),
@@ -472,7 +469,7 @@ mod tests {
             no_escape: false,
         });
         let ptr_ty = TypeRef::Ptr(ptr_ty_id);
-        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], FnLinkageType::External);
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg.define_fn(func_id, |rb, state| {
             let ptr = rb.global_ref(global_id, ptr_ty);
             let loaded = rb.load(state, ptr, I32, None, false);
@@ -503,10 +500,10 @@ mod tests {
             I64,
             GlobalInit::Init(init_id),
             true,
-            GlobalLinkage::Internal,
+            Linkage::Internal,
         );
         let ptr_ty = make_ptr_ty(&mut rvsdg, I64);
-        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I64], FnLinkageType::External);
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I64], Linkage::External);
         rvsdg.define_fn(func_id, |rb, state| {
             let ptr = rb.global_ref(global_id, ptr_ty);
             let loaded = rb.load(state, ptr, I64, None, false);
@@ -529,10 +526,10 @@ mod tests {
             F32,
             GlobalInit::Init(init_id),
             true,
-            GlobalLinkage::Internal,
+            Linkage::Internal,
         );
         let ptr_ty = make_ptr_ty(&mut rvsdg, F32);
-        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[F32], FnLinkageType::External);
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[F32], Linkage::External);
         rvsdg.define_fn(func_id, |rb, state| {
             let ptr = rb.global_ref(global_id, ptr_ty);
             let loaded = rb.load(state, ptr, F32, None, false);
@@ -553,10 +550,10 @@ mod tests {
             I32,
             GlobalInit::Init(init_id),
             true,
-            GlobalLinkage::Internal,
+            Linkage::Internal,
         );
         let ptr_ty = make_ptr_ty(&mut rvsdg, I32);
-        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], FnLinkageType::External);
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg.define_fn(func_id, |rb, state| {
             let ptr = rb.global_ref(global_id, ptr_ty);
             let loaded = rb.load(state, ptr, I32, None, false);
@@ -579,17 +576,17 @@ mod tests {
             I32,
             GlobalInit::Init(init_a),
             true,
-            GlobalLinkage::Internal,
+            Linkage::Internal,
         );
         let global_b = rvsdg.define_global(
             String::from("b"),
             I32,
             GlobalInit::Init(init_b),
             true,
-            GlobalLinkage::Internal,
+            Linkage::Internal,
         );
         let ptr_ty = make_ptr_ty(&mut rvsdg, I32);
-        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], FnLinkageType::External);
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg.define_fn(func_id, |rb, state| {
             let ptr_a = rb.global_ref(global_a, ptr_ty);
             let la = rb.load(state, ptr_a, I32, None, false);
@@ -622,10 +619,10 @@ mod tests {
             I32,
             GlobalInit::Init(init_id),
             true,
-            GlobalLinkage::Internal,
+            Linkage::Internal,
         );
         let ptr_ty = make_ptr_ty(&mut rvsdg, I32);
-        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], FnLinkageType::External);
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg.define_fn(func_id, |rb, state| {
             let ptr = rb.global_ref(global_id, ptr_ty);
             let loaded = rb.load(state, ptr, I32, None, false);
@@ -668,10 +665,10 @@ mod tests {
             arr_ty,
             GlobalInit::Init(agg_id),
             true,
-            GlobalLinkage::Internal,
+            Linkage::Internal,
         );
         let ptr_ty = make_ptr_ty(&mut rvsdg, arr_ty);
-        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], FnLinkageType::External);
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg.define_fn(func_id, |rb, state| {
             let ptr = rb.global_ref(global_id, ptr_ty);
             let loaded = rb.load(state, ptr, arr_ty, None, false);
@@ -702,10 +699,10 @@ mod tests {
             arr_ty,
             GlobalInit::Init(agg_id),
             true,
-            GlobalLinkage::Internal,
+            Linkage::Internal,
         );
         let ptr_ty = make_ptr_ty(&mut rvsdg, arr_ty);
-        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], FnLinkageType::External);
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg.define_fn(func_id, |rb, state| {
             let ptr = rb.global_ref(global_id, ptr_ty);
             let loaded = rb.load(state, ptr, arr_ty, None, false);
@@ -745,10 +742,10 @@ mod tests {
             arr_ty,
             GlobalInit::Init(agg_id),
             true,
-            GlobalLinkage::Internal,
+            Linkage::Internal,
         );
         let ptr_ty = make_ptr_ty(&mut rvsdg, arr_ty);
-        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[F32], FnLinkageType::External);
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[F32], Linkage::External);
         rvsdg.define_fn(func_id, |rb, state| {
             let ptr = rb.global_ref(global_id, ptr_ty);
             let loaded = rb.load(state, ptr, arr_ty, None, false);
@@ -773,7 +770,7 @@ mod tests {
         // Use State as a placeholder type since we don't have struct types wired up yet;
         // the lowering falls into the `_ =>` branch which uses context.const_struct
         let agg_id = rvsdg.constants.aggregate(TypeRef::State, &[e0, e1]);
-        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], FnLinkageType::External);
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg.define_fn(func_id, |rb, state| {
             let s = rb.const_pool_ref(agg_id, TypeRef::State);
             let a = rb.extract_field(s, &[0], I32);
@@ -791,7 +788,7 @@ mod tests {
     fn const_zero_i32() {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
         let zero_id = rvsdg.constants.zero(I32);
-        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], FnLinkageType::External);
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg.define_fn(func_id, |rb, state| {
             let v = rb.const_pool_ref(zero_id, I32);
             FnResult {
@@ -806,7 +803,7 @@ mod tests {
     fn const_zero_f32() {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
         let zero_id = rvsdg.constants.zero(F32);
-        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[F32], FnLinkageType::External);
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[F32], Linkage::External);
         rvsdg.define_fn(func_id, |rb, state| {
             let v = rb.const_pool_ref(zero_id, F32);
             FnResult {
@@ -833,10 +830,10 @@ mod tests {
             arr_ty,
             GlobalInit::Init(zero_id),
             true,
-            GlobalLinkage::Internal,
+            Linkage::Internal,
         );
         let ptr_ty = make_ptr_ty(&mut rvsdg, arr_ty);
-        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], FnLinkageType::External);
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg.define_fn(func_id, |rb, state| {
             let ptr = rb.global_ref(global_id, ptr_ty);
             let loaded = rb.load(state, ptr, arr_ty, None, false);
@@ -856,7 +853,7 @@ mod tests {
         // zero(i32) + 42 => 42
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
         let zero_id = rvsdg.constants.zero(I32);
-        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], FnLinkageType::External);
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg.define_fn(func_id, |rb, state| {
             let z = rb.const_pool_ref(zero_id, I32);
             let v = rb.const_i32(42);
@@ -877,7 +874,7 @@ mod tests {
             ty: I32,
             kind: crate::rvsdg::ConstantKind::Undef,
         });
-        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], FnLinkageType::External);
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg.define_fn(func_id, |rb, state| {
             let u = rb.const_pool_ref(undef_id, I32);
             let v = rb.const_i32(0);
@@ -899,7 +896,7 @@ mod tests {
             ty: F32,
             kind: crate::rvsdg::ConstantKind::Undef,
         });
-        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[F32], FnLinkageType::External);
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[F32], Linkage::External);
         rvsdg.define_fn(func_id, |rb, state| {
             let u = rb.const_pool_ref(undef_id, F32);
             FnResult {
@@ -914,7 +911,7 @@ mod tests {
     fn const_poison_i32_compiles() {
         // poison i32 — should compile and run without crashing
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
-        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], FnLinkageType::External);
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg.define_fn(func_id, |rb, state| {
             let p = rb.constant(I32, ConstValue::Poison);
             let v = rb.const_i32(0);
@@ -930,7 +927,7 @@ mod tests {
     #[test]
     fn const_poison_f32_compiles() {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
-        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[F32], FnLinkageType::External);
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[F32], Linkage::External);
         rvsdg.define_fn(func_id, |rb, state| {
             let p = rb.constant(F32, ConstValue::Poison);
             FnResult {
@@ -949,7 +946,7 @@ mod tests {
             ty: I32,
             kind: crate::rvsdg::ConstantKind::Undef,
         });
-        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], FnLinkageType::External);
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg.define_fn(func_id, |rb, state| {
             let u = rb.const_pool_ref(undef_id, I32);
             let v = rb.const_i32(42);

@@ -90,9 +90,9 @@ impl RVSDGMod {
 #[cfg(test)]
 mod tests {
     use crate::rvsdg::{
-        ArithFlags, BinaryOp, ICmpPred, RVSDGMod,
+        ArithFlags, BinaryOp, ICmpPred, Linkage, RVSDGMod,
         builder::{BranchResult, LoopResult},
-        func::{FnLinkageType, FnResult},
+        func::FnResult,
         lower_to_llvm::test_utils::test_utils::jit_run_i32,
         types::{BOOL, I32},
         value::ConstValue,
@@ -104,7 +104,7 @@ mod tests {
         // do { x = x + 1 } while(x < 10)
         // => 10
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
-        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], FnLinkageType::External);
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg.define_fn(func_id, |rb, state| {
             let x = rb.const_i32(0);
             let res = rb.theta(state, &[x], |rb| {
@@ -134,7 +134,7 @@ mod tests {
         // condition is always false, so body executes exactly once
         // => 5
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
-        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], FnLinkageType::External);
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg.define_fn(func_id, |rb, state| {
             let x = rb.const_i32(0);
             let res = rb.theta(state, &[x], |rb| {
@@ -164,7 +164,7 @@ mod tests {
         // => x = 5, y = 50
         // returns x * y = 250
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
-        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], FnLinkageType::External);
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg.define_fn(func_id, |rb, state| {
             let x = rb.const_i32(0);
             let y = rb.const_i32(100);
@@ -208,7 +208,7 @@ mod tests {
         // do { x = x - 1 } while(x > 0)
         // => 0
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
-        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], FnLinkageType::External);
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg.define_fn(func_id, |rb, state| {
             let x = rb.const_i32(10);
             let res = rb.theta(state, &[x], |rb| {
@@ -238,7 +238,7 @@ mod tests {
         // do { sum = sum + i; i = i + 1 } while(i <= 10)
         // => sum = 1+2+...+10 = 55
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
-        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], FnLinkageType::External);
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg.define_fn(func_id, |rb, state| {
             let sum = rb.const_i32(0);
             let i = rb.const_i32(1);
@@ -272,7 +272,7 @@ mod tests {
         // x = 1, i = 0
         // do { x = x * 2; i = i + 1 } while(i < 10)
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
-        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], FnLinkageType::External);
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg.define_fn(func_id, |rb, state| {
             let x = rb.const_i32(1);
             let i = rb.const_i32(0);
@@ -305,7 +305,7 @@ mod tests {
         // if true { do { x++ } while(x < 7) } else { 99 }
         // => 7
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
-        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], FnLinkageType::External);
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg.define_fn(func_id, |rb, state| {
             let cond = rb.constant(BOOL, ConstValue::Int(1));
             let res = rb.gamma(
@@ -355,7 +355,7 @@ mod tests {
         // } while(x < 6)
         // sum of even numbers 2 + 4 + 6 = 12
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
-        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], FnLinkageType::External);
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg.define_fn(func_id, |rb, state| {
             let x = rb.const_i32(0);
             let sum = rb.const_i32(0);
@@ -418,8 +418,7 @@ mod tests {
         // with x = 10 => 10 (loop body never executes)
         let build_while_loop = |init_x: i32| -> RVSDGMod {
             let mut rvsdg = RVSDGMod::new_host(String::from("test"));
-            let func_id =
-                rvsdg.declare_fn(String::from("test"), &[], &[I32], FnLinkageType::External);
+            let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
             rvsdg.define_fn(func_id, |rb, state| {
                 let x = rb.const_i32(init_x);
                 let five = rb.const_i32(5);

@@ -1,6 +1,6 @@
 use crate::rvsdg::{
-    FuncId, GlobalId, GlobalInit, GlobalLinkage, RVSDGMod, Region, ValueId, ValueKind,
-    func::{FnLinkageType, Function},
+    FuncId, GlobalId, GlobalInit, RVSDGMod, Region, ValueId, ValueKind,
+    func::Function,
     lower_to_llvm::{LLVMBuilderCtx, ValueMapper},
     types::{ScalarType, TypeRef},
 };

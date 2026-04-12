@@ -87,13 +87,16 @@ The LLVM IR round-trip (serialize → deserialize) is inherently slow and will d
 ## Building
 
 Requires:
-- Rust (edition 2024)
-- clang-17 and opt-17 on `$PATH`
-- LLVM 17 development headers (for the `llvm-ir` crate)
+- Rust
+- clang-19 and opt-19 on `$PATH`
+- LLVM 19 development headers (for the `llvm-ir` crate)
 
 ```bash
 cargo build
-cargo run  # runs on examples/c/basic.c
+cargo cargo r --example cat
+
+# depending on how you've installed llvm19 you may need to provide the path
+LLVM_SYS_191_PREFIX=$(llvm-config-19 --prefix) cargo r --example cat
 ```
 
 ## References
@@ -101,3 +104,4 @@ cargo run  # runs on examples/c/basic.c
 - [JLM](https://github.com/phate/jlm) — RVSDG-based compiler that inspired this project's approach
 - [RVSDG paper](https://arxiv.org/abs/1912.05036) — Reissmann et al., 2020
 - [Cranelift](https://cranelift.dev/) — planned alternative codegen backend
+

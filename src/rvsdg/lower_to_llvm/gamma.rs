@@ -128,9 +128,9 @@ impl RVSDGMod {
 #[cfg(test)]
 mod tests {
     use crate::rvsdg::{
-        ArithFlags, BinaryOp, ICmpPred, RVSDGMod,
+        ArithFlags, BinaryOp, ICmpPred, Linkage, RVSDGMod,
         builder::BranchResult,
-        func::{FnLinkageType, FnResult},
+        func::FnResult,
         lower_to_llvm::test_utils::test_utils::jit_run_i32,
         types::{BOOL, I32},
         value::ConstValue,
@@ -140,7 +140,7 @@ mod tests {
     fn gamma_true_branch() {
         // if true { 42 } else { 99 } => 42
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
-        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], FnLinkageType::External);
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg.define_fn(func_id, |rb, state| {
             let cond = rb.constant(BOOL, ConstValue::Int(1));
             let res = rb.gamma(
@@ -169,7 +169,7 @@ mod tests {
     fn gamma_false_branch() {
         // if false { 42 } else { 99 } => 99
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
-        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], FnLinkageType::External);
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg.define_fn(func_id, |rb, state| {
             let cond = rb.constant(BOOL, ConstValue::Int(0));
             let res = rb.gamma(
@@ -198,7 +198,7 @@ mod tests {
     fn gamma_nested_arithmetic() {
         // if true { 10 + 20 } else { 0 } => 30
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
-        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], FnLinkageType::External);
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg.define_fn(func_id, |rb, state| {
             let cond = rb.constant(BOOL, ConstValue::Int(1));
             let res = rb.gamma(
@@ -232,7 +232,7 @@ mod tests {
     fn gamma_computed_condition() {
         // x=5, y=3; if x > y { 1 } else { 0 } => 1
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
-        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], FnLinkageType::External);
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg.define_fn(func_id, |rb, state| {
             let x = rb.const_i32(5);
             let y = rb.const_i32(3);
@@ -263,7 +263,7 @@ mod tests {
     fn gamma_n_switch_case_0() {
         // switch(0) { case 0: 10, case 1: 20, case 2: 30 } => 10
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
-        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], FnLinkageType::External);
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg.define_fn(func_id, |rb, state| {
             let cond = rb.const_i32(0);
             let res = rb.gamma_n(
@@ -298,7 +298,7 @@ mod tests {
     fn gamma_n_switch_case_1() {
         // switch(1) { case 0: 10, case 1: 20, case 2: 30 } => 20
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
-        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], FnLinkageType::External);
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg.define_fn(func_id, |rb, state| {
             let cond = rb.const_i32(1);
             let res = rb.gamma_n(
@@ -333,7 +333,7 @@ mod tests {
     fn gamma_n_switch_case_2() {
         // switch(2) { case 0: 10, case 1: 20, case 2: 30 } => 30
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
-        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], FnLinkageType::External);
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg.define_fn(func_id, |rb, state| {
             let cond = rb.const_i32(2);
             let res = rb.gamma_n(
@@ -368,7 +368,7 @@ mod tests {
     fn gamma_n_switch_with_arithmetic() {
         // switch(1) { case 0: 100, case 1: 3*7, case 2: 0, case 3: -1 } => 21
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
-        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], FnLinkageType::External);
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg.define_fn(func_id, |rb, state| {
             let cond = rb.const_i32(1);
             let res = rb.gamma_n(
@@ -412,7 +412,7 @@ mod tests {
     fn gamma_with_inputs() {
         // a=10, b=20; if true { a + b } else { a - b } => 30
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
-        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], FnLinkageType::External);
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg.define_fn(func_id, |rb, state| {
             let a = rb.const_i32(10);
             let b = rb.const_i32(20);
@@ -454,7 +454,7 @@ mod tests {
         // switch(2) over 3 branches, each using inputs a=10 b=20:
         // case 0: a + b (30), case 1: a - b (-10), case 2: a * b (200) => 200
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
-        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], FnLinkageType::External);
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg.define_fn(func_id, |rb, state| {
             let a = rb.const_i32(10);
             let b = rb.const_i32(20);
@@ -507,7 +507,7 @@ mod tests {
         // if true { (10, 20) } else { (1, 2) }
         // return result_0 * result_1 = 10 * 20 = 200
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
-        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], FnLinkageType::External);
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg.define_fn(func_id, |rb, state| {
             let cond = rb.constant(BOOL, ConstValue::Int(1));
             let res = rb.gamma(

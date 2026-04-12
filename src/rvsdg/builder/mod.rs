@@ -123,7 +123,6 @@ impl<'a> RegionBuilder<'a> {
         ValueId(span.start + index)
     }
 
-    /// TODO: this probably needs to take in inputs and outputs
     #[inline]
     pub fn add_region(&mut self, state: State) -> RegionId {
         let id = RegionId(self.graph.regions.len() as u32);
@@ -248,8 +247,8 @@ pub struct LoopResult {
 #[cfg(test)]
 mod test {
     use crate::rvsdg::{
-        ArithFlags, BinaryOp, ICmpPred, RVSDGMod,
-        func::{FnLinkageType, FnResult},
+        ArithFlags, BinaryOp, ICmpPred, Linkage, RVSDGMod,
+        func::FnResult,
         types::{BOOL, I32},
     };
 
@@ -263,8 +262,7 @@ mod test {
         // }
 
         let mut rvsdg_mod = RVSDGMod::new_host(String::from("test"));
-        let main_fn =
-            rvsdg_mod.declare_fn(String::from("main"), &[], &[I32], FnLinkageType::Internal);
+        let main_fn = rvsdg_mod.declare_fn(String::from("main"), &[], &[I32], Linkage::Internal);
         rvsdg_mod.define_fn(main_fn, |rb, state| {
             let a = rb.const_i32(5);
             let b = rb.const_i32(3);
@@ -287,7 +285,7 @@ mod test {
             String::from("check"),
             &[I32, I32],
             &[BOOL],
-            FnLinkageType::Internal,
+            Linkage::Internal,
         );
         rvsdg_mod.define_fn(check_fn, |rb, state| {
             let x = rb.param(0);
@@ -319,7 +317,7 @@ mod test {
             String::from("check"),
             &[I32, I32],
             &[BOOL],
-            FnLinkageType::Internal,
+            Linkage::Internal,
         );
         rvsdg_mod.define_fn(check_fn, |rb, state| {
             let x = rb.param(0);
@@ -331,8 +329,7 @@ mod test {
             }
         });
 
-        let main_fn =
-            rvsdg_mod.declare_fn(String::from("main"), &[], &[I32], FnLinkageType::Internal);
+        let main_fn = rvsdg_mod.declare_fn(String::from("main"), &[], &[I32], Linkage::Internal);
         rvsdg_mod.define_fn(main_fn, |rb, entry_state| {
             let a = rb.const_i32(5);
             let b = rb.const_i32(3);

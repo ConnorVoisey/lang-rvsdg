@@ -1,12 +1,12 @@
 #![warn(missing_debug_implementations)]
 // TODO: enable once the API surface is more stable
 // #![warn(missing_docs)]
-
-use crate::llvm_parser::build_yes;
 use llvm_ir::Module;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use tempfile::NamedTempFile;
+
+use crate::rvsdg::RVSDGMod;
 
 pub mod llvm_parser;
 pub mod rvsdg;
@@ -42,7 +42,8 @@ fn c_file_to_mod(c_file_path: &Path) -> color_eyre::Result<Module> {
 }
 pub fn compile_c_file(c_file_path: &Path) -> color_eyre::Result<()> {
     let module = c_file_to_mod(c_file_path)?;
-    let rvsdg = build_yes();
+
+    let rvsdg = RVSDGMod::from_llvm_mod(module)?;
     rvsdg.output_with_llvm().unwrap();
     Ok(())
 }
