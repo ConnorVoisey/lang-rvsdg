@@ -1,19 +1,24 @@
-use crate::rvsdg::{
-    ConstId, ConstValue, ConstantDef, ConstantKind, GlobalInit, InlineHint, Linkage, RVSDGMod,
-    Visibility,
-    func::{
-        CallingConvention, FnAttrFlags, FnAttrs, FnDecl, Function, Param, ParamAttrFlags,
-        ParamAttrs,
-    },
-    types::{
-        ArrayType, FuncType, PtrType, ScalarType, StructDef, StructField, TypeArena, TypeRef, VOID,
-        VectorType,
+use crate::{
+    llvm_parser::block_mapper::{BasicBlockId, BasicBlockMapper},
+    rvsdg::{
+        ConstId, ConstValue, ConstantDef, ConstantKind, GlobalInit, InlineHint, Linkage, RVSDGMod,
+        Visibility,
+        func::{
+            CallingConvention, FnAttrFlags, FnAttrs, FnDecl, Param, ParamAttrFlags, ParamAttrs,
+        },
+        types::{
+            ArrayType, FuncType, PtrType, ScalarType, StructDef, StructField, TypeArena, TypeRef,
+            VOID, VectorType,
+        },
     },
 };
 use color_eyre::eyre::eyre;
 use llvm_ir::{ConstantRef, Module, TypeRef as LLVMTypeRef, function::FunctionDeclaration};
 use std::str::FromStr;
 use target_lexicon::Triple;
+
+pub mod block_mapper;
+pub mod strongly_connected_components;
 
 impl RVSDGMod {
     pub fn from_llvm_mod(module: Module) -> color_eyre::Result<RVSDGMod> {
@@ -40,12 +45,15 @@ impl RVSDGMod {
 
         // lower globals
         for global in &module.global_vars {
-            let ty = rvsdg_mod.types.convert_type_ref(&global.ty, &module)?;
-            let ty = match ty {
-                // not sure if this will work if we have a global that points to a value that
-                // hasn't been declared yet
-                TypeRef::Ptr(ptr_type_id) => rvsdg_mod.types.get_ptr(ptr_type_id).pointee.unwrap(),
-                t => t,
+            let value_ty = match &global.initializer {
+                Some(init) => {
+                    let ty = module.types.type_of(init.as_ref());
+                    rvsdg_mod.types.convert_type_ref(&ty, &module)?
+                }
+                None => match rvsdg_mod.types.convert_type_ref(&global.ty, &module)? {
+                    TypeRef::Ptr(id) => rvsdg_mod.types.get_ptr(id).pointee.unwrap_or(VOID),
+                    ty => ty,
+                },
             };
             let init = match &global.initializer {
                 Some(v) => GlobalInit::Init(rvsdg_mod.convert_const_ref(v.clone(), &module)?),
@@ -53,7 +61,7 @@ impl RVSDGMod {
             };
             rvsdg_mod.define_global(
                 global.name.to_string(),
-                ty,
+                value_ty,
                 init,
                 global.is_constant,
                 convert_linkage(global.linkage),
@@ -136,7 +144,23 @@ impl RVSDGMod {
             llvm_ir::Constant::Array {
                 element_type,
                 elements,
-            } => todo!(),
+            } => {
+                let element = self.types.convert_type_ref(element_type, module)?;
+                let array_ty_id = self.types.intern_array(ArrayType {
+                    element,
+                    len: elements.len() as u64,
+                });
+                let ids = elements
+                    .iter()
+                    .map(|el| self.convert_const_ref(el.clone(), module))
+                    .collect::<Result<Vec<_>, _>>()?;
+
+                let const_id_span = self.constants.id_pool.push_slice(&ids);
+                ConstantDef {
+                    ty: TypeRef::Array(array_ty_id),
+                    kind: ConstantKind::Aggregate(const_id_span),
+                }
+            }
             llvm_ir::Constant::Vector(constant_refs) => todo!(),
             llvm_ir::Constant::Undef(type_ref) => {
                 let ty = self.types.convert_type_ref(type_ref, module)?;
@@ -238,7 +262,55 @@ impl RVSDGMod {
 
     fn lower_fn_body(&mut self, func: &llvm_ir::Function) {
         let rvsdg_fn = self.get_func_by_name(&func.name).unwrap();
-        // &func.basic_blocks;
+        let mut bb_mapper = BasicBlockMapper::new(func.basic_blocks.len());
+        for block in &func.basic_blocks {
+            bb_mapper.intern(&block.name);
+        }
+
+        // append the fake exit block to the blocks.
+        // this is used to map return values
+        let exit_block_id = {
+            let fake_exit_name = bb_mapper.exit_name();
+            debug_assert!(
+                bb_mapper.get(&fake_exit_name).is_none(),
+                "basic block used reserved name {fake_exit_name}"
+            );
+            bb_mapper.intern(&fake_exit_name)
+        };
+
+        for (i, block) in func.basic_blocks.iter().enumerate() {
+            let from = BasicBlockId(i as u32);
+            match &block.term {
+                llvm_ir::Terminator::Br(br) => {
+                    let to = *bb_mapper.get_expect(&br.dest);
+                    bb_mapper.add_connection(from, to);
+                }
+                llvm_ir::Terminator::CondBr(cond_br) => {
+                    let true_block = *bb_mapper.get_expect(&cond_br.true_dest);
+                    let false_block = *bb_mapper.get_expect(&cond_br.false_dest);
+                    bb_mapper.add_connection(from, true_block);
+                    bb_mapper.add_connection(from, false_block);
+                }
+                llvm_ir::Terminator::Ret(_) => {
+                    bb_mapper.add_connection(from, exit_block_id);
+                }
+                llvm_ir::Terminator::Switch(switch) => {
+                    let default = *bb_mapper.get_expect(&switch.default_dest);
+                    bb_mapper.add_connection(from, default);
+                    for (_, dest) in &switch.dests {
+                        let d = *bb_mapper.get_expect(dest);
+                        bb_mapper.add_connection(from, d);
+                    }
+                }
+                llvm_ir::Terminator::Unreachable(_) => (),
+                llvm_ir::Terminator::Invoke(invoke) => todo!(),
+                t => todo!("handle terminator case: {t:?}"),
+            }
+        }
+        let scc = bb_mapper.get_strongly_connected_components();
+        dbg!(bb_mapper, scc);
+        todo!("find unstructured control flow");
+        todo!("insert predicates to structure the control flow");
         todo!("lower function basic blocks here")
     }
 }

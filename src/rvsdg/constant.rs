@@ -65,7 +65,7 @@ pub enum ConstantKind {
 pub struct ConstantPool {
     entries: Vec<ConstantDef>,
     cache: FxHashMap<ConstantDef, ConstId>,
-    id_pool: ConstIdPool,
+    pub id_pool: ConstIdPool,
 }
 
 impl ConstantPool {
