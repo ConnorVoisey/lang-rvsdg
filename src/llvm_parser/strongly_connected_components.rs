@@ -1,10 +1,36 @@
+use crate::llvm_parser::block_mapper::{BasicBlockId, BasicBlockInOuts, BasicBlockMapper};
+use smallvec::SmallVec;
 use std::collections::VecDeque;
 
-use crate::llvm_parser::block_mapper::{BasicBlockId, BasicBlockInOuts, BasicBlockMapper};
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct SccId(u32);
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SccAnalysis {
+    /// reverse topo order; reverse for forward
+    pub sccs: Vec<Scc>,
+    pub block_to_scc: Vec<SccId>,
+}
+
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct Scc {
+    pub blocks: SmallVec<[BasicBlockId; 4]>,
+    pub is_trivial: bool,
+}
+impl SccAnalysis {
+    fn add_scc(&mut self) -> Scc {
+        let scc = Scc::default();
+        self.sccs.push(scc);
+        scc
+    }
+}
 
 impl BasicBlockMapper {
-    pub fn get_strongly_connected_components(&self) -> Vec<Vec<BasicBlockId>> {
-        let mut groups = vec![];
+    pub fn get_strongly_connected_components(&self) -> SccAnalysis {
+        let mut scc_analysis = SccAnalysis {
+            sccs: vec![],
+            block_to_scc: vec![],
+        };
         let mut stack = VecDeque::new();
         let mut index = 0;
         let mut indicies = vec![-1; self.blocks.len()];
@@ -15,7 +41,7 @@ impl BasicBlockMapper {
         fn strong_connect(
             id: BasicBlockId,
             blocks: &[BasicBlockInOuts],
-            groups: &mut Vec<Vec<BasicBlockId>>,
+            scc_analysis: &mut SccAnalysis,
             stack: &mut VecDeque<BasicBlockId>,
             index: &mut i32,
             indicies: &mut Vec<i32>,
@@ -34,7 +60,14 @@ impl BasicBlockMapper {
                 if indicies[edge.0 as usize] == -1 {
                     // edge has not yet been visited, recusively do it.
                     strong_connect(
-                        *edge, blocks, groups, stack, index, indicies, low_links, on_stack,
+                        *edge,
+                        blocks,
+                        scc_analysis,
+                        stack,
+                        index,
+                        indicies,
+                        low_links,
+                        on_stack,
                     );
                     low_links[id.0 as usize] =
                         low_links[id.0 as usize].min(low_links[edge.0 as usize]);
@@ -46,16 +79,22 @@ impl BasicBlockMapper {
             }
 
             if low_links[id.0 as usize] == indicies[id.0 as usize] {
-                let mut group = vec![];
+                let mut scc = Scc {
+                    blocks: SmallVec::new(),
+                    is_trivial: true,
+                };
+                // TODO: compute the is_trivial
                 while let Some(node) = stack.pop_back() {
                     on_stack[node.0 as usize] = false;
-                    group.push(node);
+                    let scc_id = SccId(scc.blocks.len() as u32);
+                    scc.blocks.push(node);
+                    scc_analysis.block_to_scc[node.0 as usize] = scc_id;
                     if node == id {
                         break;
                     }
                 }
-                if group.len() > 0 {
-                    groups.push(group);
+                if scc.blocks.len() > 0 {
+                    scc_analysis.sccs.push(scc);
                 }
             }
         }
@@ -65,7 +104,7 @@ impl BasicBlockMapper {
                 strong_connect(
                     BasicBlockId(i as u32),
                     &self.blocks,
-                    &mut groups,
+                    &mut scc_analysis,
                     &mut stack,
                     &mut index,
                     &mut indicies,
@@ -75,7 +114,7 @@ impl BasicBlockMapper {
             }
         }
 
-        groups
+        scc_analysis
     }
 }
 

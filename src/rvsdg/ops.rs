@@ -63,6 +63,28 @@ pub struct ArithFlags {
     pub exact: bool,
 }
 
+impl ArithFlags {
+    /// Wrap flags for add/sub/mul/shl.
+    #[inline]
+    pub fn wrap(no_signed_wrap: bool, no_unsigned_wrap: bool) -> Self {
+        Self {
+            no_signed_wrap,
+            no_unsigned_wrap,
+            exact: false,
+        }
+    }
+
+    /// Exact flag for udiv/sdiv/lshr/ashr.
+    #[inline]
+    pub fn exact(exact: bool) -> Self {
+        Self {
+            no_signed_wrap: false,
+            no_unsigned_wrap: false,
+            exact,
+        }
+    }
+}
+
 /// Integer comparison predicates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ICmpPred {

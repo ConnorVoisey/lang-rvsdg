@@ -1,8 +1,10 @@
 use crate::{
-    llvm_parser::block_mapper::{BasicBlockId, BasicBlockMapper},
+    llvm_parser::{
+        block_mapper::{BasicBlockId, BasicBlockMapper},
+        instructions::Builder,
+    },
     rvsdg::{
-        ConstId, ConstValue, ConstantDef, ConstantKind, GlobalInit, InlineHint, Linkage, RVSDGMod,
-        Visibility,
+        GlobalInit, InlineHint, Linkage, RVSDGMod, Visibility,
         func::{
             CallingConvention, FnAttrFlags, FnAttrs, FnDecl, Param, ParamAttrFlags, ParamAttrs,
         },
@@ -13,12 +15,15 @@ use crate::{
     },
 };
 use color_eyre::eyre::eyre;
-use llvm_ir::{ConstantRef, Module, TypeRef as LLVMTypeRef, function::FunctionDeclaration};
+use llvm_ir::{Module, TypeRef as LLVMTypeRef, function::FunctionDeclaration};
 use std::str::FromStr;
 use target_lexicon::Triple;
 
 pub mod block_mapper;
+pub mod const_instructions;
+pub mod instructions;
 pub mod strongly_connected_components;
+pub mod vector_instructions;
 
 impl RVSDGMod {
     pub fn from_llvm_mod(module: Module) -> color_eyre::Result<RVSDGMod> {
@@ -94,173 +99,13 @@ impl RVSDGMod {
 
         // lower function bodies
         for func in &module.functions {
-            rvsdg_mod.lower_fn_body(&func);
+            rvsdg_mod.lower_fn_body(&func, &module);
         }
 
         Ok(rvsdg_mod)
     }
-    fn convert_const_ref(
-        &mut self,
-        const_ref: ConstantRef,
-        module: &Module,
-    ) -> color_eyre::Result<ConstId> {
-        let const_def = match &*const_ref {
-            llvm_ir::Constant::Int { bits, value } => ConstantDef {
-                ty: TypeRef::Scalar(int_bit_to_scalar(*bits)?),
-                kind: ConstantKind::Scalar(ConstValue::Int(sign_extend_to_i64(*value, *bits))),
-            },
-            llvm_ir::Constant::Float(float) => ConstantDef {
-                ty: TypeRef::Scalar(match float {
-                    llvm_ir::constant::Float::Single(_) => ScalarType::F32,
-                    llvm_ir::constant::Float::Double(_) => ScalarType::F64,
-                    t => Err(eyre!("unsupported float width: {t:?}"))?,
-                }),
-                kind: ConstantKind::Scalar(match float {
-                    llvm_ir::constant::Float::Single(v) => ConstValue::F32(v.to_bits()),
-                    llvm_ir::constant::Float::Double(v) => ConstValue::F64(v.to_bits()),
-                    t => Err(eyre!("unsupported float width: {t:?}"))?,
-                }),
-            },
-            llvm_ir::Constant::Null(_type_ref) => ConstantDef {
-                ty: TypeRef::Ptr(self.types.intern_ptr(PtrType {
-                    pointee: None,
-                    alias_set: None,
-                    no_escape: false,
-                })),
-                kind: ConstantKind::Scalar(ConstValue::NullPtr),
-            },
-            llvm_ir::Constant::AggregateZero(type_ref) => {
-                let ty = self.types.convert_type_ref(type_ref, module)?;
-                ConstantDef {
-                    ty,
-                    kind: ConstantKind::Zero,
-                }
-            }
-            llvm_ir::Constant::Struct {
-                name,
-                values,
-                is_packed,
-            } => todo!(),
-            llvm_ir::Constant::Array {
-                element_type,
-                elements,
-            } => {
-                let element = self.types.convert_type_ref(element_type, module)?;
-                let array_ty_id = self.types.intern_array(ArrayType {
-                    element,
-                    len: elements.len() as u64,
-                });
-                let ids = elements
-                    .iter()
-                    .map(|el| self.convert_const_ref(el.clone(), module))
-                    .collect::<Result<Vec<_>, _>>()?;
 
-                let const_id_span = self.constants.id_pool.push_slice(&ids);
-                ConstantDef {
-                    ty: TypeRef::Array(array_ty_id),
-                    kind: ConstantKind::Aggregate(const_id_span),
-                }
-            }
-            llvm_ir::Constant::Vector(constant_refs) => todo!(),
-            llvm_ir::Constant::Undef(type_ref) => {
-                let ty = self.types.convert_type_ref(type_ref, module)?;
-                ConstantDef {
-                    ty,
-                    kind: ConstantKind::Undef,
-                }
-            }
-            llvm_ir::Constant::Poison(type_ref) => {
-                let ty = self.types.convert_type_ref(type_ref, module)?;
-                ConstantDef {
-                    ty,
-                    kind: ConstantKind::Scalar(ConstValue::Poison),
-                }
-            }
-            llvm_ir::Constant::BlockAddress => todo!(),
-            llvm_ir::Constant::GlobalReference { name, ty } => {
-                let name_str = name.to_string();
-                let ty = self.types.convert_type_ref(ty, module)?;
-                if let Some(&global_id) = self.global_map.get(&name_str) {
-                    ConstantDef {
-                        ty,
-                        kind: ConstantKind::GlobalAddr(global_id),
-                    }
-                } else if let Some(&_func_id) = self.fn_map.get(&name_str) {
-                    // TODO: add ConstantKind::FuncAddr(FuncId) for function pointer constants
-                    todo!("function reference in constant context: {name_str}")
-                } else {
-                    return Err(eyre!("global reference to unknown symbol: {name_str}"));
-                }
-            }
-            // TokenNone is used for convergence control tokens in LLVM IR.
-            // It has no runtime value — treat as a zero-sized placeholder.
-            llvm_ir::Constant::TokenNone => ConstantDef {
-                ty: VOID,
-                kind: ConstantKind::Zero,
-            },
-
-            // The RVSDG IR layer does not have a concept of constant expressions —
-            // these are evaluated at parse time.
-            // These are only for ints, and only for lower llvm versions
-            llvm_ir::Constant::Add(op) => {
-                self.fold_int_binop(&op.operand0, &op.operand1, module, i64::wrapping_add)?
-            }
-            llvm_ir::Constant::Sub(op) => {
-                self.fold_int_binop(&op.operand0, &op.operand1, module, i64::wrapping_sub)?
-            }
-            llvm_ir::Constant::Mul(op) => {
-                self.fold_int_binop(&op.operand0, &op.operand1, module, i64::wrapping_mul)?
-            }
-            llvm_ir::Constant::Xor(op) => {
-                self.fold_int_binop(&op.operand0, &op.operand1, module, |a, b| a ^ b)?
-            }
-            llvm_ir::Constant::ExtractElement(extract_element) => todo!(),
-            llvm_ir::Constant::InsertElement(insert_element) => todo!(),
-            llvm_ir::Constant::ShuffleVector(shuffle_vector) => todo!(),
-            llvm_ir::Constant::GetElementPtr(get_element_ptr) => todo!(),
-            llvm_ir::Constant::Trunc(trunc) => todo!(),
-            llvm_ir::Constant::PtrToInt(ptr_to_int) => todo!(),
-            llvm_ir::Constant::IntToPtr(int_to_ptr) => todo!(),
-            llvm_ir::Constant::BitCast(bit_cast) => todo!(),
-            llvm_ir::Constant::AddrSpaceCast(addr_space_cast) => todo!(),
-            llvm_ir::Constant::PtrAuth {
-                ptr,
-                key,
-                disc,
-                addr_disc,
-            } => todo!(),
-        };
-        Ok(self.constants.intern(const_def))
-    }
-
-    fn fold_int_binop(
-        &mut self,
-        lhs_ref: &ConstantRef,
-        rhs_ref: &ConstantRef,
-        module: &Module,
-        op: impl FnOnce(i64, i64) -> i64,
-    ) -> color_eyre::Result<ConstantDef> {
-        let lhs_id = self.convert_const_ref(lhs_ref.clone(), module)?;
-        let rhs_id = self.convert_const_ref(rhs_ref.clone(), module)?;
-        let lhs = self.constants.get(lhs_id);
-        let rhs = self.constants.get(rhs_id);
-        match (&lhs.kind, &rhs.kind) {
-            (
-                ConstantKind::Scalar(ConstValue::Int(a)),
-                ConstantKind::Scalar(ConstValue::Int(b)),
-            ) => Ok(ConstantDef {
-                ty: lhs.ty,
-                kind: ConstantKind::Scalar(ConstValue::Int(op(*a, *b))),
-            }),
-            _ => Err(eyre!(
-                "constant integer binary op requires two integer operands, got: {:?} and {:?}",
-                lhs.kind,
-                rhs.kind
-            )),
-        }
-    }
-
-    fn lower_fn_body(&mut self, func: &llvm_ir::Function) {
+    fn lower_fn_body(&mut self, func: &llvm_ir::Function, module: &Module) {
         let rvsdg_fn = self.get_func_by_name(&func.name).unwrap();
         let mut bb_mapper = BasicBlockMapper::new(func.basic_blocks.len());
         for block in &func.basic_blocks {
@@ -307,14 +152,30 @@ impl RVSDGMod {
                 t => todo!("handle terminator case: {t:?}"),
             }
         }
-        let scc = bb_mapper.get_strongly_connected_components();
-        dbg!(bb_mapper, scc);
+        let scc_analysis = bb_mapper.get_strongly_connected_components();
+        dbg!(bb_mapper, &scc_analysis);
+        let params = vec![];
+        let ret_types = vec![];
+        let func_id = self.declare_fn(
+            func.name.clone(),
+            &params,
+            &ret_types,
+            convert_linkage(func.linkage),
+        );
+
+        self.define_fn(func_id, |rb, state| {
+            let mut builder = Builder::new(rb, state, module);
+            // TODO: need to lower each scc into blocks correctly
+            let group = &scc_analysis.sccs[0];
+            builder.lower_scc(func, group).unwrap();
+            todo!()
+        });
+
         todo!("find unstructured control flow");
         todo!("insert predicates to structure the control flow");
         todo!("lower function basic blocks here")
     }
 }
-
 impl TypeArena {
     fn convert_type_ref(
         &mut self,
@@ -606,7 +467,7 @@ fn convert_visibility(vis: llvm_ir::module::Visibility) -> Visibility {
 ///   - i8 `127`: LLVM stores 0x7F (127). Sign-extend → 127i64. ✓
 ///   - i32 `-1`: LLVM stores 0xFFFFFFFF. Sign-extend → -1i64. ✓
 ///   - i64 `-1`: LLVM stores 0xFFFFFFFF_FFFFFFFF. Cast → -1i64. ✓
-fn sign_extend_to_i64(value: u64, bits: u32) -> i64 {
+pub(super) fn sign_extend_to_i64(value: u64, bits: u32) -> i64 {
     if bits >= 64 {
         value as i64
     } else {
@@ -615,7 +476,7 @@ fn sign_extend_to_i64(value: u64, bits: u32) -> i64 {
     }
 }
 
-fn int_bit_to_scalar(bits: u32) -> color_eyre::Result<ScalarType> {
+pub(super) fn int_bit_to_scalar(bits: u32) -> color_eyre::Result<ScalarType> {
     Ok(match bits {
         1 => ScalarType::Bool,
         8 => ScalarType::I8,
