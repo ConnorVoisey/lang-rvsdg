@@ -232,7 +232,9 @@ impl<'rb, 'g, 'm> Builder<'rb, 'g, 'm> {
             Instruction::Freeze(i) => {
                 self.freeze(i)?;
             }
-            Instruction::Call(call) => todo!(),
+            Instruction::Call(i) => {
+                self.call(i)?;
+            }
             Instruction::VAArg(vaarg) => todo!(),
             Instruction::LandingPad(landing_pad) => todo!(),
             Instruction::CatchPad(catch_pad) => todo!(),

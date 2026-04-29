@@ -20,6 +20,7 @@ use std::str::FromStr;
 use target_lexicon::Triple;
 
 pub mod block_mapper;
+pub mod call_instructions;
 pub mod const_instructions;
 pub mod instructions;
 pub mod strongly_connected_components;

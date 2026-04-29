@@ -250,6 +250,7 @@ dependencies = [
  "anyhow",
  "bitflags",
  "color-eyre",
+ "either",
  "inkwell",
  "llvm-ir",
  "pretty_assertions",
