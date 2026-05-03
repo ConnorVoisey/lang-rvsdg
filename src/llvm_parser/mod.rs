@@ -23,6 +23,7 @@ pub mod block_mapper;
 pub mod call_instructions;
 pub mod const_instructions;
 pub mod instructions;
+pub mod loop_arcs;
 pub mod strongly_connected_components;
 pub mod vector_instructions;
 
