@@ -225,14 +225,14 @@ impl RVSDGMod {
     pub fn define_fn(
         &mut self,
         func_id: FuncId,
-        rb_fn: impl FnOnce(&mut RegionBuilder, State) -> FnResult,
-    ) {
+        rb_fn: impl FnOnce(&mut RegionBuilder, State) -> color_eyre::Result<FnResult>,
+    ) -> color_eyre::Result<()> {
         debug_assert!(self.functions[func_id.0 as usize].lambda_val.is_none());
 
         let mut rb = RegionBuilder::new_from_func(self, func_id);
         let region_id = rb.region_id();
         let state = rb.graph.regions[region_id.0 as usize].entry_state;
-        let fn_res = rb_fn(&mut rb, state);
+        let fn_res = rb_fn(&mut rb, state)?;
         let results = rb.graph.value_pool.push_slice(&fn_res.values);
         rb.graph.values.push(Value {
             ty: TypeRef::Scalar(ScalarType::Void),
@@ -254,6 +254,7 @@ impl RVSDGMod {
 
         // TODO: if in debug mode check that the return values match the declerations return types
         // Also consider if it is variadic
+        Ok(())
     }
 
     #[inline]

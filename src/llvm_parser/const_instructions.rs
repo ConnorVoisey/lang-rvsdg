@@ -1,5 +1,7 @@
+use std::any::Any;
+
 use crate::{
-    llvm_parser::{int_bit_to_scalar, sign_extend_to_i64},
+    llvm_parser::{global_name_string, int_bit_to_scalar, sign_extend_to_i64},
     rvsdg::{
         ConstId, ConstValue, ConstantDef, ConstantKind, RVSDGMod,
         types::{ArrayType, PtrType, ScalarType, TypeRef, VOID},
@@ -88,16 +90,18 @@ impl RVSDGMod {
             }
             llvm_ir::Constant::BlockAddress => todo!(),
             llvm_ir::Constant::GlobalReference { name, ty } => {
-                let name_str = name.to_string();
+                let name_str = global_name_string(name);
                 let ty = self.types.convert_type_ref(ty, module)?;
                 if let Some(&global_id) = self.global_map.get(&name_str) {
                     ConstantDef {
                         ty,
                         kind: ConstantKind::GlobalAddr(global_id),
                     }
-                } else if let Some(&_func_id) = self.fn_map.get(&name_str) {
-                    // TODO: add ConstantKind::FuncAddr(FuncId) for function pointer constants
-                    todo!("function reference in constant context: {name_str}")
+                } else if let Some(&func_id) = self.fn_map.get(&name_str) {
+                    ConstantDef {
+                        ty,
+                        kind: ConstantKind::FuncAddr(func_id),
+                    }
                 } else {
                     return Err(eyre!("global reference to unknown symbol: {name_str}"));
                 }

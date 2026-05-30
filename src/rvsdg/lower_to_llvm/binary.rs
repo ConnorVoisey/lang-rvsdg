@@ -112,10 +112,10 @@ mod tests {
             let a = rb.const_i32(lhs);
             let b = rb.const_i32(rhs);
             let result = rb.binary(op, flags, a, b, I32);
-            FnResult {
+            Ok(FnResult {
                 state,
                 values: vec![result],
-            }
+            })
         });
         jit_run_i32(&rvsdg, "test")
     }
@@ -127,10 +127,10 @@ mod tests {
             let a = rb.constant(F32, ConstValue::f32_from_native(lhs));
             let b = rb.constant(F32, ConstValue::f32_from_native(rhs));
             let result = rb.binary(op, ArithFlags::default(), a, b, F32);
-            FnResult {
+            Ok(FnResult {
                 state,
                 values: vec![result],
-            }
+            })
         });
         jit_run_f32(&rvsdg, "test")
     }

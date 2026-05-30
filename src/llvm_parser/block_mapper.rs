@@ -2,7 +2,7 @@ use llvm_ir::Name;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BasicBlockId(pub u32);
 
 #[derive(Clone, Debug, PartialEq)]

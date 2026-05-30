@@ -105,6 +105,14 @@ impl RVSDGMod {
                 let llvm_type = self.type_to_basic_type_llvm(llvm_builder.context, constant.ty);
                 Self::get_undef(llvm_type)
             }
+            ConstantKind::FuncAddr(func_id) => {
+                let func = mapper
+                    .get_fn(*func_id)
+                    .expect("function show have been declared during lower_functions");
+                func.as_global_value()
+                    .as_pointer_value()
+                    .as_basic_value_enum()
+            }
         }
     }
 
@@ -194,10 +202,10 @@ mod tests {
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg.define_fn(func_id, |rb, state| {
             let v = rb.const_i32(42);
-            FnResult {
+            Ok(FnResult {
                 state,
                 values: vec![v],
-            }
+            })
         });
         assert_eq!(jit_run_i32(&rvsdg, "test"), 42);
     }
@@ -208,10 +216,10 @@ mod tests {
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg.define_fn(func_id, |rb, state| {
             let v = rb.const_i32(0);
-            FnResult {
+            Ok(FnResult {
                 state,
                 values: vec![v],
-            }
+            })
         });
         assert_eq!(jit_run_i32(&rvsdg, "test"), 0);
     }
@@ -222,10 +230,10 @@ mod tests {
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg.define_fn(func_id, |rb, state| {
             let v = rb.const_i32(-1);
-            FnResult {
+            Ok(FnResult {
                 state,
                 values: vec![v],
-            }
+            })
         });
         assert_eq!(jit_run_i32(&rvsdg, "test"), -1);
     }
@@ -236,10 +244,10 @@ mod tests {
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg.define_fn(func_id, |rb, state| {
             let v = rb.const_i32(i32::MAX);
-            FnResult {
+            Ok(FnResult {
                 state,
                 values: vec![v],
-            }
+            })
         });
         assert_eq!(jit_run_i32(&rvsdg, "test"), i32::MAX);
     }
@@ -250,10 +258,10 @@ mod tests {
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg.define_fn(func_id, |rb, state| {
             let v = rb.const_i32(i32::MIN);
-            FnResult {
+            Ok(FnResult {
                 state,
                 values: vec![v],
-            }
+            })
         });
         assert_eq!(jit_run_i32(&rvsdg, "test"), i32::MIN);
     }
@@ -268,10 +276,10 @@ mod tests {
             let t = rb.const_i32(10);
             let f = rb.const_i32(20);
             let v = rb.ternary(cond, t, f, I32);
-            FnResult {
+            Ok(FnResult {
                 state,
                 values: vec![v],
-            }
+            })
         });
         assert_eq!(jit_run_i32(&rvsdg, "test"), 10);
     }
@@ -285,10 +293,10 @@ mod tests {
             let t = rb.const_i32(10);
             let f = rb.const_i32(20);
             let v = rb.ternary(cond, t, f, I32);
-            FnResult {
+            Ok(FnResult {
                 state,
                 values: vec![v],
-            }
+            })
         });
         assert_eq!(jit_run_i32(&rvsdg, "test"), 20);
     }
@@ -307,10 +315,10 @@ mod tests {
             let one = rb.const_i32(1);
             let zero = rb.const_i32(0);
             let v = rb.ternary(cmp, one, zero, I32);
-            FnResult {
+            Ok(FnResult {
                 state,
                 values: vec![v],
-            }
+            })
         });
         assert_eq!(jit_run_i32(&rvsdg, "test"), 1);
     }
@@ -329,10 +337,10 @@ mod tests {
             let one = rb.const_i32(1);
             let zero = rb.const_i32(0);
             let v = rb.ternary(cmp, one, zero, I32);
-            FnResult {
+            Ok(FnResult {
                 state,
                 values: vec![v],
-            }
+            })
         });
         assert_eq!(jit_run_i32(&rvsdg, "test"), 1);
     }
@@ -345,10 +353,10 @@ mod tests {
             let a = rb.const_i64(3_000_000_000);
             let b = rb.const_i64(1_000_000_000);
             let sum = rb.binary(BinaryOp::Add, ArithFlags::default(), a, b, I64);
-            FnResult {
+            Ok(FnResult {
                 state,
                 values: vec![sum],
-            }
+            })
         });
         assert_eq!(jit_run_i64(&rvsdg, "test"), 4_000_000_000);
     }
@@ -361,10 +369,10 @@ mod tests {
             let a = rb.constant(F32, ConstValue::f32_from_native(3.5));
             let b = rb.constant(F32, ConstValue::f32_from_native(1.5));
             let sum = rb.binary(BinaryOp::FloatAdd, ArithFlags::default(), a, b, F32);
-            FnResult {
+            Ok(FnResult {
                 state,
                 values: vec![sum],
-            }
+            })
         });
         assert_eq!(jit_run_f32(&rvsdg, "test"), 5.0);
     }
@@ -377,10 +385,10 @@ mod tests {
             let a = rb.constant(F32, ConstValue::f32_from_native(-2.5));
             let b = rb.constant(F32, ConstValue::f32_from_native(2.5));
             let sum = rb.binary(BinaryOp::FloatAdd, ArithFlags::default(), a, b, F32);
-            FnResult {
+            Ok(FnResult {
                 state,
                 values: vec![sum],
-            }
+            })
         });
         assert_eq!(jit_run_f32(&rvsdg, "test"), 0.0);
     }
@@ -393,10 +401,10 @@ mod tests {
             let a = rb.constant(F64, ConstValue::f64_from_native(1.0));
             let b = rb.constant(F64, ConstValue::f64_from_native(2.0));
             let sum = rb.binary(BinaryOp::FloatAdd, ArithFlags::default(), a, b, F64);
-            FnResult {
+            Ok(FnResult {
                 state,
                 values: vec![sum],
-            }
+            })
         });
         assert_eq!(jit_run_f64(&rvsdg, "test"), 3.0);
     }
@@ -411,10 +419,10 @@ mod tests {
             // 5 + 5 = 10, then 10 * 5 = 50
             let sum = rb.binary(BinaryOp::Add, ArithFlags::default(), five, five, I32);
             let result = rb.binary(BinaryOp::Mul, ArithFlags::default(), sum, five, I32);
-            FnResult {
+            Ok(FnResult {
                 state,
                 values: vec![result],
-            }
+            })
         });
         assert_eq!(jit_run_i32(&rvsdg, "test"), 50);
     }
@@ -442,10 +450,10 @@ mod tests {
             let one = rb.const_i32(1);
             let zero = rb.const_i32(0);
             let v = rb.ternary(cmp, one, zero, I32);
-            FnResult {
+            Ok(FnResult {
                 state,
                 values: vec![v],
-            }
+            })
         });
         assert_eq!(jit_run_i32(&rvsdg, "test"), 1);
     }
@@ -473,10 +481,10 @@ mod tests {
         rvsdg.define_fn(func_id, |rb, state| {
             let ptr = rb.global_ref(global_id, ptr_ty);
             let loaded = rb.load(state, ptr, I32, None, false);
-            FnResult {
+            Ok(FnResult {
                 state: loaded.state,
                 values: vec![loaded.value],
-            }
+            })
         });
         assert_eq!(jit_run_i32(&rvsdg, "test"), 42);
     }
@@ -507,10 +515,10 @@ mod tests {
         rvsdg.define_fn(func_id, |rb, state| {
             let ptr = rb.global_ref(global_id, ptr_ty);
             let loaded = rb.load(state, ptr, I64, None, false);
-            FnResult {
+            Ok(FnResult {
                 state: loaded.state,
                 values: vec![loaded.value],
-            }
+            })
         });
         assert_eq!(jit_run_i64(&rvsdg, "test"), 9_000_000_000);
     }
@@ -533,10 +541,10 @@ mod tests {
         rvsdg.define_fn(func_id, |rb, state| {
             let ptr = rb.global_ref(global_id, ptr_ty);
             let loaded = rb.load(state, ptr, F32, None, false);
-            FnResult {
+            Ok(FnResult {
                 state: loaded.state,
                 values: vec![loaded.value],
-            }
+            })
         });
         assert_eq!(jit_run_f32(&rvsdg, "test"), 3.14f32);
     }
@@ -557,10 +565,10 @@ mod tests {
         rvsdg.define_fn(func_id, |rb, state| {
             let ptr = rb.global_ref(global_id, ptr_ty);
             let loaded = rb.load(state, ptr, I32, None, false);
-            FnResult {
+            Ok(FnResult {
                 state: loaded.state,
                 values: vec![loaded.value],
-            }
+            })
         });
         assert_eq!(jit_run_i32(&rvsdg, "test"), -999);
     }
@@ -599,10 +607,10 @@ mod tests {
                 lb.value,
                 I32,
             );
-            FnResult {
+            Ok(FnResult {
                 state: lb.state,
                 values: vec![sum],
-            }
+            })
         });
         assert_eq!(jit_run_i32(&rvsdg, "test"), 42);
     }
@@ -633,16 +641,16 @@ mod tests {
                 let one = rb.const_i32(1);
                 let next_x = rb.binary(BinaryOp::Add, ArithFlags::default(), loop_x, one, I32);
                 let condition = rb.icmp(ICmpPred::SignedLt, next_x, limit);
-                LoopResult {
+                Ok(LoopResult {
                     condition,
                     next_state: state,
                     next_vars: vec![next_x],
-                }
-            });
-            FnResult {
+                })
+            })?;
+            Ok(FnResult {
                 state: res.state,
                 values: vec![res.result(0)],
-            }
+            })
         });
         assert_eq!(jit_run_i32(&rvsdg, "test"), 7);
     }
@@ -673,10 +681,10 @@ mod tests {
             let ptr = rb.global_ref(global_id, ptr_ty);
             let loaded = rb.load(state, ptr, arr_ty, None, false);
             let elem = rb.extract_field(loaded.value, &[1], I32);
-            FnResult {
+            Ok(FnResult {
                 state: loaded.state,
                 values: vec![elem],
-            }
+            })
         });
         assert_eq!(jit_run_i32(&rvsdg, "test"), 20);
     }
@@ -713,10 +721,10 @@ mod tests {
             let sum01 = rb.binary(BinaryOp::Add, ArithFlags::default(), e0, e1, I32);
             let sum23 = rb.binary(BinaryOp::Add, ArithFlags::default(), e2, e3, I32);
             let total = rb.binary(BinaryOp::Add, ArithFlags::default(), sum01, sum23, I32);
-            FnResult {
+            Ok(FnResult {
                 state: loaded.state,
                 values: vec![total],
-            }
+            })
         });
         assert_eq!(jit_run_i32(&rvsdg, "test"), 10);
     }
@@ -752,10 +760,10 @@ mod tests {
             let a = rb.extract_field(loaded.value, &[0], F32);
             let b = rb.extract_field(loaded.value, &[1], F32);
             let sum = rb.binary(BinaryOp::FloatAdd, ArithFlags::default(), a, b, F32);
-            FnResult {
+            Ok(FnResult {
                 state: loaded.state,
                 values: vec![sum],
-            }
+            })
         });
         assert_eq!(jit_run_f32(&rvsdg, "test"), 4.0);
     }
@@ -776,10 +784,10 @@ mod tests {
             let a = rb.extract_field(s, &[0], I32);
             let b = rb.extract_field(s, &[1], I32);
             let sum = rb.binary(BinaryOp::Add, ArithFlags::default(), a, b, I32);
-            FnResult {
+            Ok(FnResult {
                 state,
                 values: vec![sum],
-            }
+            })
         });
         assert_eq!(jit_run_i32(&rvsdg, "test"), 300);
     }
@@ -791,10 +799,10 @@ mod tests {
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg.define_fn(func_id, |rb, state| {
             let v = rb.const_pool_ref(zero_id, I32);
-            FnResult {
+            Ok(FnResult {
                 state,
                 values: vec![v],
-            }
+            })
         });
         assert_eq!(jit_run_i32(&rvsdg, "test"), 0);
     }
@@ -806,10 +814,10 @@ mod tests {
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[F32], Linkage::External);
         rvsdg.define_fn(func_id, |rb, state| {
             let v = rb.const_pool_ref(zero_id, F32);
-            FnResult {
+            Ok(FnResult {
                 state,
                 values: vec![v],
-            }
+            })
         });
         assert_eq!(jit_run_f32(&rvsdg, "test"), 0.0);
     }
@@ -840,10 +848,10 @@ mod tests {
             let e0 = rb.extract_field(loaded.value, &[0], I32);
             let e2 = rb.extract_field(loaded.value, &[2], I32);
             let sum = rb.binary(BinaryOp::Add, ArithFlags::default(), e0, e2, I32);
-            FnResult {
+            Ok(FnResult {
                 state: loaded.state,
                 values: vec![sum],
-            }
+            })
         });
         assert_eq!(jit_run_i32(&rvsdg, "test"), 0);
     }
@@ -858,10 +866,10 @@ mod tests {
             let z = rb.const_pool_ref(zero_id, I32);
             let v = rb.const_i32(42);
             let sum = rb.binary(BinaryOp::Add, ArithFlags::default(), z, v, I32);
-            FnResult {
+            Ok(FnResult {
                 state,
                 values: vec![sum],
-            }
+            })
         });
         assert_eq!(jit_run_i32(&rvsdg, "test"), 42);
     }
@@ -880,10 +888,10 @@ mod tests {
             let v = rb.const_i32(0);
             // undef + 0 = undef, but the program should compile and run
             let result = rb.binary(BinaryOp::Add, ArithFlags::default(), u, v, I32);
-            FnResult {
+            Ok(FnResult {
                 state,
                 values: vec![result],
-            }
+            })
         });
         // Just verify it doesn't crash — the value is undefined
         let _ = jit_run_i32(&rvsdg, "test");
@@ -899,10 +907,10 @@ mod tests {
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[F32], Linkage::External);
         rvsdg.define_fn(func_id, |rb, state| {
             let u = rb.const_pool_ref(undef_id, F32);
-            FnResult {
+            Ok(FnResult {
                 state,
                 values: vec![u],
-            }
+            })
         });
         let _ = jit_run_f32(&rvsdg, "test");
     }
@@ -916,10 +924,10 @@ mod tests {
             let p = rb.constant(I32, ConstValue::Poison);
             let v = rb.const_i32(0);
             let result = rb.binary(BinaryOp::Add, ArithFlags::default(), p, v, I32);
-            FnResult {
+            Ok(FnResult {
                 state,
                 values: vec![result],
-            }
+            })
         });
         let _ = jit_run_i32(&rvsdg, "test");
     }
@@ -930,10 +938,10 @@ mod tests {
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[F32], Linkage::External);
         rvsdg.define_fn(func_id, |rb, state| {
             let p = rb.constant(F32, ConstValue::Poison);
-            FnResult {
+            Ok(FnResult {
                 state,
                 values: vec![p],
-            }
+            })
         });
         let _ = jit_run_f32(&rvsdg, "test");
     }
@@ -952,10 +960,10 @@ mod tests {
             let v = rb.const_i32(42);
             let cond = rb.constant(BOOL, ConstValue::Int(1));
             let result = rb.ternary(cond, v, u, I32);
-            FnResult {
+            Ok(FnResult {
                 state,
                 values: vec![result],
-            }
+            })
         });
         assert_eq!(jit_run_i32(&rvsdg, "test"), 42);
     }

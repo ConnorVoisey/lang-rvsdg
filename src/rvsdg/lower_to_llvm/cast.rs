@@ -102,10 +102,10 @@ mod tests {
         rvsdg.define_fn(func_id, |rb, state| {
             let v = rb.constant(I8, ConstValue::Int(-1i8 as i64));
             let result = rb.cast(CastOp::SignExtend, v, I32);
-            FnResult {
+            Ok(FnResult {
                 state,
                 values: vec![result],
-            }
+            })
         });
         assert_eq!(jit_run_i32(&rvsdg, "test"), -1);
     }
@@ -118,10 +118,10 @@ mod tests {
         rvsdg.define_fn(func_id, |rb, state| {
             let v = rb.constant(I8, ConstValue::Int(100));
             let result = rb.cast(CastOp::SignExtend, v, I32);
-            FnResult {
+            Ok(FnResult {
                 state,
                 values: vec![result],
-            }
+            })
         });
         assert_eq!(jit_run_i32(&rvsdg, "test"), 100);
     }
@@ -134,10 +134,10 @@ mod tests {
         rvsdg.define_fn(func_id, |rb, state| {
             let v = rb.constant(I8, ConstValue::Int(0xFF));
             let result = rb.cast(CastOp::ZeroExtend, v, I32);
-            FnResult {
+            Ok(FnResult {
                 state,
                 values: vec![result],
-            }
+            })
         });
         assert_eq!(jit_run_i32(&rvsdg, "test"), 255);
     }
@@ -149,10 +149,10 @@ mod tests {
         rvsdg.define_fn(func_id, |rb, state| {
             let v = rb.constant(I16, ConstValue::Int(50000));
             let result = rb.cast(CastOp::ZeroExtend, v, I64);
-            FnResult {
+            Ok(FnResult {
                 state,
                 values: vec![result],
-            }
+            })
         });
         assert_eq!(jit_run_i64(&rvsdg, "test"), 50000);
     }
@@ -169,10 +169,10 @@ mod tests {
             let v = rb.const_i32(0x1FF);
             let truncated = rb.cast(CastOp::Truncate, v, I8);
             let result = rb.cast(CastOp::ZeroExtend, truncated, I32);
-            FnResult {
+            Ok(FnResult {
                 state,
                 values: vec![result],
-            }
+            })
         });
         assert_eq!(jit_run_i32(&rvsdg, "test"), 255);
     }
@@ -184,10 +184,10 @@ mod tests {
         rvsdg.define_fn(func_id, |rb, state| {
             let v = rb.const_i64(0x1_0000_002A); // lower 32 bits = 42
             let result = rb.cast(CastOp::Truncate, v, I32);
-            FnResult {
+            Ok(FnResult {
                 state,
                 values: vec![result],
-            }
+            })
         });
         assert_eq!(jit_run_i32(&rvsdg, "test"), 42);
     }
@@ -201,10 +201,10 @@ mod tests {
         rvsdg.define_fn(func_id, |rb, state| {
             let v = rb.constant(F32, ConstValue::f32_from_native(3.5));
             let result = rb.cast(CastOp::FloatExtend, v, F64);
-            FnResult {
+            Ok(FnResult {
                 state,
                 values: vec![result],
-            }
+            })
         });
         assert_eq!(jit_run_f64(&rvsdg, "test"), 3.5);
     }
@@ -216,10 +216,10 @@ mod tests {
         rvsdg.define_fn(func_id, |rb, state| {
             let v = rb.constant(F64, ConstValue::f64_from_native(2.5));
             let result = rb.cast(CastOp::FloatTruncate, v, F32);
-            FnResult {
+            Ok(FnResult {
                 state,
                 values: vec![result],
-            }
+            })
         });
         assert_eq!(jit_run_f32(&rvsdg, "test"), 2.5);
     }
@@ -233,10 +233,10 @@ mod tests {
         rvsdg.define_fn(func_id, |rb, state| {
             let v = rb.const_i32(-42);
             let result = rb.cast(CastOp::SignedToFloat, v, F32);
-            FnResult {
+            Ok(FnResult {
                 state,
                 values: vec![result],
-            }
+            })
         });
         assert_eq!(jit_run_f32(&rvsdg, "test"), -42.0);
     }
@@ -249,10 +249,10 @@ mod tests {
             // 3_000_000_000 doesn't fit in signed i32 but is a valid u32
             let v = rb.const_i32(3_000_000_000u32 as i32);
             let result = rb.cast(CastOp::UnsignedToFloat, v, F32);
-            FnResult {
+            Ok(FnResult {
                 state,
                 values: vec![result],
-            }
+            })
         });
         assert_eq!(jit_run_f32(&rvsdg, "test"), 3_000_000_000.0f32);
     }
@@ -264,10 +264,10 @@ mod tests {
         rvsdg.define_fn(func_id, |rb, state| {
             let v = rb.constant(F32, ConstValue::f32_from_native(-7.9));
             let result = rb.cast(CastOp::FloatToSigned, v, I32);
-            FnResult {
+            Ok(FnResult {
                 state,
                 values: vec![result],
-            }
+            })
         });
         // truncates toward zero
         assert_eq!(jit_run_i32(&rvsdg, "test"), -7);
@@ -280,10 +280,10 @@ mod tests {
         rvsdg.define_fn(func_id, |rb, state| {
             let v = rb.constant(F32, ConstValue::f32_from_native(42.7));
             let result = rb.cast(CastOp::FloatToUnsigned, v, I32);
-            FnResult {
+            Ok(FnResult {
                 state,
                 values: vec![result],
-            }
+            })
         });
         assert_eq!(jit_run_i32(&rvsdg, "test"), 42);
     }
@@ -320,10 +320,10 @@ mod tests {
             let s1 = rb.store(state, as_ptr, ninety_nine, None, false);
             // load from original pointer
             let loaded = rb.load(s1, ptr, I32, None, false);
-            FnResult {
+            Ok(FnResult {
                 state: loaded.state,
                 values: vec![loaded.value],
-            }
+            })
         });
         assert_eq!(jit_run_i32(&rvsdg, "test"), 99);
     }
@@ -340,10 +340,10 @@ mod tests {
             let as_f64 = rb.cast(CastOp::SignedToFloat, v, F64);
             let as_f32 = rb.cast(CastOp::FloatTruncate, as_f64, F32);
             let result = rb.cast(CastOp::FloatToSigned, as_f32, I32);
-            FnResult {
+            Ok(FnResult {
                 state,
                 values: vec![result],
-            }
+            })
         });
         assert_eq!(jit_run_i32(&rvsdg, "test"), 42);
     }
@@ -358,10 +358,10 @@ mod tests {
             let wide = rb.cast(CastOp::SignExtend, v, I32);
             let narrow = rb.cast(CastOp::Truncate, wide, I8);
             let result = rb.cast(CastOp::ZeroExtend, narrow, I32);
-            FnResult {
+            Ok(FnResult {
                 state,
                 values: vec![result],
-            }
+            })
         });
         assert_eq!(jit_run_i32(&rvsdg, "test"), 77);
     }

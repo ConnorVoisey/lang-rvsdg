@@ -3,13 +3,24 @@ use smallvec::SmallVec;
 use std::collections::VecDeque;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct SccId(u32);
+pub struct SccId(u32);
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SccAnalysis {
     /// reverse topo order; reverse for forward
     pub sccs: Vec<Scc>,
     pub block_to_scc: Vec<SccId>,
+}
+impl SccAnalysis {
+    #[inline]
+    pub fn get_scc(&self, scc_id: SccId) -> &Scc {
+        &self.sccs[scc_id.0 as usize]
+    }
+
+    #[inline]
+    pub fn get_scc_from_block(&self, block_id: BasicBlockId) -> SccId {
+        self.block_to_scc[block_id.0 as usize]
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Default)]
@@ -71,13 +82,15 @@ impl BasicBlockMapper {
             }
 
             if low_links[id.0 as usize] == indicies[id.0 as usize] {
+                // Compute the SCC's index now (it'll be the next slot when we push it
+                // after this loop). All blocks in this SCC get this same id.
+                let scc_id = SccId(scc_analysis.sccs.len() as u32);
                 let mut scc = Scc {
                     blocks: SmallVec::new(),
                     is_trivial: false,
                 };
                 while let Some(node) = stack.pop_back() {
                     on_stack[node.0 as usize] = false;
-                    let scc_id = SccId(scc.blocks.len() as u32);
                     scc.blocks.push(node);
                     scc_analysis.block_to_scc[node.0 as usize] = scc_id;
                     if node == id {

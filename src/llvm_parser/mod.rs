@@ -1,12 +1,15 @@
 use crate::{
     llvm_parser::{
         block_mapper::{BasicBlockId, BasicBlockMapper},
-        instructions::Builder,
+        dominance::{ForwardView, ReverseView, compute_dominance},
+        instructions::RegionLowerer,
+        strongly_connected_components::SccAnalysis,
     },
     rvsdg::{
         GlobalInit, InlineHint, Linkage, RVSDGMod, Visibility,
         func::{
-            CallingConvention, FnAttrFlags, FnAttrs, FnDecl, Param, ParamAttrFlags, ParamAttrs,
+            CallingConvention, FnAttrFlags, FnAttrs, FnDecl, FnResult, Param, ParamAttrFlags,
+            ParamAttrs,
         },
         types::{
             ArrayType, FuncType, PtrType, ScalarType, StructDef, StructField, TypeArena, TypeRef,
@@ -22,10 +25,22 @@ use target_lexicon::Triple;
 pub mod block_mapper;
 pub mod call_instructions;
 pub mod const_instructions;
+pub mod dominance;
 pub mod instructions;
 pub mod loop_arcs;
+pub mod region;
 pub mod strongly_connected_components;
 pub mod vector_instructions;
+
+struct FnCtx<'m> {
+    pub llvm_mod: &'m Module,
+    pub func: &'m llvm_ir::Function,
+    pub bb_mapper: &'m BasicBlockMapper,
+    pub scc_analysis: &'m SccAnalysis,
+    pub immediate_dominators: &'m [Option<BasicBlockId>], // forward dominators
+    pub post_immediate_dominators: &'m [Option<BasicBlockId>], // post-dominators
+    pub exit_block_id: BasicBlockId,                      // synthetic function exit
+}
 
 impl RVSDGMod {
     pub fn from_llvm_mod(module: Module) -> color_eyre::Result<RVSDGMod> {
@@ -67,7 +82,7 @@ impl RVSDGMod {
                 None => GlobalInit::Extern,
             };
             rvsdg_mod.define_global(
-                global.name.to_string(),
+                global_name_string(&global.name),
                 value_ty,
                 init,
                 global.is_constant,
@@ -79,7 +94,7 @@ impl RVSDGMod {
             let init =
                 GlobalInit::Init(rvsdg_mod.convert_const_ref(global.aliasee.clone(), &module)?);
             rvsdg_mod.define_global(
-                global.name.to_string(),
+                global_name_string(&global.name),
                 ty,
                 init,
                 true,
@@ -89,7 +104,7 @@ impl RVSDGMod {
         for global in &module.global_ifuncs {
             let ty = rvsdg_mod.types.convert_type_ref(&global.ty, &module)?;
             rvsdg_mod.define_global(
-                global.name.to_string(),
+                global_name_string(&global.name),
                 ty,
                 GlobalInit::Extern,
                 true,
@@ -101,13 +116,17 @@ impl RVSDGMod {
 
         // lower function bodies
         for func in &module.functions {
-            rvsdg_mod.lower_fn_body(&func, &module);
+            rvsdg_mod.lower_fn_body(func, &module)?;
         }
 
         Ok(rvsdg_mod)
     }
 
-    fn lower_fn_body(&mut self, func: &llvm_ir::Function, module: &Module) {
+    fn lower_fn_body(
+        &mut self,
+        func: &llvm_ir::Function,
+        module: &Module,
+    ) -> color_eyre::Result<()> {
         let rvsdg_fn = self.get_func_by_name(&func.name).unwrap();
         let mut bb_mapper = BasicBlockMapper::new(func.basic_blocks.len());
         for block in &func.basic_blocks {
@@ -155,27 +174,50 @@ impl RVSDGMod {
             }
         }
         let scc_analysis = bb_mapper.get_strongly_connected_components();
-        dbg!(bb_mapper, &scc_analysis);
-        let params = vec![];
-        let ret_types = vec![];
-        let func_id = self.declare_fn(
-            func.name.clone(),
-            &params,
-            &ret_types,
-            convert_linkage(func.linkage),
-        );
+        dbg!(&bb_mapper, &scc_analysis);
 
-        self.define_fn(func_id, |rb, state| {
-            let mut builder = Builder::new(rb, state, module);
-            // TODO: need to lower each scc into blocks correctly
-            let group = &scc_analysis.sccs[0];
-            builder.lower_scc(func, group).unwrap();
-            todo!()
-        });
+        // Compute dominators / post-dominators once per function. Borrowed by FnCtx.
+        let forward_view = ForwardView {
+            nodes: &bb_mapper.blocks,
+            entry: BasicBlockId(0),
+        };
+        let immediate_dominators = compute_dominance(&forward_view);
+        let reverse_view = ReverseView {
+            nodes: &bb_mapper.blocks,
+            exit: exit_block_id,
+        };
+        let post_immediate_dominators = compute_dominance(&reverse_view);
 
-        todo!("find unstructured control flow");
-        todo!("insert predicates to structure the control flow");
-        todo!("lower function basic blocks here")
+        let fn_ctx = FnCtx {
+            llvm_mod: module,
+            func,
+            bb_mapper: &bb_mapper,
+            scc_analysis: &scc_analysis,
+            immediate_dominators: &immediate_dominators,
+            post_immediate_dominators: &post_immediate_dominators,
+            exit_block_id,
+        };
+
+        self.define_fn(rvsdg_fn.id, |rb, state| {
+            let mut builder = RegionLowerer::new(rb, &fn_ctx);
+
+            // register function parameters
+            for (i, param) in func.parameters.iter().enumerate() {
+                let val = builder.rb.param(i as u32);
+                builder.name_to_value.insert(param.name.clone(), val);
+            }
+
+            // Lower the body from the entry block. lower_region returns the
+            // exit state plus any operand values from the function's `ret`
+            // terminator (empty Vec for void returns).
+            let exit = builder.lower_region(state, BasicBlockId(0), None)?;
+
+            let (state, values) = match exit {
+                region::RegionExit::AtBoundary(state) => (state, vec![]),
+                region::RegionExit::Returned { state, values } => (state, values),
+            };
+            Ok(FnResult { state, values })
+        })
     }
 }
 impl TypeArena {
@@ -488,4 +530,15 @@ pub(super) fn int_bit_to_scalar(bits: u32) -> color_eyre::Result<ScalarType> {
         128 => ScalarType::I128,
         _ => Err(eyre!("unsupported integer width: {bits}"))?,
     })
+}
+
+/// `Name::Display` prepends `%` (correct for SSA-locals, wrong for globals).
+/// `fn_map` and `global_map` are keyed by the bare name, so this is the
+/// canonical conversion to use whenever we need to insert into or look up
+/// from those maps.
+pub(super) fn global_name_string(name: &llvm_ir::Name) -> String {
+    match name {
+        llvm_ir::Name::Name(s) => s.as_ref().clone(),
+        llvm_ir::Name::Number(n) => n.to_string(),
+    }
 }

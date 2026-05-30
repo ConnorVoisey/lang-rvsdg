@@ -113,16 +113,16 @@ mod tests {
                 let next_x = rb.binary(BinaryOp::Add, ArithFlags::default(), loop_x, one, I32);
                 let ten = rb.const_i32(10);
                 let condition = rb.icmp(ICmpPred::SignedLt, next_x, ten);
-                LoopResult {
+                Ok(LoopResult {
                     condition,
                     next_state: state,
                     next_vars: vec![next_x],
-                }
-            });
-            FnResult {
+                })
+            })?;
+            Ok(FnResult {
                 state: res.state,
                 values: vec![res.result(0)],
-            }
+            })
         });
 
         assert_eq!(jit_run_i32(&rvsdg, "test"), 10);
@@ -142,16 +142,16 @@ mod tests {
                 let five = rb.const_i32(5);
                 let next_x = rb.binary(BinaryOp::Add, ArithFlags::default(), loop_x, five, I32);
                 let condition = rb.constant(BOOL, ConstValue::Int(0));
-                LoopResult {
+                Ok(LoopResult {
                     condition,
                     next_state: state,
                     next_vars: vec![next_x],
-                }
-            });
-            FnResult {
+                })
+            })?;
+            Ok(FnResult {
                 state: res.state,
                 values: vec![res.result(0)],
-            }
+            })
         });
 
         assert_eq!(jit_run_i32(&rvsdg, "test"), 5);
@@ -177,12 +177,12 @@ mod tests {
                 let next_y = rb.binary(BinaryOp::Sub, ArithFlags::default(), loop_y, ten, I32);
                 let five = rb.const_i32(5);
                 let condition = rb.icmp(ICmpPred::SignedLt, next_x, five);
-                LoopResult {
+                Ok(LoopResult {
                     condition,
                     next_state: state,
                     next_vars: vec![next_x, next_y],
-                }
-            });
+                })
+            })?;
             // x * y = 5 * 50 = 250
             let result_x = res.result(0);
             let result_y = res.result(1);
@@ -193,10 +193,10 @@ mod tests {
                 result_y,
                 I32,
             );
-            FnResult {
+            Ok(FnResult {
                 state: res.state,
                 values: vec![product],
-            }
+            })
         });
 
         assert_eq!(jit_run_i32(&rvsdg, "test"), 250);
@@ -217,16 +217,16 @@ mod tests {
                 let next_x = rb.binary(BinaryOp::Sub, ArithFlags::default(), loop_x, one, I32);
                 let zero = rb.const_i32(0);
                 let condition = rb.icmp(ICmpPred::SignedGt, next_x, zero);
-                LoopResult {
+                Ok(LoopResult {
                     condition,
                     next_state: state,
                     next_vars: vec![next_x],
-                }
-            });
-            FnResult {
+                })
+            })?;
+            Ok(FnResult {
                 state: res.state,
                 values: vec![res.result(0)],
-            }
+            })
         });
 
         assert_eq!(jit_run_i32(&rvsdg, "test"), 0);
@@ -251,16 +251,16 @@ mod tests {
                 let next_i = rb.binary(BinaryOp::Add, ArithFlags::default(), loop_i, one, I32);
                 let ten = rb.const_i32(10);
                 let condition = rb.icmp(ICmpPred::SignedLe, next_i, ten);
-                LoopResult {
+                Ok(LoopResult {
                     condition,
                     next_state: state,
                     next_vars: vec![next_sum, next_i],
-                }
-            });
-            FnResult {
+                })
+            })?;
+            Ok(FnResult {
                 state: res.state,
                 values: vec![res.result(0)],
-            }
+            })
         });
 
         assert_eq!(jit_run_i32(&rvsdg, "test"), 55);
@@ -285,16 +285,16 @@ mod tests {
                 let next_i = rb.binary(BinaryOp::Add, ArithFlags::default(), loop_i, one, I32);
                 let ten = rb.const_i32(10);
                 let condition = rb.icmp(ICmpPred::SignedLt, next_i, ten);
-                LoopResult {
+                Ok(LoopResult {
                     condition,
                     next_state: state,
                     next_vars: vec![next_x, next_i],
-                }
-            });
-            FnResult {
+                })
+            })?;
+            Ok(FnResult {
                 state: res.state,
                 values: vec![res.result(0)],
-            }
+            })
         });
 
         assert_eq!(jit_run_i32(&rvsdg, "test"), 1024);
@@ -321,26 +321,28 @@ mod tests {
                             rb.binary(BinaryOp::Add, ArithFlags::default(), loop_x, one, I32);
                         let seven = rb.const_i32(7);
                         let condition = rb.icmp(ICmpPred::SignedLt, next_x, seven);
-                        LoopResult {
+                        Ok(LoopResult {
                             condition,
                             next_state: state,
                             next_vars: vec![next_x],
-                        }
-                    });
-                    BranchResult {
+                        })
+                    })?;
+                    Ok(BranchResult {
                         state,
                         values: vec![loop_res.result(0)],
-                    }
+                    })
                 },
-                |rb| BranchResult {
-                    state,
-                    values: vec![rb.const_i32(99)],
+                |rb| {
+                    Ok(BranchResult {
+                        state,
+                        values: vec![rb.const_i32(99)],
+                    })
                 },
-            );
-            FnResult {
+            )?;
+            Ok(FnResult {
                 state: res.state,
                 values: vec![res.result(0)],
-            }
+            })
         });
 
         assert_eq!(jit_run_i32(&rvsdg, "test"), 7);
@@ -380,31 +382,35 @@ mod tests {
                     is_even,
                     state,
                     &[next_x],
-                    |rb| BranchResult {
-                        state,
-                        values: vec![rb.param(0)],
+                    |rb| {
+                        Ok(BranchResult {
+                            state,
+                            values: vec![rb.param(0)],
+                        })
                     },
-                    |rb| BranchResult {
-                        state,
-                        values: vec![rb.const_i32(0)],
+                    |rb| {
+                        Ok(BranchResult {
+                            state,
+                            values: vec![rb.const_i32(0)],
+                        })
                     },
-                );
+                )?;
                 let to_add = branch_res.result(0);
                 let next_sum =
                     rb.binary(BinaryOp::Add, ArithFlags::default(), loop_sum, to_add, I32);
 
                 let six = rb.const_i32(6);
                 let condition = rb.icmp(ICmpPred::SignedLt, next_x, six);
-                LoopResult {
+                Ok(LoopResult {
                     condition,
                     next_state: state,
                     next_vars: vec![next_x, next_sum],
-                }
-            });
-            FnResult {
+                })
+            })?;
+            Ok(FnResult {
                 state: res.state,
                 values: vec![res.result(1)],
-            }
+            })
         });
 
         assert_eq!(jit_run_i32(&rvsdg, "test"), 12);
@@ -437,29 +443,29 @@ mod tests {
                                 rb.binary(BinaryOp::Add, ArithFlags::default(), loop_x, one, I32);
                             let five = rb.const_i32(5);
                             let condition = rb.icmp(ICmpPred::SignedLt, next_x, five);
-                            LoopResult {
+                            Ok(LoopResult {
                                 condition,
                                 next_state: state,
                                 next_vars: vec![next_x],
-                            }
-                        });
-                        BranchResult {
+                            })
+                        })?;
+                        Ok(BranchResult {
                             state,
                             values: vec![loop_res.result(0)],
-                        }
+                        })
                     },
                     |rb| {
                         // false branch: condition already false, pass through
-                        BranchResult {
+                        Ok(BranchResult {
                             state,
                             values: vec![rb.param(0)],
-                        }
+                        })
                     },
-                );
-                FnResult {
+                )?;
+                Ok(FnResult {
                     state: res.state,
                     values: vec![res.result(0)],
-                }
+                })
             });
             rvsdg
         };

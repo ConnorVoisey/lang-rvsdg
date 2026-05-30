@@ -188,10 +188,10 @@ mod tests {
         rvsdg.define_fn(func_id, |rb, state| {
             let v = rb.const_i32(input);
             let result = rb.unary(op, v, I32);
-            FnResult {
+            Ok(FnResult {
                 state,
                 values: vec![result],
-            }
+            })
         });
         jit_run_i32(&rvsdg, "test")
     }
@@ -202,10 +202,10 @@ mod tests {
         rvsdg.define_fn(func_id, |rb, state| {
             let v = rb.constant(F32, ConstValue::f32_from_native(input));
             let result = rb.unary(op, v, F32);
-            FnResult {
+            Ok(FnResult {
                 state,
                 values: vec![result],
-            }
+            })
         });
         jit_run_f32(&rvsdg, "test")
     }
@@ -301,10 +301,10 @@ mod tests {
             let v = rb.const_i32(0xDEADBEEF_u32 as i32);
             let swapped = rb.unary(UnaryOp::ByteSwap, v, I32);
             let result = rb.unary(UnaryOp::ByteSwap, swapped, I32);
-            FnResult {
+            Ok(FnResult {
                 state,
                 values: vec![result],
-            }
+            })
         });
         assert_eq!(jit_run_i32(&rvsdg, "test"), 0xDEADBEEF_u32 as i32);
     }
@@ -325,10 +325,10 @@ mod tests {
             let v = rb.const_i32(0x12345678);
             let rev = rb.unary(UnaryOp::BitReverse, v, I32);
             let result = rb.unary(UnaryOp::BitReverse, rev, I32);
-            FnResult {
+            Ok(FnResult {
                 state,
                 values: vec![result],
-            }
+            })
         });
         assert_eq!(jit_run_i32(&rvsdg, "test"), 0x12345678);
     }
@@ -415,10 +415,10 @@ mod tests {
             let v = rb.constant(F32, ConstValue::f32_from_native(42.0));
             let neg = rb.unary(UnaryOp::FloatNeg, v, F32);
             let result = rb.unary(UnaryOp::FloatAbs, neg, F32);
-            FnResult {
+            Ok(FnResult {
                 state,
                 values: vec![result],
-            }
+            })
         });
         assert_eq!(jit_run_f32(&rvsdg, "test"), 42.0);
     }

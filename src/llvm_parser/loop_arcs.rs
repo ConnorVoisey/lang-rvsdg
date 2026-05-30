@@ -8,7 +8,7 @@
 //! - repetition arcs: edges inside the SCC that target an entry block (back-edges)
 //!
 //! `is_natural` is the cheap test for "this loop already has a single header,
-//! single back-edge, and single exit" — restructuring can be skipped.
+//! single back-edge, and single exit" - restructuring can be skipped.
 
 use smallvec::SmallVec;
 
@@ -17,13 +17,30 @@ use crate::llvm_parser::{
     strongly_connected_components::Scc,
 };
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct LoopArcs {
-    pub entry_blocks: SmallVec<[BasicBlockId; 4]>,
-    pub entry_arcs: SmallVec<[(BasicBlockId, BasicBlockId); 4]>,
-    pub exit_blocks: SmallVec<[BasicBlockId; 4]>,
-    pub exit_arcs: SmallVec<[(BasicBlockId, BasicBlockId); 4]>,
-    pub repetition_arcs: SmallVec<[(BasicBlockId, BasicBlockId); 4]>,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoopArcs {
+    /// Canonical do/while shape: one header, one back-edge, one exit. Maps
+    /// directly onto a θ-node with no auxiliary predicates.
+    Natural {
+        /// Single entry vertex, where the loop is entered and re-entered.
+        header: BasicBlockId,
+        /// Source of the single back-edge, the block whose terminator
+        /// jumps back to `header`.
+        latch: BasicBlockId,
+        /// Target of the single exit arc, the block control transfers to
+        /// after leaving the loop.
+        exit: BasicBlockId,
+    },
+    /// Anything that's not natural: multiple entries, multiple back-edges,
+    /// or multiple exits. Phase 4 will materialize γ-dispatch nodes around
+    /// the θ-node using the auxiliary `q` and `r` predicates.
+    Irregular {
+        entry_blocks: SmallVec<[BasicBlockId; 4]>,
+        entry_arcs: SmallVec<[(BasicBlockId, BasicBlockId); 4]>,
+        exit_blocks: SmallVec<[BasicBlockId; 4]>,
+        exit_arcs: SmallVec<[(BasicBlockId, BasicBlockId); 4]>,
+        repetition_arcs: SmallVec<[(BasicBlockId, BasicBlockId); 4]>,
+    },
 }
 
 impl LoopArcs {
@@ -36,8 +53,8 @@ impl LoopArcs {
 
         let mut is_entry = vec![false; block_count];
         let mut is_exit_target = vec![false; block_count];
-        let mut entry_arcs = SmallVec::new();
-        let mut exit_arcs = SmallVec::new();
+        let mut entry_arcs: SmallVec<[(BasicBlockId, BasicBlockId); 4]> = SmallVec::new();
+        let mut exit_arcs: SmallVec<[(BasicBlockId, BasicBlockId); 4]> = SmallVec::new();
 
         for &block in &scc.blocks {
             for &pred in mapper.inputs(block) {
@@ -54,7 +71,7 @@ impl LoopArcs {
             }
         }
 
-        let mut repetition_arcs = SmallVec::new();
+        let mut repetition_arcs: SmallVec<[(BasicBlockId, BasicBlockId); 4]> = SmallVec::new();
         for &block in &scc.blocks {
             for &succ in mapper.outputs(block) {
                 if is_entry[succ.0 as usize] {
@@ -74,20 +91,27 @@ impl LoopArcs {
         entry_blocks.sort();
         exit_blocks.sort();
 
-        Self {
-            entry_blocks,
-            entry_arcs,
-            exit_blocks,
-            exit_arcs,
-            repetition_arcs,
+        // One header, one back-edge, one exit: the canonical do/while shape that
+        // maps directly onto a θ-node.
+        if entry_blocks.len() == 1 && repetition_arcs.len() == 1 && exit_arcs.len() == 1 {
+            Self::Natural {
+                header: entry_blocks[0],
+                // back-edge source: the block whose terminator jumps back
+                // to the header.
+                latch: repetition_arcs[0].0,
+                // exit target: the block control transfers to *outside*
+                // the loop. The arc's source is somewhere inside the loop.
+                exit: exit_arcs[0].1,
+            }
+        } else {
+            Self::Irregular {
+                entry_blocks,
+                entry_arcs,
+                exit_blocks,
+                exit_arcs,
+                repetition_arcs,
+            }
         }
-    }
-
-    /// One header, one back-edge, one exit — the canonical do/while shape that
-    /// maps directly onto a θ-node.
-    #[inline]
-    pub fn is_natural(&self) -> bool {
-        self.entry_blocks.len() == 1 && self.repetition_arcs.len() == 1 && self.exit_arcs.len() == 1
     }
 }
 
@@ -123,17 +147,16 @@ mod tests {
         mapper.add_connection(bbs[1], bbs[3]);
 
         let scc = scc_of(&[bbs[1], bbs[2]]);
-        let mut arcs = LoopArcs::from_scc(&scc, &mapper);
-        arcs.entry_arcs.sort();
-        arcs.exit_arcs.sort();
-        arcs.repetition_arcs.sort();
+        let arcs = LoopArcs::from_scc(&scc, &mapper);
 
-        assert_eq!(vec![bbs[1]], arcs.entry_blocks.to_vec());
-        assert_eq!(vec![(bbs[0], bbs[1])], arcs.entry_arcs.to_vec());
-        assert_eq!(vec![bbs[3]], arcs.exit_blocks.to_vec());
-        assert_eq!(vec![(bbs[1], bbs[3])], arcs.exit_arcs.to_vec());
-        assert_eq!(vec![(bbs[2], bbs[1])], arcs.repetition_arcs.to_vec());
-        assert!(arcs.is_natural());
+        assert_eq!(
+            LoopArcs::Natural {
+                header: bbs[1],
+                latch: bbs[2],
+                exit: bbs[3],
+            },
+            arcs
+        );
     }
 
     #[test]
@@ -147,12 +170,15 @@ mod tests {
         let scc = scc_of(&[bbs[1]]);
         let arcs = LoopArcs::from_scc(&scc, &mapper);
 
-        assert_eq!(vec![bbs[1]], arcs.entry_blocks.to_vec());
-        assert_eq!(vec![(bbs[0], bbs[1])], arcs.entry_arcs.to_vec());
-        assert_eq!(vec![bbs[2]], arcs.exit_blocks.to_vec());
-        assert_eq!(vec![(bbs[1], bbs[2])], arcs.exit_arcs.to_vec());
-        assert_eq!(vec![(bbs[1], bbs[1])], arcs.repetition_arcs.to_vec());
-        assert!(arcs.is_natural());
+        // Header and latch coincide for self-loops.
+        assert_eq!(
+            LoopArcs::Natural {
+                header: bbs[1],
+                latch: bbs[1],
+                exit: bbs[2],
+            },
+            arcs
+        );
     }
 
     #[test]
@@ -166,24 +192,34 @@ mod tests {
         mapper.add_connection(bbs[1], bbs[3]);
 
         let scc = scc_of(&[bbs[1], bbs[2]]);
-        let mut arcs = LoopArcs::from_scc(&scc, &mapper);
-        arcs.entry_arcs.sort();
-        arcs.exit_arcs.sort();
-        arcs.repetition_arcs.sort();
+        let arcs = LoopArcs::from_scc(&scc, &mapper);
 
-        assert_eq!(vec![bbs[1], bbs[2]], arcs.entry_blocks.to_vec());
+        let LoopArcs::Irregular {
+            entry_blocks,
+            mut entry_arcs,
+            exit_blocks,
+            mut exit_arcs,
+            mut repetition_arcs,
+        } = arcs
+        else {
+            panic!("expected Irregular, got {arcs:?}");
+        };
+        entry_arcs.sort();
+        exit_arcs.sort();
+        repetition_arcs.sort();
+
+        assert_eq!(vec![bbs[1], bbs[2]], entry_blocks.to_vec());
         assert_eq!(
             vec![(bbs[0], bbs[1]), (bbs[0], bbs[2])],
-            arcs.entry_arcs.to_vec()
+            entry_arcs.to_vec()
         );
-        assert_eq!(vec![bbs[3]], arcs.exit_blocks.to_vec());
-        assert_eq!(vec![(bbs[1], bbs[3])], arcs.exit_arcs.to_vec());
+        assert_eq!(vec![bbs[3]], exit_blocks.to_vec());
+        assert_eq!(vec![(bbs[1], bbs[3])], exit_arcs.to_vec());
         // Both intra-SCC edges target entry blocks → both are repetition arcs.
         assert_eq!(
             vec![(bbs[1], bbs[2]), (bbs[2], bbs[1])],
-            arcs.repetition_arcs.to_vec()
+            repetition_arcs.to_vec()
         );
-        assert!(!arcs.is_natural());
     }
 
     #[test]
@@ -197,17 +233,25 @@ mod tests {
         mapper.add_connection(bbs[2], bbs[4]);
 
         let scc = scc_of(&[bbs[1], bbs[2]]);
-        let mut arcs = LoopArcs::from_scc(&scc, &mapper);
-        arcs.exit_arcs.sort();
+        let arcs = LoopArcs::from_scc(&scc, &mapper);
 
-        assert_eq!(vec![bbs[1]], arcs.entry_blocks.to_vec());
-        assert_eq!(vec![bbs[3], bbs[4]], arcs.exit_blocks.to_vec());
-        assert_eq!(
-            vec![(bbs[1], bbs[3]), (bbs[2], bbs[4])],
-            arcs.exit_arcs.to_vec()
-        );
-        assert_eq!(vec![(bbs[2], bbs[1])], arcs.repetition_arcs.to_vec());
-        assert!(!arcs.is_natural());
+        let LoopArcs::Irregular {
+            entry_blocks,
+            entry_arcs,
+            exit_blocks,
+            mut exit_arcs,
+            repetition_arcs,
+        } = arcs
+        else {
+            panic!("expected Irregular, got {arcs:?}");
+        };
+        exit_arcs.sort();
+
+        assert_eq!(vec![bbs[1]], entry_blocks.to_vec());
+        assert_eq!(vec![(bbs[0], bbs[1])], entry_arcs.to_vec());
+        assert_eq!(vec![bbs[3], bbs[4]], exit_blocks.to_vec());
+        assert_eq!(vec![(bbs[1], bbs[3]), (bbs[2], bbs[4])], exit_arcs.to_vec());
+        assert_eq!(vec![(bbs[2], bbs[1])], repetition_arcs.to_vec());
     }
 
     #[test]
@@ -222,15 +266,27 @@ mod tests {
         mapper.add_connection(bbs[1], bbs[4]);
 
         let scc = scc_of(&[bbs[1], bbs[2], bbs[3]]);
-        let mut arcs = LoopArcs::from_scc(&scc, &mapper);
-        arcs.repetition_arcs.sort();
+        let arcs = LoopArcs::from_scc(&scc, &mapper);
 
-        assert_eq!(vec![bbs[1]], arcs.entry_blocks.to_vec());
-        assert_eq!(vec![bbs[4]], arcs.exit_blocks.to_vec());
+        let LoopArcs::Irregular {
+            entry_blocks,
+            entry_arcs,
+            exit_blocks,
+            exit_arcs,
+            mut repetition_arcs,
+        } = arcs
+        else {
+            panic!("expected Irregular, got {arcs:?}");
+        };
+        repetition_arcs.sort();
+
+        assert_eq!(vec![bbs[1]], entry_blocks.to_vec());
+        assert_eq!(vec![(bbs[0], bbs[1])], entry_arcs.to_vec());
+        assert_eq!(vec![bbs[4]], exit_blocks.to_vec());
+        assert_eq!(vec![(bbs[1], bbs[4])], exit_arcs.to_vec());
         assert_eq!(
             vec![(bbs[2], bbs[1]), (bbs[3], bbs[1])],
-            arcs.repetition_arcs.to_vec()
+            repetition_arcs.to_vec()
         );
-        assert!(!arcs.is_natural());
     }
 }

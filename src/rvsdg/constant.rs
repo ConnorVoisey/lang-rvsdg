@@ -1,6 +1,6 @@
 use rustc_hash::FxHashMap;
 
-use crate::rvsdg::{GlobalId, types::TypeRef, value::ConstValue};
+use crate::rvsdg::{FuncId, GlobalId, types::TypeRef, value::ConstValue};
 
 /// Handle into the constant pool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -54,8 +54,10 @@ pub enum ConstantKind {
     Aggregate(ConstIdsSpan),
     /// Raw byte string (for string literals like `c"hello\00"`)
     String(Vec<u8>),
-    /// Address of a global variable or function
+    /// Address of a global variable
     GlobalAddr(GlobalId),
+    /// Address of a global function
+    FuncAddr(FuncId),
     /// Undefined value (LLVM's `undef`, distinct from poison)
     Undef,
 }

@@ -185,10 +185,10 @@ mod tests {
             let val = rb.const_i32(42);
             let s1 = rb.store(state, ptr, val, None, false);
             let loaded = rb.load(s1, ptr, I32, None, false);
-            FnResult {
+            Ok(FnResult {
                 state: loaded.state,
                 values: vec![loaded.value],
-            }
+            })
         });
         assert_eq!(jit_run_i32(&rvsdg, "test"), 42);
     }
@@ -214,10 +214,10 @@ mod tests {
             let ninety_nine = rb.const_i32(99);
             let s2 = rb.store(s1, ptr, ninety_nine, None, false);
             let loaded = rb.load(s2, ptr, I32, None, false);
-            FnResult {
+            Ok(FnResult {
                 state: loaded.state,
                 values: vec![loaded.value],
-            }
+            })
         });
         assert_eq!(jit_run_i32(&rvsdg, "test"), 99);
     }
@@ -259,10 +259,10 @@ mod tests {
                 lb.value,
                 I32,
             );
-            FnResult {
+            Ok(FnResult {
                 state: lb.state,
                 values: vec![sum],
-            }
+            })
         });
         assert_eq!(jit_run_i32(&rvsdg, "test"), 42);
     }
@@ -281,10 +281,10 @@ mod tests {
             let val = rb.const_i32(77);
             let s1 = rb.store(alloc.state, alloc.ptr, val, None, false);
             let loaded = rb.load(s1, alloc.ptr, I32, None, false);
-            FnResult {
+            Ok(FnResult {
                 state: loaded.state,
                 values: vec![loaded.value],
-            }
+            })
         });
         assert_eq!(jit_run_i32(&rvsdg, "test"), 77);
     }
@@ -316,18 +316,18 @@ mod tests {
                 let next_i = rb.binary(BinaryOp::Add, ArithFlags::default(), loop_i, one, I32);
                 let five = rb.const_i32(5);
                 let cond = rb.icmp(ICmpPred::SignedLt, next_i, five);
-                LoopResult {
+                Ok(LoopResult {
                     condition: cond,
                     next_state: s2,
                     next_vars: vec![next_i],
-                }
-            });
+                })
+            })?;
 
             let final_val = rb.load(res.state, alloc.ptr, I32, None, false);
-            FnResult {
+            Ok(FnResult {
                 state: final_val.state,
                 values: vec![final_val.value],
-            }
+            })
         });
         assert_eq!(jit_run_i32(&rvsdg, "test"), 50);
     }
@@ -366,10 +366,10 @@ mod tests {
                 lb.value,
                 I32,
             );
-            FnResult {
+            Ok(FnResult {
                 state: lb.state,
                 values: vec![diff],
-            }
+            })
         });
         assert_eq!(jit_run_i32(&rvsdg, "test"), 10);
     }
@@ -404,18 +404,18 @@ mod tests {
                 let next_i = rb.binary(BinaryOp::Add, ArithFlags::default(), loop_i, one, I32);
                 let ten = rb.const_i32(10);
                 let cond = rb.icmp(ICmpPred::SignedLt, next_i, ten);
-                LoopResult {
+                Ok(LoopResult {
                     condition: cond,
                     next_state: s2,
                     next_vars: vec![next_i],
-                }
-            });
+                })
+            })?;
 
             let final_val = rb.load(res.state, ptr, I32, None, false);
-            FnResult {
+            Ok(FnResult {
                 state: final_val.state,
                 values: vec![final_val.value],
-            }
+            })
         });
         assert_eq!(jit_run_i32(&rvsdg, "test"), 30);
     }
@@ -454,10 +454,10 @@ mod tests {
             // GEP [4 x i32]* ptr, 0, 2 => i32*
             let elem_ptr = rb.ptr_offset(ptr, arr_ty, &[zero, idx], i32_ptr_ty, true);
             let loaded = rb.load(state, elem_ptr, I32, None, false);
-            FnResult {
+            Ok(FnResult {
                 state: loaded.state,
                 values: vec![loaded.value],
-            }
+            })
         });
         assert_eq!(jit_run_i32(&rvsdg, "test"), 30);
     }
@@ -508,10 +508,10 @@ mod tests {
                 I32,
             );
             let total = rb.binary(BinaryOp::Add, ArithFlags::default(), sum01, l2.value, I32);
-            FnResult {
+            Ok(FnResult {
                 state: l2.state,
                 values: vec![total],
-            }
+            })
         });
         assert_eq!(jit_run_i32(&rvsdg, "test"), 600);
     }
@@ -566,16 +566,16 @@ mod tests {
                 let next_i = rb.binary(BinaryOp::Add, ArithFlags::default(), loop_i, one, I32);
                 let five = rb.const_i32(5);
                 let cond = rb.icmp(ICmpPred::SignedLt, next_i, five);
-                LoopResult {
+                Ok(LoopResult {
                     condition: cond,
                     next_state: loaded.state,
                     next_vars: vec![next_i, next_sum],
-                }
-            });
-            FnResult {
+                })
+            })?;
+            Ok(FnResult {
                 state: res.state,
                 values: vec![res.result(1)],
-            }
+            })
         });
         assert_eq!(jit_run_i32(&rvsdg, "test"), 15);
     }
@@ -608,10 +608,10 @@ mod tests {
             let e2 = rb.extract_field(modified, &[2], I32);
             let sum01 = rb.binary(BinaryOp::Add, ArithFlags::default(), e0, e1, I32);
             let total = rb.binary(BinaryOp::Add, ArithFlags::default(), sum01, e2, I32);
-            FnResult {
+            Ok(FnResult {
                 state,
                 values: vec![total],
-            }
+            })
         });
         assert_eq!(jit_run_i32(&rvsdg, "test"), 103);
     }
@@ -632,10 +632,10 @@ mod tests {
             let a = rb.extract_field(modified, &[0], I32);
             let b = rb.extract_field(modified, &[1], I32);
             let sum = rb.binary(BinaryOp::Add, ArithFlags::default(), a, b, I32);
-            FnResult {
+            Ok(FnResult {
                 state,
                 values: vec![sum],
-            }
+            })
         });
         assert_eq!(jit_run_i32(&rvsdg, "test"), 70);
     }
@@ -657,10 +657,10 @@ mod tests {
             let a = rb.extract_field(modified, &[0], I32);
             let b = rb.extract_field(modified, &[1], I32);
             let sum = rb.binary(BinaryOp::Add, ArithFlags::default(), a, b, I32);
-            FnResult {
+            Ok(FnResult {
                 state,
                 values: vec![sum],
-            }
+            })
         });
         assert_eq!(jit_run_i32(&rvsdg, "test"), 300);
     }
@@ -683,10 +683,10 @@ mod tests {
             let a = rb.extract_field(s2, &[0], I32);
             let b = rb.extract_field(s2, &[1], I32);
             let sum = rb.binary(BinaryOp::Add, ArithFlags::default(), a, b, I32);
-            FnResult {
+            Ok(FnResult {
                 state,
                 values: vec![sum],
-            }
+            })
         });
         assert_eq!(jit_run_i32(&rvsdg, "test"), 30);
     }
@@ -719,10 +719,10 @@ mod tests {
                 I32,
             );
             // old_value should be 10 (what was there before)
-            FnResult {
+            Ok(FnResult {
                 state: cas.state,
                 values: vec![cas.old_value],
-            }
+            })
         });
         assert_eq!(jit_run_i32(&rvsdg, "test"), 10);
     }
@@ -753,10 +753,10 @@ mod tests {
             );
             // load should now return 42
             let loaded = rb.load(cas.state, alloc.ptr, I32, None, false);
-            FnResult {
+            Ok(FnResult {
                 state: loaded.state,
                 values: vec![loaded.value],
-            }
+            })
         });
         assert_eq!(jit_run_i32(&rvsdg, "test"), 42);
     }
@@ -788,10 +788,10 @@ mod tests {
             );
             // CAS failed, value unchanged, load should return 10
             let loaded = rb.load(cas.state, alloc.ptr, I32, None, false);
-            FnResult {
+            Ok(FnResult {
                 state: loaded.state,
                 values: vec![loaded.value],
-            }
+            })
         });
         assert_eq!(jit_run_i32(&rvsdg, "test"), 10);
     }
@@ -821,10 +821,10 @@ mod tests {
                 I32,
             );
             let flag = rb.cast(CastOp::ZeroExtend, cas.success, I32);
-            FnResult {
+            Ok(FnResult {
                 state: cas.state,
                 values: vec![flag],
-            }
+            })
         });
         assert_eq!(jit_run_i32(&rvsdg, "test"), 1);
     }
@@ -854,10 +854,10 @@ mod tests {
                 I32,
             );
             let flag = rb.cast(CastOp::ZeroExtend, cas.success, I32);
-            FnResult {
+            Ok(FnResult {
                 state: cas.state,
                 values: vec![flag],
-            }
+            })
         });
         assert_eq!(jit_run_i32(&rvsdg, "test"), 0);
     }

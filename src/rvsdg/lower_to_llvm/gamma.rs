@@ -147,19 +147,23 @@ mod tests {
                 cond,
                 state,
                 &[],
-                |rb| BranchResult {
-                    state,
-                    values: vec![rb.const_i32(42)],
+                |rb| {
+                    Ok(BranchResult {
+                        state,
+                        values: vec![rb.const_i32(42)],
+                    })
                 },
-                |rb| BranchResult {
-                    state,
-                    values: vec![rb.const_i32(99)],
+                |rb| {
+                    Ok(BranchResult {
+                        state,
+                        values: vec![rb.const_i32(99)],
+                    })
                 },
-            );
-            FnResult {
+            )?;
+            Ok(FnResult {
                 state: res.state,
                 values: vec![res.result(0)],
-            }
+            })
         });
 
         assert_eq!(jit_run_i32(&rvsdg, "test"), 42);
@@ -176,19 +180,23 @@ mod tests {
                 cond,
                 state,
                 &[],
-                |rb| BranchResult {
-                    state,
-                    values: vec![rb.const_i32(42)],
+                |rb| {
+                    Ok(BranchResult {
+                        state,
+                        values: vec![rb.const_i32(42)],
+                    })
                 },
-                |rb| BranchResult {
-                    state,
-                    values: vec![rb.const_i32(99)],
+                |rb| {
+                    Ok(BranchResult {
+                        state,
+                        values: vec![rb.const_i32(99)],
+                    })
                 },
-            );
-            FnResult {
+            )?;
+            Ok(FnResult {
                 state: res.state,
                 values: vec![res.result(0)],
-            }
+            })
         });
 
         assert_eq!(jit_run_i32(&rvsdg, "test"), 99);
@@ -209,20 +217,22 @@ mod tests {
                     let a = rb.const_i32(10);
                     let b = rb.const_i32(20);
                     let sum = rb.binary(BinaryOp::Add, ArithFlags::default(), a, b, I32);
-                    BranchResult {
+                    Ok(BranchResult {
                         state,
                         values: vec![sum],
-                    }
+                    })
                 },
-                |rb| BranchResult {
-                    state,
-                    values: vec![rb.const_i32(0)],
+                |rb| {
+                    Ok(BranchResult {
+                        state,
+                        values: vec![rb.const_i32(0)],
+                    })
                 },
-            );
-            FnResult {
+            )?;
+            Ok(FnResult {
                 state: res.state,
                 values: vec![res.result(0)],
-            }
+            })
         });
 
         assert_eq!(jit_run_i32(&rvsdg, "test"), 30);
@@ -241,19 +251,23 @@ mod tests {
                 cond,
                 state,
                 &[],
-                |rb| BranchResult {
-                    state,
-                    values: vec![rb.const_i32(1)],
+                |rb| {
+                    Ok(BranchResult {
+                        state,
+                        values: vec![rb.const_i32(1)],
+                    })
                 },
-                |rb| BranchResult {
-                    state,
-                    values: vec![rb.const_i32(0)],
+                |rb| {
+                    Ok(BranchResult {
+                        state,
+                        values: vec![rb.const_i32(0)],
+                    })
                 },
-            );
-            FnResult {
+            )?;
+            Ok(FnResult {
                 state: res.state,
                 values: vec![res.result(0)],
-            }
+            })
         });
 
         assert_eq!(jit_run_i32(&rvsdg, "test"), 1);
@@ -271,24 +285,30 @@ mod tests {
                 state,
                 &[],
                 &[
-                    &|rb| BranchResult {
-                        state,
-                        values: vec![rb.const_i32(10)],
+                    &|rb| {
+                        Ok(BranchResult {
+                            state,
+                            values: vec![rb.const_i32(10)],
+                        })
                     },
-                    &|rb| BranchResult {
-                        state,
-                        values: vec![rb.const_i32(20)],
+                    &|rb| {
+                        Ok(BranchResult {
+                            state,
+                            values: vec![rb.const_i32(20)],
+                        })
                     },
-                    &|rb| BranchResult {
-                        state,
-                        values: vec![rb.const_i32(30)],
+                    &|rb| {
+                        Ok(BranchResult {
+                            state,
+                            values: vec![rb.const_i32(30)],
+                        })
                     },
                 ],
-            );
-            FnResult {
+            )?;
+            Ok(FnResult {
                 state: res.state,
                 values: vec![res.result(0)],
-            }
+            })
         });
 
         assert_eq!(jit_run_i32(&rvsdg, "test"), 10);
@@ -306,24 +326,30 @@ mod tests {
                 state,
                 &[],
                 &[
-                    &|rb| BranchResult {
-                        state,
-                        values: vec![rb.const_i32(10)],
+                    &|rb| {
+                        Ok(BranchResult {
+                            state,
+                            values: vec![rb.const_i32(10)],
+                        })
                     },
-                    &|rb| BranchResult {
-                        state,
-                        values: vec![rb.const_i32(20)],
+                    &|rb| {
+                        Ok(BranchResult {
+                            state,
+                            values: vec![rb.const_i32(20)],
+                        })
                     },
-                    &|rb| BranchResult {
-                        state,
-                        values: vec![rb.const_i32(30)],
+                    &|rb| {
+                        Ok(BranchResult {
+                            state,
+                            values: vec![rb.const_i32(30)],
+                        })
                     },
                 ],
-            );
-            FnResult {
+            )?;
+            Ok(FnResult {
                 state: res.state,
                 values: vec![res.result(0)],
-            }
+            })
         });
 
         assert_eq!(jit_run_i32(&rvsdg, "test"), 20);
@@ -341,24 +367,30 @@ mod tests {
                 state,
                 &[],
                 &[
-                    &|rb| BranchResult {
-                        state,
-                        values: vec![rb.const_i32(10)],
+                    &|rb| {
+                        Ok(BranchResult {
+                            state,
+                            values: vec![rb.const_i32(10)],
+                        })
                     },
-                    &|rb| BranchResult {
-                        state,
-                        values: vec![rb.const_i32(20)],
+                    &|rb| {
+                        Ok(BranchResult {
+                            state,
+                            values: vec![rb.const_i32(20)],
+                        })
                     },
-                    &|rb| BranchResult {
-                        state,
-                        values: vec![rb.const_i32(30)],
+                    &|rb| {
+                        Ok(BranchResult {
+                            state,
+                            values: vec![rb.const_i32(30)],
+                        })
                     },
                 ],
-            );
-            FnResult {
+            )?;
+            Ok(FnResult {
                 state: res.state,
                 values: vec![res.result(0)],
-            }
+            })
         });
 
         assert_eq!(jit_run_i32(&rvsdg, "test"), 30);
@@ -376,33 +408,39 @@ mod tests {
                 state,
                 &[],
                 &[
-                    &|rb| BranchResult {
-                        state,
-                        values: vec![rb.const_i32(100)],
+                    &|rb| {
+                        Ok(BranchResult {
+                            state,
+                            values: vec![rb.const_i32(100)],
+                        })
                     },
                     &|rb| {
                         let a = rb.const_i32(3);
                         let b = rb.const_i32(7);
                         let product = rb.binary(BinaryOp::Mul, ArithFlags::default(), a, b, I32);
-                        BranchResult {
+                        Ok(BranchResult {
                             state,
                             values: vec![product],
-                        }
+                        })
                     },
-                    &|rb| BranchResult {
-                        state,
-                        values: vec![rb.const_i32(0)],
+                    &|rb| {
+                        Ok(BranchResult {
+                            state,
+                            values: vec![rb.const_i32(0)],
+                        })
                     },
-                    &|rb| BranchResult {
-                        state,
-                        values: vec![rb.const_i32(-1)],
+                    &|rb| {
+                        Ok(BranchResult {
+                            state,
+                            values: vec![rb.const_i32(-1)],
+                        })
                     },
                 ],
-            );
-            FnResult {
+            )?;
+            Ok(FnResult {
                 state: res.state,
                 values: vec![res.result(0)],
-            }
+            })
         });
 
         assert_eq!(jit_run_i32(&rvsdg, "test"), 21);
@@ -425,25 +463,25 @@ mod tests {
                     let x = rb.param(0);
                     let y = rb.param(1);
                     let sum = rb.binary(BinaryOp::Add, ArithFlags::default(), x, y, I32);
-                    BranchResult {
+                    Ok(BranchResult {
                         state,
                         values: vec![sum],
-                    }
+                    })
                 },
                 |rb| {
                     let x = rb.param(0);
                     let y = rb.param(1);
                     let diff = rb.binary(BinaryOp::Sub, ArithFlags::default(), x, y, I32);
-                    BranchResult {
+                    Ok(BranchResult {
                         state,
                         values: vec![diff],
-                    }
+                    })
                 },
-            );
-            FnResult {
+            )?;
+            Ok(FnResult {
                 state: res.state,
                 values: vec![res.result(0)],
-            }
+            })
         });
 
         assert_eq!(jit_run_i32(&rvsdg, "test"), 30);
@@ -468,35 +506,35 @@ mod tests {
                         let x = rb.param(0);
                         let y = rb.param(1);
                         let sum = rb.binary(BinaryOp::Add, ArithFlags::default(), x, y, I32);
-                        BranchResult {
+                        Ok(BranchResult {
                             state,
                             values: vec![sum],
-                        }
+                        })
                     },
                     &|rb| {
                         let x = rb.param(0);
                         let y = rb.param(1);
                         let diff = rb.binary(BinaryOp::Sub, ArithFlags::default(), x, y, I32);
-                        BranchResult {
+                        Ok(BranchResult {
                             state,
                             values: vec![diff],
-                        }
+                        })
                     },
                     &|rb| {
                         let x = rb.param(0);
                         let y = rb.param(1);
                         let product = rb.binary(BinaryOp::Mul, ArithFlags::default(), x, y, I32);
-                        BranchResult {
+                        Ok(BranchResult {
                             state,
                             values: vec![product],
-                        }
+                        })
                     },
                 ],
-            );
-            FnResult {
+            )?;
+            Ok(FnResult {
                 state: res.state,
                 values: vec![res.result(0)],
-            }
+            })
         });
 
         assert_eq!(jit_run_i32(&rvsdg, "test"), 200);
@@ -514,22 +552,26 @@ mod tests {
                 cond,
                 state,
                 &[],
-                |rb| BranchResult {
-                    state,
-                    values: vec![rb.const_i32(10), rb.const_i32(20)],
+                |rb| {
+                    Ok(BranchResult {
+                        state,
+                        values: vec![rb.const_i32(10), rb.const_i32(20)],
+                    })
                 },
-                |rb| BranchResult {
-                    state,
-                    values: vec![rb.const_i32(1), rb.const_i32(2)],
+                |rb| {
+                    Ok(BranchResult {
+                        state,
+                        values: vec![rb.const_i32(1), rb.const_i32(2)],
+                    })
                 },
-            );
+            )?;
             let a = res.result(0);
             let b = res.result(1);
             let product = rb.binary(BinaryOp::Mul, ArithFlags::default(), a, b, I32);
-            FnResult {
+            Ok(FnResult {
                 state: res.state,
                 values: vec![product],
-            }
+            })
         });
 
         assert_eq!(jit_run_i32(&rvsdg, "test"), 200);

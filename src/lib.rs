@@ -2,7 +2,8 @@
 // TODO: enable once the API surface is more stable
 // #![warn(missing_docs)]
 use llvm_ir::Module;
-use std::path::Path;
+use std::fs::read_to_string;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use tempfile::NamedTempFile;
 
@@ -12,9 +13,10 @@ pub mod llvm_parser;
 pub mod rvsdg;
 
 fn c_file_to_mod(c_file_path: &Path) -> color_eyre::Result<Module> {
-    let bc_output = NamedTempFile::with_suffix(".bc")?;
+    // let ll_output = NamedTempFile::with_suffix(".ll")?;
+    let ll_output: PathBuf = "c_mod_llvm.ll".into();
 
-    let clang_cmd = Command::new("clang-17")
+    let clang_cmd = Command::new("clang-19")
         .args([
             "-O1",
             "-Xclang",
@@ -28,12 +30,21 @@ fn c_file_to_mod(c_file_path: &Path) -> color_eyre::Result<Module> {
         .stdout(Stdio::piped())
         .spawn()?;
 
-    Command::new("opt-17")
-        .args(["-passes=mem2reg", "-o", bc_output.path().to_str().unwrap()])
+    Command::new("opt-19")
+        .args([
+            "-passes=sroa,mem2reg,loop-simplify,lcssa",
+            "-S",
+            "-o",
+            ll_output.to_str().unwrap(),
+        ])
         .stdin(clang_cmd.stdout.unwrap())
         .stdout(Stdio::piped())
         .status()?;
-    let module = match Module::from_bc_path(bc_output.path()) {
+
+    let llvm_ir_full_text = read_to_string(&ll_output).unwrap();
+    println!("Parsed LLVM IR (text): {}", llvm_ir_full_text);
+
+    let module = match Module::from_ir_path(&ll_output) {
         Ok(v) => v,
         Err(e) => panic!("{}", e),
     };

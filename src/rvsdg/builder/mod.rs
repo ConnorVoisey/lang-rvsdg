@@ -267,10 +267,10 @@ mod test {
             let a = rb.const_i32(5);
             let b = rb.const_i32(3);
             let c = rb.binary(BinaryOp::Add, ArithFlags::default(), a, b, I32);
-            FnResult {
+            Ok(FnResult {
                 state,
                 values: vec![c],
-            }
+            })
         });
     }
 
@@ -291,10 +291,10 @@ mod test {
             let x = rb.param(0);
             let y = rb.param(1);
             let result = rb.icmp(ICmpPred::SignedLt, x, y);
-            FnResult {
+            Ok(FnResult {
                 state,
                 values: vec![result],
-            }
+            })
         });
     }
 
@@ -323,10 +323,10 @@ mod test {
             let x = rb.param(0);
             let y = rb.param(1);
             let result = rb.icmp(ICmpPred::SignedLt, x, y);
-            FnResult {
+            Ok(FnResult {
                 state,
                 values: vec![result],
-            }
+            })
         });
 
         let main_fn = rvsdg_mod.declare_fn(String::from("main"), &[], &[I32], Linkage::Internal);
@@ -335,10 +335,10 @@ mod test {
             let b = rb.const_i32(3);
             let call_res = rb.call(check_fn, entry_state, &[a, b]);
             let c = call_res.result(0);
-            FnResult {
+            Ok(FnResult {
                 state: call_res.state,
                 values: vec![c],
-            }
+            })
         });
     }
 }
