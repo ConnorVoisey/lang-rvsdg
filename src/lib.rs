@@ -1,11 +1,13 @@
 #![warn(missing_debug_implementations)]
 // TODO: enable once the API surface is more stable
 // #![warn(missing_docs)]
+use clap::{ArgGroup, Parser};
+use inkwell::OptimizationLevel;
+use inkwell::context::Context;
 use llvm_ir::Module;
 use std::fs::read_to_string;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use tempfile::NamedTempFile;
 
 use crate::rvsdg::RVSDGMod;
 
@@ -51,10 +53,59 @@ fn c_file_to_mod(c_file_path: &Path) -> color_eyre::Result<Module> {
 
     Ok(module)
 }
-pub fn compile_c_file(c_file_path: &Path) -> color_eyre::Result<()> {
+
+#[derive(Parser, Debug)]
+#[command(name = "RVSDG_CC")]
+#[command(version = "0.0")]
+#[command(
+    about = "Basic c compiler",
+    long_about = "Basic c compiler with very little implementation, enough to run some benchmarks to stress the backend"
+)]
+#[command(group(ArgGroup::new("mode").required(false).args(["output", "run"])))]
+pub struct Cli {
+    #[arg(short, long)]
+    output: Option<String>,
+
+    #[arg(long, short, default_value_t = false)]
+    run: bool,
+
+    #[arg(long, default_value_t = false)]
+    optimise: bool,
+
+    input: String,
+}
+
+pub fn run_cli() -> color_eyre::Result<Option<u8>> {
+    let cli = Cli::parse();
+
+    let c_file_path = Path::new(&cli.input);
     let module = c_file_to_mod(c_file_path)?;
 
     let rvsdg = RVSDGMod::from_llvm_mod(module)?;
-    rvsdg.output_with_llvm().unwrap();
-    Ok(())
+    if cli.optimise {
+        todo!("run optimisations")
+    }
+
+    if cli.run {
+        let context = Context::create();
+        let module = rvsdg.lower_to_llvm_module(&context)?;
+        let engine = module
+            .create_jit_execution_engine(OptimizationLevel::None)
+            .expect("failed to create JIT engine");
+
+        let func = unsafe {
+            engine
+                .get_function::<unsafe extern "C" fn() -> u8>("main")
+                .expect("failed to find main function")
+        };
+        let res = unsafe { func.call() };
+        Ok(Some(res))
+    } else {
+        let output = match cli.output {
+            Some(v) => &v.to_string(),
+            None => &rvsdg.mod_name,
+        };
+        rvsdg.output_with_llvm(output).unwrap();
+        Ok(None)
+    }
 }

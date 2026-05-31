@@ -1,11 +1,11 @@
-use std::path::Path;
+use std::process::ExitCode;
 
-use lang_rvsdg::compile_c_file;
+use lang_rvsdg::run_cli;
 
-fn main() -> color_eyre::Result<()> {
+fn main() -> color_eyre::Result<ExitCode> {
     color_eyre::install()?;
-
-    let c_file_path = Path::new("examples/c/basic.c");
-    compile_c_file(c_file_path)?;
-    Ok(())
+    Ok(ExitCode::from(match run_cli()? {
+        Some(v) => v,
+        None => 0,
+    }))
 }

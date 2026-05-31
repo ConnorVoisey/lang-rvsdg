@@ -89,23 +89,13 @@ impl RVSDGMod {
         Ok(module)
     }
 
-    pub fn output_with_llvm(&self) -> Result<(), Box<dyn Error>> {
+    pub fn output_with_llvm(&self, output: &str) -> Result<(), Box<dyn Error>> {
         // initialise things
         Target::initialize_native(&InitializationConfig::default())
             .expect("Failed to initialize native target");
 
         let context = Context::create();
-        let module = context.create_module(&self.mod_name);
-        let builder = context.create_builder();
-
-        // actually convert the RVSDG module into LLVM
-        let llvm_builder = LLVMBuilderCtx {
-            context: &context,
-            module: &module,
-            builder: &builder,
-        };
-        let mut value_mapper = ValueMapper::new(self);
-        self.lower_mod(&llvm_builder, &mut value_mapper)?;
+        let module = self.lower_to_llvm_module(&context)?;
 
         // more output things
         let llvm_triple = TargetTriple::create(&self.target.to_string());
@@ -122,7 +112,7 @@ impl RVSDGMod {
             )
             .expect("Failed to create target machine");
 
-        let obj_file = format!("{}.o", self.mod_name);
+        let obj_file = format!("{}.o", output);
         let obj_path = Path::new(&obj_file);
         machine
             .write_to_file(&module, FileType::Object, obj_path)
@@ -131,15 +121,14 @@ impl RVSDGMod {
         println!("Wrote object file: {}", obj_path.display());
 
         // link, this will need to be conditional depending on the mode
-        let exe_path = &self.mod_name;
         let status = Command::new("cc")
-            .args([obj_path.to_str().unwrap(), "-o", exe_path])
+            .args([obj_path.to_str().unwrap(), "-o", output])
             .status()
             .expect("Failed to invoke linker (cc)");
 
         if status.success() {
-            println!("Linked executable: ./{exe_path}");
-            println!("\nRun it with:  ./{exe_path}");
+            println!("Linked executable: ./{output}");
+            println!("\nRun it with:  ./{output}");
         } else {
             eprintln!("Linking failed with status: {status}");
         }
