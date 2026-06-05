@@ -164,7 +164,11 @@ fn intersect(
     finger_1
 }
 
-// TODO: needs tests and review
+/// Returns true if block `d` dominates block `b`. Walks the dominator-tree
+/// chain from `b` upward via `immediate_dominators`; returns true on hitting
+/// `d`, false on hitting the entry (self-idom) without finding `d`.
+///
+/// Every block dominates itself.
 #[inline(always)]
 pub fn dominates(
     d: BasicBlockId,
@@ -176,7 +180,7 @@ pub fn dominates(
         if current == d {
             return true;
         }
-        match immediate_dominators[b.0 as usize] {
+        match immediate_dominators[current.0 as usize] {
             Some(parent) if parent == current => return false,
             Some(parent) => current = parent,
             None => return false,
@@ -187,33 +191,8 @@ pub fn dominates(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llvm_parser::block_mapper::BasicBlockMapper;
-    use llvm_ir::Name;
+    use crate::llvm_parser::test_utils::{idoms_of, init, post_idoms_of};
     use pretty_assertions::assert_eq;
-
-    fn init(n: usize) -> (BasicBlockMapper, Vec<BasicBlockId>) {
-        let mut mapper = BasicBlockMapper::new(n);
-        let bbs = (0..n)
-            .map(|i| mapper.intern(&Name::Number(i)))
-            .collect::<Vec<_>>();
-        (mapper, bbs)
-    }
-
-    fn idoms_of(mapper: &BasicBlockMapper) -> Vec<Option<BasicBlockId>> {
-        let view = ForwardView {
-            nodes: &mapper.blocks,
-            entry: BasicBlockId(0),
-        };
-        compute_dominance(&view)
-    }
-
-    fn post_idoms_of(mapper: &BasicBlockMapper, exit: BasicBlockId) -> Vec<Option<BasicBlockId>> {
-        let view = ReverseView {
-            nodes: &mapper.blocks,
-            exit,
-        };
-        compute_dominance(&view)
-    }
 
     // ------------------------------------------------------------------------
     // Trivial cases
@@ -799,6 +778,92 @@ mod tests {
         // Backward: everything post-dominated by exit.
         for &b in &bbs {
             assert_eq!(Some(bbs[3]), pdoms[b.0 as usize]);
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // dominates() function — regression coverage for the multi-hop bug
+    // (was indexing `b.0` instead of `current.0` and never moved up the chain).
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn dominates_self() {
+        // Trivial: any block dominates itself.
+        let (mut mapper, bbs) = init(2);
+        mapper.add_connection(bbs[0], bbs[1]);
+        let idoms = idoms_of(&mapper);
+        assert!(dominates(bbs[0], bbs[0], &idoms));
+        assert!(dominates(bbs[1], bbs[1], &idoms));
+    }
+
+    #[test]
+    fn dominates_immediate() {
+        // 0 -> 1. idom(1) = 0. 0 dominates 1, 1 does NOT dominate 0.
+        let (mut mapper, bbs) = init(2);
+        mapper.add_connection(bbs[0], bbs[1]);
+        let idoms = idoms_of(&mapper);
+        assert!(dominates(bbs[0], bbs[1], &idoms));
+        assert!(!dominates(bbs[1], bbs[0], &idoms));
+    }
+
+    #[test]
+    fn dominates_chain() {
+        // 0 -> 1 -> 2 -> 3. Pre-fix this was the failing case: dominates(0, 2)
+        // and dominates(0, 3) would walk one step (to idom(2)=1, idom(3)=2),
+        // then re-read idom(b) instead of idom(current), get the same answer,
+        // see parent==current, and return false.
+        let (mut mapper, bbs) = init(4);
+        mapper.add_connection(bbs[0], bbs[1]);
+        mapper.add_connection(bbs[1], bbs[2]);
+        mapper.add_connection(bbs[2], bbs[3]);
+        let idoms = idoms_of(&mapper);
+        // Every block dominates itself.
+        for &b in &bbs {
+            assert!(dominates(b, b, &idoms));
+        }
+        // Each block dominates everything below it in the chain.
+        for i in 0..bbs.len() {
+            for j in i..bbs.len() {
+                assert!(dominates(bbs[i], bbs[j], &idoms),
+                    "block {} should dominate block {}", i, j);
+            }
+        }
+        // Blocks lower in the chain do NOT dominate higher ones.
+        for i in 0..bbs.len() {
+            for j in 0..i {
+                assert!(!dominates(bbs[i], bbs[j], &idoms),
+                    "block {} should NOT dominate block {}", i, j);
+            }
+        }
+    }
+
+    #[test]
+    fn dominates_sibling_not_in_chain() {
+        // 0 -> 1, 0 -> 2, 1 -> 3, 2 -> 3. Diamond.
+        // 1 and 2 are siblings in the dominator tree (both directly under 0);
+        // neither dominates the other.
+        let (mut mapper, bbs) = init(4);
+        mapper.add_connection(bbs[0], bbs[1]);
+        mapper.add_connection(bbs[0], bbs[2]);
+        mapper.add_connection(bbs[1], bbs[3]);
+        mapper.add_connection(bbs[2], bbs[3]);
+        let idoms = idoms_of(&mapper);
+        assert!(!dominates(bbs[1], bbs[2], &idoms));
+        assert!(!dominates(bbs[2], bbs[1], &idoms));
+    }
+
+    #[test]
+    fn dominates_entry_dominates_all() {
+        // Entry block dominates every reachable block in any CFG.
+        let (mut mapper, bbs) = init(5);
+        mapper.add_connection(bbs[0], bbs[1]);
+        mapper.add_connection(bbs[1], bbs[2]);
+        mapper.add_connection(bbs[2], bbs[3]);
+        mapper.add_connection(bbs[1], bbs[4]);
+        let idoms = idoms_of(&mapper);
+        for &b in &bbs {
+            assert!(dominates(bbs[0], b, &idoms),
+                "entry should dominate block {}", b.0);
         }
     }
 }

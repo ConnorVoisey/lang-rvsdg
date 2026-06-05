@@ -32,6 +32,55 @@ fn c_file_to_mod(c_file_path: &Path) -> color_eyre::Result<Module> {
         .stdout(Stdio::piped())
         .spawn()?;
 
+    // The LLVM opt pass list below contains ONLY structural normalisations
+    // that adapt the C source language into a shape this compiler currently
+    // ingests. We must not list optimisation passes here (no instcombine,
+    // gvn, simplifycfg, etc.): when we later benchmark our own
+    // optimisations against LLVM's, the comparison is only meaningful if
+    // LLVM has not already done its optimisation work on the input. Every
+    // entry below is either a conversion from a C-specific construct into
+    // SSA, or a structural normalisation that stands in for a control flow
+    // restructuring step we have not yet implemented in our own code.
+    //
+    // The pass list is being shrunk to `sroa,mem2reg` once construction
+    // implements Bahmann, Reissmann, Jahre, Meyer (2015) "Perfect
+    // Reconstructability of Control Flow from Demand Dependence Graphs"
+    // sections 4.1 and 4.2 directly. See construction_plan.md for the
+    // phased plan. Per-pass meaning today:
+    //
+    //   sroa            : split allocated aggregates into scalars so that
+    //                     mem2reg can promote them. C-source conversion;
+    //                     stays even after the final pipeline is reached.
+    //   mem2reg         : promote alloca plus load and store sequences into
+    //                     phi nodes and SSA values. C-source conversion;
+    //                     stays after the final pipeline is reached.
+    //   loop-simplify   : force every loop into a canonical shape with a
+    //                     single preheader, a single back-edge source
+    //                     (single latch), and dedicated exit blocks. Stands
+    //                     in for our currently absent paper section 4.1
+    //                     handling of multi-preheader and multi-latch loops
+    //                     via the auxiliary q and r predicates. Dropped in
+    //                     Phase 6 once those predicates are implemented.
+    //   loop-rotate     : transform every test-first while loop into a
+    //                     do-while loop with an outer guard. Stands in for
+    //                     our currently absent gating gamma inside theta
+    //                     body that the paper section 4.1 produces for
+    //                     test-first single-entry loops. Dropped in Phase 1.
+    //   lcssa           : insert trivial phi nodes at every loop exit for
+    //                     every value defined inside the loop and used
+    //                     outside it. Stands in for our currently absent
+    //                     demand analysis that the paper's symbolic
+    //                     translation performs implicitly. Dropped in
+    //                     Phase 5.
+    //
+    // Two passes are NOT in the list but are widely available and would
+    // also be structural normalisations rather than optimisations if added:
+    // `unify-loop-exits` (collapses multi-exit loops into single-exit)
+    // and `fix-irreducible` (rewrites irreducible cycles into reducible
+    // ones via dispatch on an entry predicate). They are deliberately
+    // omitted because the paper section 4.1 handling of multi-exit loops
+    // via r and irreducible loops via q is what we are implementing
+    // directly, in Phases 2 and 3 respectively.
     Command::new("opt-19")
         .args([
             "-passes=sroa,mem2reg,loop-simplify,lcssa",

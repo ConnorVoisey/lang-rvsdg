@@ -97,6 +97,9 @@ cargo cargo r --example cat
 
 # depending on how you've installed llvm19 you may need to provide the path
 LLVM_SYS_191_PREFIX=$(llvm-config-19 --prefix) cargo r --example cat
+
+# this is the same for tests
+LLVM_SYS_191_PREFIX=$(llvm-config-19 --prefix) cargo t
 ```
 
 ## References

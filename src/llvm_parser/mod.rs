@@ -3,7 +3,7 @@ use crate::{
         block_mapper::{BasicBlockId, BasicBlockMapper},
         dominance::{ForwardView, ReverseView, compute_dominance},
         instructions::RegionLowerer,
-        strongly_connected_components::SccAnalysis,
+        scc_tree::{SccTree, SccTreeNodeId},
     },
     rvsdg::{
         GlobalInit, InlineHint, Linkage, RVSDGMod, Visibility,
@@ -29,17 +29,36 @@ pub mod dominance;
 pub mod instructions;
 pub mod loop_arcs;
 pub mod region;
+pub mod scc_tree;
 pub mod strongly_connected_components;
+#[cfg(test)]
+pub mod test_utils;
 pub mod vector_instructions;
 
 struct FnCtx<'m> {
     pub llvm_mod: &'m Module,
     pub func: &'m llvm_ir::Function,
     pub bb_mapper: &'m BasicBlockMapper,
-    pub scc_analysis: &'m SccAnalysis,
-    pub immediate_dominators: &'m [Option<BasicBlockId>], // forward dominators
-    pub post_immediate_dominators: &'m [Option<BasicBlockId>], // post-dominators
-    pub exit_block_id: BasicBlockId,                      // synthetic function exit
+    /// Tree of every non-trivial strongly connected component in the
+    /// function, with parent / child nesting and per-component entry,
+    /// exit, and repetition arc analysis attached. Replaces the
+    /// natural-loop forest as the source of truth for loop detection.
+    pub scc_tree: &'m SccTree,
+    /// Per-block lookup: for each block id, the strongly connected
+    /// component whose entry vertex this block is (if any). Region
+    /// lowering uses this to dispatch into a theta node when it reaches
+    /// the start of a loop.
+    pub scc_entry_block_to_id: &'m [Option<SccTreeNodeId>],
+    /// Forward immediate dominators, indexed by block id. Used by
+    /// branch-arm collection during gamma construction.
+    pub immediate_dominators: &'m [Option<BasicBlockId>],
+    /// Reverse immediate dominators (post-dominators), indexed by block
+    /// id. Used by region lowering to find the join point of every
+    /// conditional branch.
+    pub post_immediate_dominators: &'m [Option<BasicBlockId>],
+    /// Synthetic function-exit block id appended after the source
+    /// blocks during construction.
+    pub exit_block_id: BasicBlockId,
 }
 
 impl RVSDGMod {
@@ -173,10 +192,8 @@ impl RVSDGMod {
                 t => todo!("handle terminator case: {t:?}"),
             }
         }
-        let scc_analysis = bb_mapper.get_strongly_connected_components();
-        dbg!(&bb_mapper, &scc_analysis);
-
-        // Compute dominators / post-dominators once per function. Borrowed by FnCtx.
+        // Compute dominators and post-dominators once per function;
+        // both are borrowed by FnCtx during lowering.
         let forward_view = ForwardView {
             nodes: &bb_mapper.blocks,
             entry: BasicBlockId(0),
@@ -188,11 +205,19 @@ impl RVSDGMod {
         };
         let post_immediate_dominators = compute_dominance(&reverse_view);
 
+        // Build the strongly connected component tree. This performs the
+        // whole-function Tarjan pass plus one sub-Tarjan per non-trivial
+        // component to recover nested-loop structure. See
+        // scc_tree.rs for the algorithm.
+        let scc_tree = SccTree::build(&bb_mapper);
+        let scc_entry_block_to_id = scc_tree.entry_block_to_node(bb_mapper.blocks.len());
+
         let fn_ctx = FnCtx {
             llvm_mod: module,
             func,
             bb_mapper: &bb_mapper,
-            scc_analysis: &scc_analysis,
+            scc_tree: &scc_tree,
+            scc_entry_block_to_id: &scc_entry_block_to_id,
             immediate_dominators: &immediate_dominators,
             post_immediate_dominators: &post_immediate_dominators,
             exit_block_id,
@@ -210,7 +235,7 @@ impl RVSDGMod {
             // Lower the body from the entry block. lower_region returns the
             // exit state plus any operand values from the function's `ret`
             // terminator (empty Vec for void returns).
-            let exit = builder.lower_region(state, BasicBlockId(0), None)?;
+            let exit = builder.lower_region(state, BasicBlockId(0), None, None)?;
 
             let (state, values) = match exit {
                 region::RegionExit::AtBoundary(state) => (state, vec![]),

@@ -244,6 +244,40 @@ pub(super) fn for_each_operand<'a, F: FnMut(&'a Operand)>(inst: &'a Instruction,
     }
 }
 
+/// Iterate over every operand referenced by `term`, the terminator of a
+/// basic block. Symmetric to `for_each_operand` for non-terminator
+/// instructions. Needed by the loop live-in scan, since a terminator
+/// can be the sole consumer of an outer-scope value (e.g. `br i1
+/// %arg, ...` with `%arg` a function argument not otherwise used in
+/// the loop body).
+pub(super) fn for_each_terminator_operand<'a, F: FnMut(&'a Operand)>(
+    term: &'a llvm_ir::Terminator,
+    mut f: F,
+) {
+    use llvm_ir::Terminator;
+    match term {
+        Terminator::Br(_) => {}
+        Terminator::CondBr(cb) => f(&cb.condition),
+        Terminator::Switch(sw) => f(&sw.operand),
+        Terminator::IndirectBr(ib) => f(&ib.operand),
+        Terminator::Ret(r) => {
+            if let Some(op) = &r.return_operand {
+                f(op);
+            }
+        }
+        Terminator::Resume(r) => f(&r.operand),
+        Terminator::CleanupRet(c) => f(&c.cleanup_pad),
+        Terminator::CatchRet(c) => f(&c.catch_pad),
+        Terminator::Invoke(_) => {
+            todo!("for_each_terminator_operand: Invoke")
+        }
+        Terminator::CallBr(_) => {
+            todo!("for_each_terminator_operand: CallBr")
+        }
+        Terminator::Unreachable(_) | Terminator::CatchSwitch(_) => {}
+    }
+}
+
 /// Returns the SSA destination name of an instruction, if it has one.
 ///
 /// Used by live-in analysis to determine what's "defined inside" a region.
@@ -368,11 +402,31 @@ pub struct RegionLowerer<'rb, 'g, 'm> {
 }
 
 impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
+    /// Construct a top-level lowerer with an empty SSA-name map. Used at the
+    /// function entry; callers populate `name_to_value` themselves with
+    /// function parameters before lowering the body.
     pub fn new(rb: &'rb mut RegionBuilder<'g>, fn_ctx: &'m FnCtx<'m>) -> Self {
         Self {
             rb,
             fn_ctx,
             name_to_value: FxHashMap::default(),
+        }
+    }
+
+    /// Construct a child-region lowerer with a pre-seeded `name_to_value`.
+    /// Used when building a nested region whose params correspond to known
+    /// outer-scope SSA names (gamma arm params seeded from live-ins, theta
+    /// body params seeded from header phis + live-ins). The caller builds
+    /// the map up front, optionally pre-sized for the expected body size.
+    pub fn new_child(
+        rb: &'rb mut RegionBuilder<'g>,
+        fn_ctx: &'m FnCtx<'m>,
+        name_to_value: FxHashMap<Name, ValueId>,
+    ) -> Self {
+        Self {
+            rb,
+            fn_ctx,
+            name_to_value,
         }
     }
 

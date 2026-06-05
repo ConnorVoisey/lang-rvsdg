@@ -125,6 +125,144 @@ impl BasicBlockMapper {
 
         scc_analysis
     }
+
+    /// Compute strongly connected components over a subgraph induced by
+    /// `blocks`, treating arcs in `exclude_arcs` as absent. Returns the
+    /// strongly connected components of the resulting directed graph in
+    /// reverse topological order. Both trivial single-block components
+    /// and non-trivial multi-block (or self-looping single-block)
+    /// components are included; callers filter for the kind they want.
+    ///
+    /// This is the analysis backbone for nested loop discovery in the
+    /// paper-faithful construction (see construction_plan.md, section
+    /// 4.9). After the whole-function strongly connected components have
+    /// been identified, recursing into each non-trivial component's
+    /// block set with that component's repetition arcs excluded reveals
+    /// the inner loops without ever re-running Tarjan over the full
+    /// function.
+    ///
+    /// Complexity: O(|blocks| + |edges-in-subgraph|) per call, plus an
+    /// O(N) zero-fill of three working arrays sized for the whole
+    /// function. Memory is owned by the call; nothing persists.
+    pub fn scc_in_subgraph(
+        &self,
+        blocks: &[BasicBlockId],
+        exclude_arcs: &[(BasicBlockId, BasicBlockId)],
+    ) -> Vec<Scc> {
+        let block_count = self.blocks.len();
+        let mut in_subgraph = vec![false; block_count];
+        for b in blocks {
+            in_subgraph[b.0 as usize] = true;
+        }
+
+        let mut sccs: Vec<Scc> = Vec::new();
+        let mut stack: VecDeque<BasicBlockId> = VecDeque::new();
+        let mut index: i32 = 0;
+        let mut indicies = vec![-1; block_count];
+        let mut low_links = vec![0; block_count];
+        let mut on_stack = vec![false; block_count];
+
+        #[inline]
+        fn strong_connect(
+            id: BasicBlockId,
+            blocks: &[BasicBlockInOuts],
+            in_subgraph: &[bool],
+            exclude_arcs: &[(BasicBlockId, BasicBlockId)],
+            sccs: &mut Vec<Scc>,
+            stack: &mut VecDeque<BasicBlockId>,
+            index: &mut i32,
+            indicies: &mut Vec<i32>,
+            low_links: &mut Vec<i32>,
+            on_stack: &mut Vec<bool>,
+        ) {
+            indicies[id.0 as usize] = *index;
+            low_links[id.0 as usize] = *index;
+            *index += 1;
+            stack.push_back(id);
+            on_stack[id.0 as usize] = true;
+
+            let block = &blocks[id.0 as usize];
+            for edge in &block.outputs {
+                // Filter: edges whose target is outside the subgraph are
+                // not part of this analysis. Edges listed in
+                // exclude_arcs are treated as if they had been removed
+                // (this is how the paper's L* = SCC blocks minus
+                // repetition arcs is realised without mutating the CFG).
+                if !in_subgraph[edge.0 as usize] {
+                    continue;
+                }
+                if exclude_arcs.contains(&(id, *edge)) {
+                    continue;
+                }
+
+                if indicies[edge.0 as usize] == -1 {
+                    strong_connect(
+                        *edge,
+                        blocks,
+                        in_subgraph,
+                        exclude_arcs,
+                        sccs,
+                        stack,
+                        index,
+                        indicies,
+                        low_links,
+                        on_stack,
+                    );
+                    low_links[id.0 as usize] =
+                        low_links[id.0 as usize].min(low_links[edge.0 as usize]);
+                } else if on_stack[edge.0 as usize] {
+                    low_links[id.0 as usize] =
+                        low_links[id.0 as usize].min(indicies[edge.0 as usize]);
+                }
+            }
+
+            if low_links[id.0 as usize] == indicies[id.0 as usize] {
+                let mut scc = Scc {
+                    blocks: SmallVec::new(),
+                    is_trivial: false,
+                };
+                while let Some(node) = stack.pop_back() {
+                    on_stack[node.0 as usize] = false;
+                    scc.blocks.push(node);
+                    if node == id {
+                        break;
+                    }
+                }
+                // Trivial single-block component: only counts as trivial
+                // if the block has no self-edge surviving the subgraph
+                // filter. A self-edge that exists in the original CFG
+                // but is listed in exclude_arcs does not count.
+                let has_self_loop = blocks[id.0 as usize].outputs.contains(&id)
+                    && !exclude_arcs.contains(&(id, id));
+                scc.is_trivial = scc.blocks.len() == 1 && !has_self_loop;
+                if !scc.blocks.is_empty() {
+                    sccs.push(scc);
+                }
+            }
+        }
+
+        // Only start strong_connect from blocks in the subgraph. Blocks
+        // outside the subgraph are not visited; their indicies stay at
+        // -1 and they cannot be reached through filtered edges.
+        for b in blocks {
+            if indicies[b.0 as usize] == -1 {
+                strong_connect(
+                    *b,
+                    &self.blocks,
+                    &in_subgraph,
+                    exclude_arcs,
+                    &mut sccs,
+                    &mut stack,
+                    &mut index,
+                    &mut indicies,
+                    &mut low_links,
+                    &mut on_stack,
+                );
+            }
+        }
+
+        sccs
+    }
 }
 
 #[cfg(test)]
@@ -763,6 +901,119 @@ mod tests {
         basic_blocks.add_connection(bbs[2], bbs[0]);
         let analysis = basic_blocks.get_strongly_connected_components();
         assert!(!scc_for(&analysis, bbs[0]).is_trivial);
+    }
+
+    /// Normalise scc_in_subgraph output for assertions: sort blocks
+    /// inside each SCC, then sort SCCs by their first block.
+    fn collect_subgraph_sorted(sccs: Vec<super::Scc>) -> Vec<Vec<BasicBlockId>> {
+        let mut out: Vec<Vec<BasicBlockId>> = sccs
+            .into_iter()
+            .map(|scc| {
+                let mut bs: Vec<BasicBlockId> = scc.blocks.into_iter().collect();
+                bs.sort();
+                bs
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn subgraph_empty_blocks_returns_no_sccs() {
+        let (mut basic_blocks, bbs) = init(3);
+        basic_blocks.add_connection(bbs[0], bbs[1]);
+        basic_blocks.add_connection(bbs[1], bbs[0]);
+
+        let sccs = basic_blocks.scc_in_subgraph(&[], &[]);
+        assert!(sccs.is_empty());
+    }
+
+    #[test]
+    fn subgraph_excludes_blocks_outside_set() {
+        // Whole-function SCCs: {0,1} and {2,3}. Restricting to {0,1}
+        // returns only the first.
+        let (mut basic_blocks, bbs) = init(4);
+        basic_blocks.add_connection(bbs[0], bbs[1]);
+        basic_blocks.add_connection(bbs[1], bbs[0]);
+        basic_blocks.add_connection(bbs[2], bbs[3]);
+        basic_blocks.add_connection(bbs[3], bbs[2]);
+
+        let sccs = collect_subgraph_sorted(basic_blocks.scc_in_subgraph(&[bbs[0], bbs[1]], &[]));
+        assert_eq!(vec![vec![bbs[0], bbs[1]]], sccs);
+    }
+
+    #[test]
+    fn subgraph_excluded_arc_breaks_cycle() {
+        // 0 <-> 1 forms an SCC. Excluding the back-edge 1 -> 0 breaks
+        // the cycle; both blocks become trivial singletons.
+        let (mut basic_blocks, bbs) = init(2);
+        basic_blocks.add_connection(bbs[0], bbs[1]);
+        basic_blocks.add_connection(bbs[1], bbs[0]);
+
+        let sccs = collect_subgraph_sorted(
+            basic_blocks.scc_in_subgraph(&[bbs[0], bbs[1]], &[(bbs[1], bbs[0])]),
+        );
+        assert_eq!(vec![vec![bbs[0]], vec![bbs[1]]], sccs);
+    }
+
+    #[test]
+    fn subgraph_excluded_self_loop_makes_singleton_trivial() {
+        // Block with self-loop. Excluding the self-loop should make the
+        // singleton trivial.
+        let (mut basic_blocks, bbs) = init(1);
+        basic_blocks.add_connection(bbs[0], bbs[0]);
+
+        let raw = basic_blocks.scc_in_subgraph(&[bbs[0]], &[(bbs[0], bbs[0])]);
+        assert_eq!(1, raw.len());
+        assert!(raw[0].is_trivial);
+    }
+
+    #[test]
+    fn subgraph_preserved_self_loop_keeps_singleton_non_trivial() {
+        let (mut basic_blocks, bbs) = init(1);
+        basic_blocks.add_connection(bbs[0], bbs[0]);
+
+        let raw = basic_blocks.scc_in_subgraph(&[bbs[0]], &[]);
+        assert_eq!(1, raw.len());
+        assert!(!raw[0].is_trivial);
+    }
+
+    #[test]
+    fn subgraph_reveals_nested_inner_loop_after_outer_back_edge_removed() {
+        // Outer loop 0 -> 1 -> 2 -> 1 (inner self-cycle on the path) -> 3 -> 0.
+        // Whole-function Tarjan merges everything into {0,1,2,3}.
+        // Restricting to that block set and excluding the outer
+        // repetition arc 3 -> 0 reveals the inner cycle {1,2} as a
+        // separate SCC.
+        let (mut basic_blocks, bbs) = init(4);
+        basic_blocks.add_connection(bbs[0], bbs[1]);
+        basic_blocks.add_connection(bbs[1], bbs[2]);
+        basic_blocks.add_connection(bbs[2], bbs[1]);
+        basic_blocks.add_connection(bbs[2], bbs[3]);
+        basic_blocks.add_connection(bbs[3], bbs[0]);
+
+        let inner_blocks = [bbs[0], bbs[1], bbs[2], bbs[3]];
+        let exclude = [(bbs[3], bbs[0])];
+        let sccs = collect_subgraph_sorted(basic_blocks.scc_in_subgraph(&inner_blocks, &exclude));
+        // After excluding the back-edge, {1,2} is still a cycle; {0}
+        // and {3} are reachable but no longer participate in a cycle.
+        assert_eq!(
+            vec![vec![bbs[0]], vec![bbs[1], bbs[2]], vec![bbs[3]]],
+            sccs
+        );
+    }
+
+    #[test]
+    fn subgraph_ignores_edges_leaving_the_subgraph() {
+        // Block 0 has an outgoing edge to block 2 (not in subgraph).
+        // The subgraph {0, 1} should not see that edge at all.
+        let (mut basic_blocks, bbs) = init(3);
+        basic_blocks.add_connection(bbs[0], bbs[1]);
+        basic_blocks.add_connection(bbs[1], bbs[0]);
+        basic_blocks.add_connection(bbs[0], bbs[2]);
+
+        let sccs = collect_subgraph_sorted(basic_blocks.scc_in_subgraph(&[bbs[0], bbs[1]], &[]));
+        assert_eq!(vec![vec![bbs[0], bbs[1]]], sccs);
     }
 
     #[test]

@@ -1,54 +1,59 @@
-//! Per-SCC arc/vertex sets used by loop restructuring (§4.1 of Bahmann et al. 2014).
+//! Per-component arc and vertex sets, used by the paper's loop
+//! restructuring algorithm (Bahmann, Reissmann, Jahre, Meyer (2015)
+//! "Perfect Reconstructability of Control Flow from Demand Dependence
+//! Graphs", section 4.1).
 //!
-//! Given an SCC, this computes the five sets the restructuring rewrite needs:
-//! - entry blocks: blocks inside the SCC reached from outside it
-//! - entry arcs: the corresponding incoming edges
-//! - exit blocks: blocks outside the SCC reached from inside it
-//! - exit arcs: the corresponding outgoing edges
-//! - repetition arcs: edges inside the SCC that target an entry block (back-edges)
+//! Given a block set that represents a loop's body (a strongly
+//! connected component, or a synthesised candidate produced during
+//! restructuring), this computes the five sets the restructuring
+//! rewrite needs:
 //!
-//! `is_natural` is the cheap test for "this loop already has a single header,
-//! single back-edge, and single exit" - restructuring can be skipped.
+//! - **entry blocks** (paper's V_E): blocks inside the body that are
+//!   reached from outside it.
+//! - **entry arcs** (A_E): the corresponding incoming edges.
+//! - **exit blocks** (V_X): blocks outside the body that are reached
+//!   from inside it.
+//! - **exit arcs** (A_X): the corresponding outgoing edges.
+//! - **repetition arcs** (A_R): edges inside the body whose target is
+//!   an entry block; the back-edges that close the loop.
+//!
+//! The analysis is shape-agnostic. It does not assume the block set
+//! forms a natural loop. Multi-entry and multi-exit subsets work
+//! identically; the paper's q and r predicates use these sets to
+//! produce a single-entry single-exit shape suitable for direct
+//! conversion into a theta node. See `scc_tree.rs` for how loop
+//! restructuring builds and consumes the analysis.
 
 use smallvec::SmallVec;
 
-use crate::llvm_parser::{
-    block_mapper::{BasicBlockId, BasicBlockMapper},
-    strongly_connected_components::Scc,
-};
+use crate::llvm_parser::block_mapper::{BasicBlockId, BasicBlockMapper};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LoopArcs {
-    /// Canonical do/while shape: one header, one back-edge, one exit. Maps
-    /// directly onto a θ-node with no auxiliary predicates.
-    Natural {
-        /// Single entry vertex, where the loop is entered and re-entered.
-        header: BasicBlockId,
-        /// Source of the single back-edge, the block whose terminator
-        /// jumps back to `header`.
-        latch: BasicBlockId,
-        /// Target of the single exit arc, the block control transfers to
-        /// after leaving the loop.
-        exit: BasicBlockId,
-    },
-    /// Anything that's not natural: multiple entries, multiple back-edges,
-    /// or multiple exits. Phase 4 will materialize γ-dispatch nodes around
-    /// the θ-node using the auxiliary `q` and `r` predicates.
-    Irregular {
-        entry_blocks: SmallVec<[BasicBlockId; 4]>,
-        entry_arcs: SmallVec<[(BasicBlockId, BasicBlockId); 4]>,
-        exit_blocks: SmallVec<[BasicBlockId; 4]>,
-        exit_arcs: SmallVec<[(BasicBlockId, BasicBlockId); 4]>,
-        repetition_arcs: SmallVec<[(BasicBlockId, BasicBlockId); 4]>,
-    },
+pub struct LoopArcs {
+    /// Blocks inside the loop body that are reached from outside it.
+    pub entry_blocks: SmallVec<[BasicBlockId; 4]>,
+    /// Edges (from outside, to inside) that target an entry block.
+    pub entry_arcs: SmallVec<[(BasicBlockId, BasicBlockId); 4]>,
+    /// Blocks outside the loop body that are reached from inside it.
+    pub exit_blocks: SmallVec<[BasicBlockId; 4]>,
+    /// Edges (from inside, to outside) that leave the loop.
+    pub exit_arcs: SmallVec<[(BasicBlockId, BasicBlockId); 4]>,
+    /// Edges inside the loop whose target is an entry block; the
+    /// back-edges that close the loop.
+    pub repetition_arcs: SmallVec<[(BasicBlockId, BasicBlockId); 4]>,
 }
 
 impl LoopArcs {
-    pub fn from_scc(scc: &Scc, mapper: &BasicBlockMapper) -> Self {
+    /// Compute the arc and vertex sets for an arbitrary block set viewed
+    /// as a loop body. Given a strongly connected component's blocks,
+    /// produces the entry blocks (V_E), entry arcs (A_E), exit blocks
+    /// (V_X), exit arcs (A_X), and repetition arcs (A_R) that the
+    /// paper's section 4.1 restructuring consumes.
+    pub fn from_scc_blocks(blocks: &[BasicBlockId], mapper: &BasicBlockMapper) -> Self {
         let block_count = mapper.blocks.len();
-        let mut in_scc = vec![false; block_count];
-        for &b in &scc.blocks {
-            in_scc[b.0 as usize] = true;
+        let mut in_body = vec![false; block_count];
+        for &b in blocks {
+            in_body[b.0 as usize] = true;
         }
 
         let mut is_entry = vec![false; block_count];
@@ -56,15 +61,15 @@ impl LoopArcs {
         let mut entry_arcs: SmallVec<[(BasicBlockId, BasicBlockId); 4]> = SmallVec::new();
         let mut exit_arcs: SmallVec<[(BasicBlockId, BasicBlockId); 4]> = SmallVec::new();
 
-        for &block in &scc.blocks {
+        for &block in blocks {
             for &pred in mapper.inputs(block) {
-                if !in_scc[pred.0 as usize] {
+                if !in_body[pred.0 as usize] {
                     entry_arcs.push((pred, block));
                     is_entry[block.0 as usize] = true;
                 }
             }
             for &succ in mapper.outputs(block) {
-                if !in_scc[succ.0 as usize] {
+                if !in_body[succ.0 as usize] {
                     exit_arcs.push((block, succ));
                     is_exit_target[succ.0 as usize] = true;
                 }
@@ -72,7 +77,7 @@ impl LoopArcs {
         }
 
         let mut repetition_arcs: SmallVec<[(BasicBlockId, BasicBlockId); 4]> = SmallVec::new();
-        for &block in &scc.blocks {
+        for &block in blocks {
             for &succ in mapper.outputs(block) {
                 if is_entry[succ.0 as usize] {
                     repetition_arcs.push((block, succ));
@@ -80,37 +85,23 @@ impl LoopArcs {
             }
         }
 
-        let mut entry_blocks = (0..block_count as u32)
+        let mut entry_blocks: SmallVec<[BasicBlockId; 4]> = (0..block_count as u32)
             .filter(|i| is_entry[*i as usize])
             .map(BasicBlockId)
-            .collect::<SmallVec<_>>();
-        let mut exit_blocks = (0..block_count as u32)
+            .collect();
+        let mut exit_blocks: SmallVec<[BasicBlockId; 4]> = (0..block_count as u32)
             .filter(|i| is_exit_target[*i as usize])
             .map(BasicBlockId)
-            .collect::<SmallVec<_>>();
+            .collect();
         entry_blocks.sort();
         exit_blocks.sort();
 
-        // One header, one back-edge, one exit: the canonical do/while shape that
-        // maps directly onto a θ-node.
-        if entry_blocks.len() == 1 && repetition_arcs.len() == 1 && exit_arcs.len() == 1 {
-            Self::Natural {
-                header: entry_blocks[0],
-                // back-edge source: the block whose terminator jumps back
-                // to the header.
-                latch: repetition_arcs[0].0,
-                // exit target: the block control transfers to *outside*
-                // the loop. The arc's source is somewhere inside the loop.
-                exit: exit_arcs[0].1,
-            }
-        } else {
-            Self::Irregular {
-                entry_blocks,
-                entry_arcs,
-                exit_blocks,
-                exit_arcs,
-                repetition_arcs,
-            }
+        LoopArcs {
+            entry_blocks,
+            entry_arcs,
+            exit_blocks,
+            exit_arcs,
+            repetition_arcs,
         }
     }
 }
@@ -118,113 +109,50 @@ impl LoopArcs {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llvm_parser::strongly_connected_components::Scc;
-    use llvm_ir::Name;
+    use crate::llvm_parser::test_utils::init;
     use pretty_assertions::assert_eq;
-
-    fn init(n: usize) -> (BasicBlockMapper, Vec<BasicBlockId>) {
-        let mut mapper = BasicBlockMapper::new(n);
-        let bbs = (0..n)
-            .map(|i| mapper.intern(&Name::Number(i)))
-            .collect::<Vec<_>>();
-        (mapper, bbs)
-    }
-
-    fn scc_of(blocks: &[BasicBlockId]) -> Scc {
-        Scc {
-            blocks: blocks.iter().copied().collect(),
-            is_trivial: false,
-        }
-    }
 
     #[test]
     fn natural_two_block_loop() {
-        // 0 (preheader) -> 1 (header) -> 2 (body) -> 1, 1 -> 3 (exit)
+        // 0 (preheader) -> 1 (header) -> 2 (body) -> 1, 1 -> 3 (exit).
         let (mut mapper, bbs) = init(4);
         mapper.add_connection(bbs[0], bbs[1]);
         mapper.add_connection(bbs[1], bbs[2]);
         mapper.add_connection(bbs[2], bbs[1]);
         mapper.add_connection(bbs[1], bbs[3]);
 
-        let scc = scc_of(&[bbs[1], bbs[2]]);
-        let arcs = LoopArcs::from_scc(&scc, &mapper);
+        let arcs = LoopArcs::from_scc_blocks(&[bbs[1], bbs[2]], &mapper);
 
-        assert_eq!(
-            LoopArcs::Natural {
-                header: bbs[1],
-                latch: bbs[2],
-                exit: bbs[3],
-            },
-            arcs
-        );
+        assert_eq!(arcs.entry_blocks.to_vec(), vec![bbs[1]]);
+        assert_eq!(arcs.entry_arcs.to_vec(), vec![(bbs[0], bbs[1])]);
+        assert_eq!(arcs.exit_blocks.to_vec(), vec![bbs[3]]);
+        assert_eq!(arcs.exit_arcs.to_vec(), vec![(bbs[1], bbs[3])]);
+        assert_eq!(arcs.repetition_arcs.to_vec(), vec![(bbs[2], bbs[1])]);
     }
 
     #[test]
     fn single_block_self_loop() {
-        // 0 (entry) -> 1, 1 -> 1 (self), 1 -> 2 (exit)
+        // 0 (entry) -> 1, 1 -> 1 (self), 1 -> 2 (exit).
         let (mut mapper, bbs) = init(3);
         mapper.add_connection(bbs[0], bbs[1]);
         mapper.add_connection(bbs[1], bbs[1]);
         mapper.add_connection(bbs[1], bbs[2]);
 
-        let scc = scc_of(&[bbs[1]]);
-        let arcs = LoopArcs::from_scc(&scc, &mapper);
+        let arcs = LoopArcs::from_scc_blocks(&[bbs[1]], &mapper);
 
-        // Header and latch coincide for self-loops.
-        assert_eq!(
-            LoopArcs::Natural {
-                header: bbs[1],
-                latch: bbs[1],
-                exit: bbs[2],
-            },
-            arcs
-        );
+        // Header and latch coincide; the self-edge is the back-edge.
+        assert_eq!(arcs.entry_blocks.to_vec(), vec![bbs[1]]);
+        assert_eq!(arcs.entry_arcs.to_vec(), vec![(bbs[0], bbs[1])]);
+        assert_eq!(arcs.exit_blocks.to_vec(), vec![bbs[2]]);
+        assert_eq!(arcs.exit_arcs.to_vec(), vec![(bbs[1], bbs[2])]);
+        assert_eq!(arcs.repetition_arcs.to_vec(), vec![(bbs[1], bbs[1])]);
     }
 
     #[test]
-    fn irreducible_two_entries() {
-        // 0 enters both 1 and 2; 1 <-> 2 form a cycle; 1 -> 3 exits.
-        let (mut mapper, bbs) = init(4);
-        mapper.add_connection(bbs[0], bbs[1]);
-        mapper.add_connection(bbs[0], bbs[2]);
-        mapper.add_connection(bbs[1], bbs[2]);
-        mapper.add_connection(bbs[2], bbs[1]);
-        mapper.add_connection(bbs[1], bbs[3]);
-
-        let scc = scc_of(&[bbs[1], bbs[2]]);
-        let arcs = LoopArcs::from_scc(&scc, &mapper);
-
-        let LoopArcs::Irregular {
-            entry_blocks,
-            mut entry_arcs,
-            exit_blocks,
-            mut exit_arcs,
-            mut repetition_arcs,
-        } = arcs
-        else {
-            panic!("expected Irregular, got {arcs:?}");
-        };
-        entry_arcs.sort();
-        exit_arcs.sort();
-        repetition_arcs.sort();
-
-        assert_eq!(vec![bbs[1], bbs[2]], entry_blocks.to_vec());
-        assert_eq!(
-            vec![(bbs[0], bbs[1]), (bbs[0], bbs[2])],
-            entry_arcs.to_vec()
-        );
-        assert_eq!(vec![bbs[3]], exit_blocks.to_vec());
-        assert_eq!(vec![(bbs[1], bbs[3])], exit_arcs.to_vec());
-        // Both intra-SCC edges target entry blocks → both are repetition arcs.
-        assert_eq!(
-            vec![(bbs[1], bbs[2]), (bbs[2], bbs[1])],
-            repetition_arcs.to_vec()
-        );
-    }
-
-    #[test]
-    fn multiple_exits_not_natural() {
-        // 0 -> 1, 1 -> 2 -> 1 (loop), 1 -> 3 (exit a), 2 -> 4 (exit b)
+    fn multiple_exits_single_entry() {
+        // 0 -> 1, 1 -> 2 -> 1 (loop), 1 -> 3 (exit a), 2 -> 4 (exit b).
+        // Single-entry, multi-exit: the analysis records both exit arcs
+        // and the single entry vertex unchanged.
         let (mut mapper, bbs) = init(5);
         mapper.add_connection(bbs[0], bbs[1]);
         mapper.add_connection(bbs[1], bbs[2]);
@@ -232,31 +160,22 @@ mod tests {
         mapper.add_connection(bbs[1], bbs[3]);
         mapper.add_connection(bbs[2], bbs[4]);
 
-        let scc = scc_of(&[bbs[1], bbs[2]]);
-        let arcs = LoopArcs::from_scc(&scc, &mapper);
-
-        let LoopArcs::Irregular {
-            entry_blocks,
-            entry_arcs,
-            exit_blocks,
-            mut exit_arcs,
-            repetition_arcs,
-        } = arcs
-        else {
-            panic!("expected Irregular, got {arcs:?}");
-        };
+        let arcs = LoopArcs::from_scc_blocks(&[bbs[1], bbs[2]], &mapper);
+        let mut exit_arcs = arcs.exit_arcs.to_vec();
         exit_arcs.sort();
 
-        assert_eq!(vec![bbs[1]], entry_blocks.to_vec());
-        assert_eq!(vec![(bbs[0], bbs[1])], entry_arcs.to_vec());
-        assert_eq!(vec![bbs[3], bbs[4]], exit_blocks.to_vec());
-        assert_eq!(vec![(bbs[1], bbs[3]), (bbs[2], bbs[4])], exit_arcs.to_vec());
-        assert_eq!(vec![(bbs[2], bbs[1])], repetition_arcs.to_vec());
+        assert_eq!(arcs.entry_blocks.to_vec(), vec![bbs[1]]);
+        assert_eq!(arcs.entry_arcs.to_vec(), vec![(bbs[0], bbs[1])]);
+        assert_eq!(arcs.exit_blocks.to_vec(), vec![bbs[3], bbs[4]]);
+        assert_eq!(exit_arcs, vec![(bbs[1], bbs[3]), (bbs[2], bbs[4])]);
+        assert_eq!(arcs.repetition_arcs.to_vec(), vec![(bbs[2], bbs[1])]);
     }
 
     #[test]
-    fn multiple_back_edges_not_natural() {
-        // 0 -> 1, 1 -> 2 -> 1, 1 -> 3 -> 1 (two latches), 1 -> 4 (exit)
+    fn multiple_back_edges_single_exit() {
+        // 0 -> 1, 1 -> 2 -> 1, 1 -> 3 -> 1 (two latches), 1 -> 4 (exit).
+        // Multi-latch shapes show up as two repetition arcs to the same
+        // single entry vertex.
         let (mut mapper, bbs) = init(5);
         mapper.add_connection(bbs[0], bbs[1]);
         mapper.add_connection(bbs[1], bbs[2]);
@@ -265,28 +184,40 @@ mod tests {
         mapper.add_connection(bbs[3], bbs[1]);
         mapper.add_connection(bbs[1], bbs[4]);
 
-        let scc = scc_of(&[bbs[1], bbs[2], bbs[3]]);
-        let arcs = LoopArcs::from_scc(&scc, &mapper);
+        let arcs = LoopArcs::from_scc_blocks(&[bbs[1], bbs[2], bbs[3]], &mapper);
+        let mut rep = arcs.repetition_arcs.to_vec();
+        rep.sort();
 
-        let LoopArcs::Irregular {
-            entry_blocks,
-            entry_arcs,
-            exit_blocks,
-            exit_arcs,
-            mut repetition_arcs,
-        } = arcs
-        else {
-            panic!("expected Irregular, got {arcs:?}");
-        };
-        repetition_arcs.sort();
+        assert_eq!(arcs.entry_blocks.to_vec(), vec![bbs[1]]);
+        assert_eq!(arcs.entry_arcs.to_vec(), vec![(bbs[0], bbs[1])]);
+        assert_eq!(arcs.exit_blocks.to_vec(), vec![bbs[4]]);
+        assert_eq!(arcs.exit_arcs.to_vec(), vec![(bbs[1], bbs[4])]);
+        assert_eq!(rep, vec![(bbs[2], bbs[1]), (bbs[3], bbs[1])]);
+    }
 
-        assert_eq!(vec![bbs[1]], entry_blocks.to_vec());
-        assert_eq!(vec![(bbs[0], bbs[1])], entry_arcs.to_vec());
-        assert_eq!(vec![bbs[4]], exit_blocks.to_vec());
-        assert_eq!(vec![(bbs[1], bbs[4])], exit_arcs.to_vec());
-        assert_eq!(
-            vec![(bbs[2], bbs[1]), (bbs[3], bbs[1])],
-            repetition_arcs.to_vec()
-        );
+    #[test]
+    fn multi_entry_records_both_entry_vertices() {
+        // 0 -> 1 and 0 -> 2; 1 -> 2 and 2 -> 1 form an irreducible
+        // cycle; 1 -> 3 exits. The block set {1, 2} has two entry
+        // vertices: this is the case that drives the paper's q
+        // predicate.
+        let (mut mapper, bbs) = init(4);
+        mapper.add_connection(bbs[0], bbs[1]);
+        mapper.add_connection(bbs[0], bbs[2]);
+        mapper.add_connection(bbs[1], bbs[2]);
+        mapper.add_connection(bbs[2], bbs[1]);
+        mapper.add_connection(bbs[1], bbs[3]);
+
+        let arcs = LoopArcs::from_scc_blocks(&[bbs[1], bbs[2]], &mapper);
+        let mut entry_arcs = arcs.entry_arcs.to_vec();
+        entry_arcs.sort();
+
+        assert_eq!(arcs.entry_blocks.to_vec(), vec![bbs[1], bbs[2]]);
+        assert_eq!(entry_arcs, vec![(bbs[0], bbs[1]), (bbs[0], bbs[2])]);
+        assert_eq!(arcs.exit_blocks.to_vec(), vec![bbs[3]]);
+        assert_eq!(arcs.exit_arcs.to_vec(), vec![(bbs[1], bbs[3])]);
+        let mut rep = arcs.repetition_arcs.to_vec();
+        rep.sort();
+        assert_eq!(rep, vec![(bbs[1], bbs[2]), (bbs[2], bbs[1])]);
     }
 }
