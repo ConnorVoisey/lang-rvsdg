@@ -6,7 +6,7 @@ use crate::{
         scc_tree::{SccTree, SccTreeNodeId},
     },
     rvsdg::{
-        GlobalInit, InlineHint, Linkage, RVSDGMod, Visibility,
+        GlobalId, GlobalInit, InlineHint, Linkage, RVSDGMod, Visibility,
         func::{
             CallingConvention, FnAttrFlags, FnAttrs, FnDecl, FnResult, Param, ParamAttrFlags,
             ParamAttrs,
@@ -84,7 +84,15 @@ impl RVSDGMod {
             rvsdg_mod.declare_fn_full(decl);
         }
 
-        // lower globals
+        // Globals are lowered in two passes so an initializer can reference
+        // a global/alias declared later in the module (csmith emits such
+        // forward references freely — e.g. one global initialised with the
+        // address of another). Pass 1 registers every global, alias, and
+        // ifunc name (and its type) in `global_map`; pass 2 resolves the
+        // initializers, which may now look up any global by name.
+
+        // Pass 1: register names with a placeholder (Extern) initializer.
+        let mut var_ids: Vec<GlobalId> = Vec::with_capacity(module.global_vars.len());
         for global in &module.global_vars {
             let value_ty = match &global.initializer {
                 Some(init) => {
@@ -96,29 +104,26 @@ impl RVSDGMod {
                     ty => ty,
                 },
             };
-            let init = match &global.initializer {
-                Some(v) => GlobalInit::Init(rvsdg_mod.convert_const_ref(v.clone(), &module)?),
-                None => GlobalInit::Extern,
-            };
-            rvsdg_mod.define_global(
+            let id = rvsdg_mod.define_global(
                 global_name_string(&global.name),
                 value_ty,
-                init,
+                GlobalInit::Extern,
                 global.is_constant,
                 convert_linkage(global.linkage),
             );
+            var_ids.push(id);
         }
+        let mut alias_ids: Vec<GlobalId> = Vec::with_capacity(module.global_aliases.len());
         for global in &module.global_aliases {
             let ty = rvsdg_mod.types.convert_type_ref(&global.ty, &module)?;
-            let init =
-                GlobalInit::Init(rvsdg_mod.convert_const_ref(global.aliasee.clone(), &module)?);
-            rvsdg_mod.define_global(
+            let id = rvsdg_mod.define_global(
                 global_name_string(&global.name),
                 ty,
-                init,
+                GlobalInit::Extern,
                 true,
                 convert_linkage(global.linkage),
             );
+            alias_ids.push(id);
         }
         for global in &module.global_ifuncs {
             let ty = rvsdg_mod.types.convert_type_ref(&global.ty, &module)?;
@@ -129,6 +134,18 @@ impl RVSDGMod {
                 true,
                 convert_linkage(global.linkage),
             );
+        }
+
+        // Pass 2: resolve initializers now that every name is registered.
+        for (global, &id) in module.global_vars.iter().zip(&var_ids) {
+            if let Some(init) = &global.initializer {
+                let cid = rvsdg_mod.convert_const_ref(init.clone(), &module)?;
+                rvsdg_mod.set_global_init(id, GlobalInit::Init(cid));
+            }
+        }
+        for (global, &id) in module.global_aliases.iter().zip(&alias_ids) {
+            let cid = rvsdg_mod.convert_const_ref(global.aliasee.clone(), &module)?;
+            rvsdg_mod.set_global_init(id, GlobalInit::Init(cid));
         }
         // TODO: lower types
         // pub types: Types,
@@ -235,10 +252,10 @@ impl RVSDGMod {
             // Lower the body from the entry block. lower_region returns the
             // exit state plus any operand values from the function's `ret`
             // terminator (empty Vec for void returns).
-            let exit = builder.lower_region(state, BasicBlockId(0), None, None)?;
+            let exit = builder.lower_region(state, BasicBlockId(0), &[], None, None)?;
 
             let (state, values) = match exit {
-                region::RegionExit::AtBoundary(state) => (state, vec![]),
+                region::RegionExit::AtBoundary { state, .. } => (state, vec![]),
                 region::RegionExit::Returned { state, values } => (state, values),
             };
             Ok(FnResult { state, values })

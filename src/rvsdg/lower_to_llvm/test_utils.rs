@@ -1,17 +1,12 @@
 #[cfg(test)]
 pub mod test_utils {
     use crate::rvsdg::RVSDGMod;
-    use inkwell::{
-        OptimizationLevel,
-        context::Context,
-        targets::{InitializationConfig, Target},
-    };
+    use inkwell::{OptimizationLevel, context::Context};
 
     macro_rules! define_jit_runner {
         ($name:ident, $ret:ty) => {
             pub fn $name(rvsdg: &RVSDGMod, fn_name: &str) -> $ret {
-                Target::initialize_native(&InitializationConfig::default())
-                    .expect("Failed to initialize native target");
+                crate::init_llvm_native();
 
                 let context = Context::create();
                 let module = rvsdg

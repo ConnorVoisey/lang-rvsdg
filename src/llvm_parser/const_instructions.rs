@@ -48,11 +48,25 @@ impl RVSDGMod {
                     kind: ConstantKind::Zero,
                 }
             }
-            llvm_ir::Constant::Struct {
-                name: _,
-                values: _,
-                is_packed: _,
-            } => todo!(),
+            llvm_ir::Constant::Struct { values, .. } => {
+                // A struct constant is an aggregate of its field constants,
+                // same as an array (the backend dispatches on the type:
+                // arrays use const_array, structs use const_struct). The
+                // struct type comes from the whole constant's type. Packing
+                // is not tracked here — the backend builds non-packed
+                // structs, and csmith is run with --no-packed-struct.
+                let llvm_ty = module.types.type_of(const_ref.as_ref());
+                let ty = self.types.convert_type_ref(&llvm_ty, module)?;
+                let ids = values
+                    .iter()
+                    .map(|v| self.convert_const_ref(v.clone(), module))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let span = self.constants.id_pool.push_slice(&ids);
+                ConstantDef {
+                    ty,
+                    kind: ConstantKind::Aggregate(span),
+                }
+            }
             llvm_ir::Constant::Array {
                 element_type,
                 elements,
@@ -131,7 +145,39 @@ impl RVSDGMod {
             llvm_ir::Constant::ExtractElement(_extract_element) => todo!(),
             llvm_ir::Constant::InsertElement(_insert_element) => todo!(),
             llvm_ir::Constant::ShuffleVector(_shuffle_vector) => todo!(),
-            llvm_ir::Constant::GetElementPtr(_get_element_ptr) => todo!(),
+            llvm_ir::Constant::GetElementPtr(gep) => {
+                let base = self.convert_const_ref(gep.address.clone(), module)?;
+                let base_type = self.constants.get(base).ty;
+                // llvm-ir drops the source element type on a constant GEP
+                // (opaque pointers), so recover it from the index shape:
+                //   - one index  → LLVM's canonical byte form
+                //     `getelementptr (i8, ptr base, i64 offset)`; index over i8.
+                //   - many indices → a typed aggregate access
+                //     `getelementptr (T, ptr base, 0, k, …)`; the source type
+                //     T is what `base` points to.
+                let source_type = if gep.indices.len() == 1 {
+                    TypeRef::Scalar(ScalarType::I8)
+                } else {
+                    self.const_pointee_type(base).ok_or_else(|| {
+                        eyre!("could not infer source type for multi-index constant getelementptr")
+                    })?
+                };
+                let index_ids = gep
+                    .indices
+                    .iter()
+                    .map(|i| self.convert_const_ref(i.clone(), module))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let indices = self.constants.id_pool.push_slice(&index_ids);
+                ConstantDef {
+                    ty: base_type,
+                    kind: ConstantKind::GetElementPointer {
+                        base,
+                        source_type,
+                        indices,
+                        in_bounds: gep.in_bounds,
+                    },
+                }
+            }
             llvm_ir::Constant::Trunc(_trunc) => todo!(),
             llvm_ir::Constant::PtrToInt(_ptr_to_int) => todo!(),
             llvm_ir::Constant::IntToPtr(_int_to_ptr) => todo!(),
@@ -145,6 +191,56 @@ impl RVSDGMod {
             } => todo!(),
         };
         Ok(self.constants.intern(const_def))
+    }
+
+    /// The element type a pointer constant points to — the *source type* for a
+    /// typed GEP applied to it. A global points to its value type; a nested
+    /// constant GEP points to the element its own indices land on (its source
+    /// type descended by every index after the leading pointer-stride index).
+    /// `None` for pointers whose pointee we don't track (e.g. function or null
+    /// pointers), which can't be a typed-GEP base.
+    fn const_pointee_type(&self, id: ConstId) -> Option<TypeRef> {
+        match &self.constants.get(id).kind {
+            ConstantKind::GlobalAddr(global_id) => Some(self.get_global(*global_id).ty),
+            ConstantKind::GetElementPointer {
+                source_type,
+                indices,
+                ..
+            } => {
+                let indices = self.constants.get_aggregate_elements(*indices).to_vec();
+                self.descend_type(*source_type, &indices[1..])
+            }
+            _ => None,
+        }
+    }
+
+    /// Walk an aggregate type along constant GEP indices, returning the type
+    /// reached. Array indices step into the element type; struct indices select
+    /// a field by its constant index. `None` on a non-aggregate or bad index.
+    fn descend_type(&self, mut ty: TypeRef, indices: &[ConstId]) -> Option<TypeRef> {
+        for &index in indices {
+            ty = match ty {
+                TypeRef::Array(array_id) => self.types.get_array(array_id).element,
+                TypeRef::Struct(struct_id) => {
+                    let field = self.const_int_value(index)? as usize;
+                    self.types
+                        .get_struct(struct_id)
+                        .fields
+                        .get(field)?
+                        .field_type
+                }
+                _ => return None,
+            };
+        }
+        Some(ty)
+    }
+
+    /// The integer value of a scalar integer constant, if it is one.
+    fn const_int_value(&self, id: ConstId) -> Option<i64> {
+        match self.constants.get(id).kind {
+            ConstantKind::Scalar(ConstValue::Int(v)) => Some(v),
+            _ => None,
+        }
     }
 
     fn fold_int_binop(

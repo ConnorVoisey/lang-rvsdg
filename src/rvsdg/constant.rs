@@ -60,6 +60,15 @@ pub enum ConstantKind {
     FuncAddr(FuncId),
     /// Undefined value (LLVM's `undef`, distinct from poison)
     Undef,
+    /// Constant-expression `getelementptr`: the address of an element of
+    /// `base` reached by `indices` over `source_type`. Common in csmith
+    /// output as a global pointer initialised to `&other_global[k]`.
+    GetElementPointer {
+        base: ConstId,
+        source_type: TypeRef,
+        indices: ConstIdsSpan,
+        in_bounds: bool,
+    },
 }
 
 /// Deduplicated storage for all module-level constants.

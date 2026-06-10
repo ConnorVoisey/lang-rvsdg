@@ -997,10 +997,7 @@ mod tests {
         let sccs = collect_subgraph_sorted(basic_blocks.scc_in_subgraph(&inner_blocks, &exclude));
         // After excluding the back-edge, {1,2} is still a cycle; {0}
         // and {3} are reachable but no longer participate in a cycle.
-        assert_eq!(
-            vec![vec![bbs[0]], vec![bbs[1], bbs[2]], vec![bbs[3]]],
-            sccs
-        );
+        assert_eq!(vec![vec![bbs[0]], vec![bbs[1], bbs[2]], vec![bbs[3]]], sccs);
     }
 
     #[test]

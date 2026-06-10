@@ -4,14 +4,19 @@
 //! block's phi shape.
 //!
 //! Bahmann, Reissmann, Jahre, Meyer (2015) section 4.2 (branch
-//! restructuring) is the larger algorithm we eventually want; this
-//! module is the part that handles already-structured branches where
-//! every CondBr / Switch has a single post-dominator join.
-//! Unstructured branches (early returns inside arms, breaks out of
-//! nested gammas, switch fall-through tails) hit the post-dominator
-//! `.expect()` in `region::lower_region`; the auxiliary continuation
-//! predicate transform from Bahmann et al. 2015 section 4.2 is the
-//! intended remedy and has not been implemented yet.
+//! restructuring). The build is driven by `restructure::continuation_points`
+//! (Phase A): a branch with a single continuation point is a plain
+//! single-join γ (`lower_n_way_branch`); a branch with more than one is
+//! lowered by `lower_multi_continuation_branch` — the §4.2 `p`-demux — which
+//! discovers the auxiliary continuation predicate `p` during the arm walk
+//! and lowers each continuation exactly once (no node cloning).
+//!
+//! Not yet handled here: a branch with an arm that escapes the region
+//! (returns, traps, or spins) instead of reaching a continuation point.
+//! `lower_region`'s `arms_reconverge` guard detects this and falls back to
+//! the single-join path (which clones the shared continuation but handles
+//! the escaping arm); generalising the demux to escaping arms needs the
+//! return/exit predicate plumbing.
 
 use llvm_ir::{
     Name, Operand,
@@ -25,7 +30,6 @@ use crate::{
     llvm_parser::{
         FnCtx,
         block_mapper::BasicBlockId,
-        dominance::dominates,
         instructions::{RegionLowerer, for_each_operand, instruction_dest},
         region::{
             RegionExit,
@@ -35,7 +39,8 @@ use crate::{
     rvsdg::{
         ICmpPred, State, ValueId,
         builder::{BranchResult, RegionBuilder},
-        types::I32,
+        types::{I32, TypeRef},
+        value::ConstValue,
     },
 };
 
@@ -46,12 +51,13 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
         &mut self,
         state: State,
         cond_branch: &CondBr,
+        head: BasicBlockId,
         join: BasicBlockId,
     ) -> color_eyre::Result<State> {
         let predicate = self.operand(&cond_branch.condition)?;
         let true_target = *self.fn_ctx.bb_mapper.get_expect(&cond_branch.true_dest);
         let false_target = *self.fn_ctx.bb_mapper.get_expect(&cond_branch.false_dest);
-        self.lower_n_way_branch(state, predicate, &[true_target, false_target], join)
+        self.lower_n_way_branch(state, predicate, &[true_target, false_target], join, head)
     }
 
     /// Lower an n-way switch by building a gamma whose arm 0 is the
@@ -68,8 +74,26 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
         &mut self,
         state: State,
         switch: &Switch,
+        head: BasicBlockId,
         join: BasicBlockId,
     ) -> color_eyre::Result<State> {
+        let (selector, targets) = self.switch_selector(switch)?;
+        self.lower_n_way_branch(state, selector, &targets, join, head)
+    }
+
+    /// Compute the n-way gamma selector for a `switch`: arm 0 is the
+    /// default destination and arm `i+1` is the i-th case, chosen by an
+    /// `icmp eq` + `select` chain over the case values. Returns the
+    /// selector value and the arm targets (default first, then cases in
+    /// declaration order).
+    ///
+    /// Shared by the acyclic switch lowering above and the in-loop-body
+    /// switch lowering (`loops::lower_body_switch`) — the two differ only
+    /// in how the resulting (selector, targets) feed a gamma.
+    pub(super) fn switch_selector(
+        &mut self,
+        switch: &Switch,
+    ) -> color_eyre::Result<(ValueId, Vec<BasicBlockId>)> {
         let switch_operand = self.operand(&switch.operand)?;
 
         // Arm 0 is the default; arms 1..=N are case destinations in
@@ -80,9 +104,8 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
             targets.push(*self.fn_ctx.bb_mapper.get_expect(dest_name));
         }
 
-        // Compute the arm-index selector. Start at 0 (default) and for
-        // each case `i`, replace with `i+1` when the switch operand
-        // matches that case's value.
+        // Start at 0 (default) and for each case `i`, replace with `i+1`
+        // when the switch operand matches that case's value.
         let mut selector = self.rb.const_i32(0);
         for (i, (case_const, _)) in switch.dests.iter().enumerate() {
             let case_value = self.operand(&Operand::ConstantOperand(case_const.clone()))?;
@@ -91,7 +114,7 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
             selector = self.rb.ternary(matched, case_index, selector, I32);
         }
 
-        self.lower_n_way_branch(state, selector, &targets, join)
+        Ok((selector, targets))
     }
 
     /// Shared body of `lower_cond_branch` and `lower_switch`: emit an
@@ -114,6 +137,7 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
         predicate: ValueId,
         arm_targets: &[BasicBlockId],
         join: BasicBlockId,
+        head: BasicBlockId,
     ) -> color_eyre::Result<State> {
         // The join block's phis define the gamma's per-arm result shape.
         let phis_at_join = phi_instructions_at(&self.fn_ctx.func.basic_blocks[join.0 as usize]);
@@ -122,7 +146,7 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
         // arm.
         let arm_blocks_per_arm: Vec<FxHashSet<BasicBlockId>> = arm_targets
             .iter()
-            .map(|&target| self.collect_arm_blocks(target, join))
+            .map(|&target| self.collect_walked_blocks(target, &[join]))
             .collect();
 
         // Live-in scan needs every block across all arms. Flatten into
@@ -132,42 +156,41 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
             .flat_map(|set| set.iter().copied())
             .collect();
         let (live_in_names, live_ins) =
-            self.compute_arm_live_ins(&combined_arm_blocks, &phis_at_join);
+            self.compute_arm_live_ins(&combined_arm_blocks, &phis_at_join, Some(head));
 
         // Pre-bind into locals so closures don't capture `self`.
         let fn_ctx = self.fn_ctx;
         let phis_slice: &[&Phi] = &phis_at_join;
         let live_in_names_slice: &[Name] = &live_in_names;
+        let boundary = [join];
+        let boundary_ref: &[BasicBlockId] = &boundary;
+        let leaf = Leaf::JoinPhis(phis_slice);
+        let leaf_ref = &leaf;
 
         // Owned per-arm closures. Same closure type per iteration so
-        // they can live together in a `Vec<_>`. Each borrows its
-        // arm-block set from `arm_blocks_per_arm`, which stays alive in
-        // this stack frame for the duration of the gamma_n call.
+        // they can live together in a `Vec<_>`. Each walks its arm to the
+        // join and produces its result slots via the leaf; `head` seeds the
+        // walk so empty / shared-tail arms resolve correctly.
         let arm_closures: Vec<_> = arm_targets
             .iter()
-            .zip(arm_blocks_per_arm.iter())
-            .map(|(&target, arm_blocks)| {
+            .map(|&target| {
                 move |rb: &mut RegionBuilder| -> color_eyre::Result<BranchResult> {
                     lower_arm(
                         rb,
                         fn_ctx,
                         state,
-                        phis_slice,
                         target,
-                        join,
-                        arm_blocks,
+                        boundary_ref,
                         live_in_names_slice,
+                        head,
+                        leaf_ref,
                     )
                 }
             })
             .collect();
 
         // Coerce each closure to a trait-object reference for gamma_n.
-        let branch_refs: Vec<&dyn Fn(&mut RegionBuilder) -> color_eyre::Result<BranchResult>> =
-            arm_closures
-                .iter()
-                .map(|c| c as &dyn Fn(&mut RegionBuilder) -> color_eyre::Result<BranchResult>)
-                .collect();
+        let branch_refs = as_branch_refs(&arm_closures);
         let result = self.rb.gamma_n(predicate, state, &live_ins, &branch_refs)?;
 
         // Bind each join-phi's destination to the corresponding gamma
@@ -178,6 +201,248 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
         }
 
         Ok(result.state)
+    }
+
+    /// Lower a branch whose arms reconverge at MORE THAN ONE continuation
+    /// point (Bahmann et al. §4.2, the `p`-demux case). Instead of cloning
+    /// the shared continuation into every arm, we build two gammas:
+    ///
+    ///   1. `γ_outer` on the original predicate: each arm walks only as far
+    ///      as the continuation-point boundary and reports WHICH one it
+    ///      reached — the auxiliary predicate `p`. It outputs `p` followed
+    ///      by, for each demux target, that target's phi values (resolved
+    ///      from the arm that reached it; `poison` for targets it did not —
+    ///      the demux never reads those slots).
+    ///   2. `γ_demux` on `p`: one arm per demux target. Each binds its
+    ///      target's phis from the captured `γ_outer` outputs, then lowers
+    ///      the continuation from that target to the final `join` exactly
+    ///      once. Its outputs are the `join`'s phi values.
+    ///
+    /// `join` (the post-dominator) is added to the demux targets so an arm
+    /// that runs straight to the join is handled uniformly (an empty demux
+    /// arm). On return the `join`'s phis are bound and the caller resumes
+    /// there, exactly as for the single-join path.
+    pub(super) fn lower_multi_continuation_branch(
+        &mut self,
+        state: State,
+        predicate: ValueId,
+        arm_targets: &[BasicBlockId],
+        continuation_points: &[BasicBlockId],
+        head: BasicBlockId,
+        join: BasicBlockId,
+    ) -> color_eyre::Result<State> {
+        // Demux targets: the continuation points plus the final join.
+        let mut demux_targets: SmallVec<[BasicBlockId; 4]> =
+            continuation_points.iter().copied().collect();
+        if !demux_targets.contains(&join) {
+            demux_targets.push(join);
+        }
+        demux_targets.sort_unstable_by_key(|b| b.0);
+
+        // Per demux target: its phi instructions and their RVSDG types.
+        let target_phis: Vec<Vec<&Phi>> = demux_targets
+            .iter()
+            .map(|&t| {
+                phi_instructions_at(&self.fn_ctx.func.basic_blocks[t.0 as usize])
+                    .into_iter()
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let mut target_phi_types: Vec<Vec<TypeRef>> = Vec::with_capacity(target_phis.len());
+        for phis in &target_phis {
+            let mut tys = Vec::with_capacity(phis.len());
+            for phi in phis {
+                tys.push(
+                    self.rb
+                        .graph
+                        .types
+                        .convert_type_ref(&phi.to_type, self.fn_ctx.llvm_mod)?,
+                );
+            }
+            target_phi_types.push(tys);
+        }
+
+        // ---- Phase 1: γ_outer -------------------------------------------
+        // Live-ins over the arms walked to the continuation-point boundary.
+        let arm_blocks: Vec<FxHashSet<BasicBlockId>> = arm_targets
+            .iter()
+            .map(|&t| self.collect_walked_blocks(t, &demux_targets))
+            .collect();
+        let combined: SmallVec<[BasicBlockId; 8]> =
+            arm_blocks.iter().flat_map(|s| s.iter().copied()).collect();
+        let all_target_phis: Vec<&Phi> = target_phis.iter().flatten().copied().collect();
+        let (live_in_names, live_ins) =
+            self.compute_arm_live_ins(&combined, &all_target_phis, Some(head));
+
+        let fn_ctx = self.fn_ctx;
+        let demux_targets_slice: &[BasicBlockId] = &demux_targets;
+        let target_phis_ref: &[Vec<&Phi>] = &target_phis;
+        let target_phi_types_ref: &[Vec<TypeRef>] = &target_phi_types;
+        let live_in_names_ref: &[Name] = &live_in_names;
+
+        let outer_closures: Vec<_> = arm_targets
+            .iter()
+            .map(|&target| {
+                move |rb: &mut RegionBuilder| -> color_eyre::Result<BranchResult> {
+                    let mut name_to_value = FxHashMap::default();
+                    for (i, name) in live_in_names_ref.iter().enumerate() {
+                        name_to_value.insert(name.clone(), rb.param(i as u32));
+                    }
+                    let mut arm = RegionLowerer::new_child(rb, fn_ctx, name_to_value);
+                    let (arm_state, exit_pred, reached) = match arm.lower_region(
+                        state,
+                        target,
+                        demux_targets_slice,
+                        None,
+                        Some(head),
+                    )? {
+                        RegionExit::AtBoundary {
+                            state,
+                            exit_pred,
+                            reached,
+                        } => (state, exit_pred, reached),
+                        RegionExit::Returned { .. } => {
+                            return Err(color_eyre::eyre::eyre!(
+                                "early return inside a multi-continuation branch arm"
+                            ));
+                        }
+                    };
+                    let reached = reached.ok_or_else(|| {
+                        color_eyre::eyre::eyre!(
+                            "multi-continuation branch arm reached a dead end \
+                             (unreachable) before any continuation point"
+                        )
+                    })?;
+                    let k = demux_targets_slice
+                        .iter()
+                        .position(|&t| t == reached)
+                        .ok_or_else(|| {
+                            color_eyre::eyre::eyre!(
+                                "branch arm reached {} which is not a continuation point",
+                                reached.0
+                            )
+                        })?;
+                    // Output: p, then each target's phi values (the reached
+                    // target resolved from this arm, the rest poison).
+                    let mut values = Vec::new();
+                    values.push(arm.rb.constant(I32, ConstValue::Int(k as i64)));
+                    for (i, phis) in target_phis_ref.iter().enumerate() {
+                        if i == k {
+                            values.extend(arm.arm_phi_contributions(phis, exit_pred)?);
+                        } else {
+                            for &ty in &target_phi_types_ref[i] {
+                                values.push(arm.rb.constant(ty, ConstValue::Poison));
+                            }
+                        }
+                    }
+                    Ok(BranchResult {
+                        state: arm_state,
+                        values,
+                    })
+                }
+            })
+            .collect();
+        let outer_refs = as_branch_refs(&outer_closures);
+        let outer = self.rb.gamma_n(predicate, state, &live_ins, &outer_refs)?;
+
+        // Captured outputs: result(0) = p; result(1..) = per-target phis.
+        let p = outer.result(0);
+        // Offset (into the captured-phi inputs, i.e. excluding p) where each
+        // target's phi block begins.
+        let mut phi_offset: Vec<usize> = Vec::with_capacity(target_phis.len());
+        let mut acc = 0usize;
+        for phis in &target_phis {
+            phi_offset.push(acc);
+            acc += phis.len();
+        }
+        let captured_count = acc;
+        let captured: Vec<ValueId> = (0..captured_count)
+            .map(|i| outer.result(1 + i as u16))
+            .collect();
+
+        // ---- Phase 2: γ_demux -------------------------------------------
+        // The final join's phis (the demux's uniform result shape).
+        let join_phis = phi_instructions_at(&self.fn_ctx.func.basic_blocks[join.0 as usize]);
+        // Tail live-ins: outer-scope values used walking the demux targets to
+        // the join. (Captured phis are bound per-arm, not live-ins.)
+        let tail_blocks: Vec<FxHashSet<BasicBlockId>> = demux_targets
+            .iter()
+            .map(|&t| self.collect_walked_blocks(t, &[join]))
+            .collect();
+        let combined_tail: SmallVec<[BasicBlockId; 8]> =
+            tail_blocks.iter().flat_map(|s| s.iter().copied()).collect();
+        let (tail_names, tail_live_ins) =
+            self.compute_arm_live_ins(&combined_tail, &join_phis, None);
+
+        // γ_demux inputs: captured phis first, then the tail live-ins.
+        let mut demux_inputs: Vec<ValueId> = captured.clone();
+        demux_inputs.extend_from_slice(&tail_live_ins);
+
+        let join_phis_ref: &[&Phi] = &join_phis;
+        let tail_names_ref: &[Name] = &tail_names;
+        let phi_offset_ref: &[usize] = &phi_offset;
+
+        let demux_closures: Vec<_> = demux_targets
+            .iter()
+            .enumerate()
+            .map(|(target_index, &target)| {
+                move |rb: &mut RegionBuilder| -> color_eyre::Result<BranchResult> {
+                    let mut name_to_value = FxHashMap::default();
+                    // Bind this target's phis from the captured γ_outer outputs.
+                    let base = phi_offset_ref[target_index];
+                    for (j, phi) in target_phis_ref[target_index].iter().enumerate() {
+                        name_to_value.insert(phi.dest.clone(), rb.param((base + j) as u32));
+                    }
+                    // Bind the tail live-ins (params after the captured block).
+                    for (j, name) in tail_names_ref.iter().enumerate() {
+                        name_to_value.insert(name.clone(), rb.param((captured_count + j) as u32));
+                    }
+                    let mut arm = RegionLowerer::new_child(rb, fn_ctx, name_to_value);
+
+                    let values = if target == join {
+                        // Empty demux arm: already at the join; its phis are
+                        // the ones just bound from the captured outputs.
+                        arm.arm_phi_contributions(join_phis_ref, None)?
+                    } else {
+                        let (_, exit_pred) =
+                            match arm.lower_region(state, target, &[join], None, None)? {
+                                RegionExit::AtBoundary {
+                                    state, exit_pred, ..
+                                } => (state, exit_pred),
+                                RegionExit::Returned { .. } => {
+                                    return Err(color_eyre::eyre::eyre!(
+                                        "early return inside a continuation-demux arm"
+                                    ));
+                                }
+                            };
+                        arm.arm_phi_contributions(join_phis_ref, exit_pred)?
+                    };
+                    // `BranchResult.state` is ignored by `gamma_n` (it only
+                    // reads `values`); the arm's internal state edge is
+                    // threaded by the backend, which serialises each region's
+                    // nodes in insertion order, so a load/store the arm's tail
+                    // walk emitted is ordered correctly within the arm. The
+                    // `outer.state` here is a placeholder, consistent with the
+                    // single-join path's `lower_arm`.
+                    Ok(BranchResult {
+                        state: outer.state,
+                        values,
+                    })
+                }
+            })
+            .collect();
+        let demux_refs = as_branch_refs(&demux_closures);
+        let demux = self
+            .rb
+            .gamma_n(p, outer.state, &demux_inputs, &demux_refs)?;
+
+        // Bind the join's phis from the demux outputs; the caller resumes
+        // at the join.
+        for (i, phi) in join_phis.iter().enumerate() {
+            self.name_to_value
+                .insert(phi.dest.clone(), demux.result(i as u16));
+        }
+        Ok(demux.state)
     }
 
     /// Scan a set of arm blocks to find SSA values that are USED inside
@@ -215,10 +480,19 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
     /// For a switch with N arms, the caller flattens all arm-block sets
     /// into a single slice before calling; allocation cost is one short
     /// Vec per gamma.
+    ///
+    /// `pass_through_pred` is the head/branch block when this is a branch
+    /// gamma (and `None` for the loop exit-dispatch path). An empty arm
+    /// (a fan-out arc going straight to the join, e.g. the `else` of a
+    /// short-circuit `&&`/`||`) contributes its join-phi value along the
+    /// `head -> join` edge. That value is defined in the outer scope, so
+    /// it must be threaded in as a live-in here; the arm then echoes it
+    /// straight back out as its result.
     pub(super) fn compute_arm_live_ins(
         &self,
         arm_block_set: &[BasicBlockId],
         phis_at_join: &[&Phi],
+        pass_through_pred: Option<BasicBlockId>,
     ) -> (Vec<Name>, Vec<ValueId>) {
         // Pass 1: names defined inside the arms.
         let mut defined_inside: FxHashSet<&Name> = FxHashSet::default();
@@ -265,7 +539,10 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
                 let Some(&pred_id) = self.fn_ctx.bb_mapper.get(pred_name) else {
                     continue;
                 };
-                if !arm_block_set.contains(&pred_id) {
+                // Accept operands flowing in from an arm block (normal
+                // arms) or directly along the head -> join edge (the
+                // empty pass-through arm).
+                if !arm_block_set.contains(&pred_id) && Some(pred_id) != pass_through_pred {
                     continue;
                 }
                 let Operand::LocalOperand { name, .. } = op else {
@@ -284,63 +561,104 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
         (names, values)
     }
 
-    /// Blocks belonging to one gamma arm: those dominated by `arm_root`
-    /// but not by `join`. The result is the set of blocks the arm's
-    /// region will own.
-    pub(super) fn collect_arm_blocks(
+    /// The set of blocks a gamma arm actually *walks*: every block
+    /// reachable from `arm_root` by following CFG successors, stopping at
+    /// (and not crossing) `boundary` and the synthetic function exit.
+    ///
+    /// This is the region the arm's `lower_region` covers, and per the
+    /// paper's BUILD_RVSDG* (§4, lines 458-461: a gamma takes "all
+    /// variables required in the subregions" as inputs) it is exactly the
+    /// set whose SSA uses-minus-defs are the arm's live-ins.
+    ///
+    /// It deliberately differs from the dominator set used previously: a
+    /// continuation block reached from this arm — a switch fall-through
+    /// tail, a cross edge — is dominated by neither arm yet IS walked, so
+    /// its outer-scope uses must be threaded in as gamma inputs. Scanning
+    /// only the dominator set omitted those, which is the use-before-def
+    /// defect (`instructions.rs:898`). Because `join` post-dominates
+    /// `arm_root` in a well-formed branch, this reachability is exactly the
+    /// arm region; SSA dominance then guarantees a value defined inside the
+    /// region is defined before any use, so the caller's uses-minus-defs
+    /// scan is precise.
+    ///
+    /// Reachability is bounded by the region (typically 1-8 blocks),
+    /// cheaper than the previous full-function dominator scan.
+    pub(super) fn collect_walked_blocks(
         &self,
         arm_root: BasicBlockId,
-        join: BasicBlockId,
+        boundary: &[BasicBlockId],
     ) -> FxHashSet<BasicBlockId> {
-        let mut res = FxHashSet::default();
-        for i in 0..self.fn_ctx.func.basic_blocks.len() {
-            let bb_id = BasicBlockId(i as u32);
-            if dominates(arm_root, bb_id, self.fn_ctx.immediate_dominators)
-                && !dominates(join, bb_id, self.fn_ctx.immediate_dominators)
-            {
-                res.insert(bb_id);
+        let mut set = FxHashSet::default();
+        let exit = self.fn_ctx.exit_block_id;
+        let stops = |b: BasicBlockId| b == exit || boundary.contains(&b);
+        // An empty arm (fan-out arc straight to a boundary) walks nothing.
+        let mut stack: SmallVec<[BasicBlockId; 8]> = SmallVec::new();
+        if !stops(arm_root) {
+            stack.push(arm_root);
+        }
+        while let Some(bb) = stack.pop() {
+            if !set.insert(bb) {
+                continue;
+            }
+            for &succ in self.fn_ctx.bb_mapper.outputs(bb) {
+                if !stops(succ) && !set.contains(&succ) {
+                    stack.push(succ);
+                }
             }
         }
-        res
+        set
     }
 
-    /// For each phi at the join, find the operand contributed by *this*
-    /// arm and resolve it in the arm's region scope.
+    /// For each phi at the join, resolve the value *this* arm contributes,
+    /// in the arm's region scope.
     ///
-    /// A phi's `incoming_values` is a `Vec<(Operand, Name)>` where the
-    /// `Name` is the predecessor block. We pick the entry whose
-    /// predecessor block lies in `arm_blocks` (looked up via the
-    /// function's `BasicBlockMapper`).
+    /// Every arm must produce exactly one value per join phi. The value is
+    /// found, in order:
     ///
-    /// Returns a `Vec<ValueId>` aligned with `phis_at_join`: index `i`
-    /// is this arm's contribution to the i-th phi. The caller binds
-    /// these as the gamma node's arm results.
+    /// 1. If the arm already bound the phi's destination — an inner gamma
+    ///    whose join coincides with this one (e.g. a nested if/else whose
+    ///    merge is the same block) leaves the resolved value in
+    ///    `name_to_value`. Use it directly.
+    /// 2. Otherwise the arm reached the join linearly from `exit_pred`
+    ///    (the block its walk last stepped through, reported by
+    ///    `lower_region`). Pick the phi incoming for that predecessor and
+    ///    resolve it in the arm's scope. This covers the normal single
+    ///    block arm, an empty pass-through arm (where `exit_pred` is the
+    ///    branching head), and a shared continuation block reached via a
+    ///    fall-through (where `exit_pred` is that shared block).
     ///
-    /// Errors if any phi has no incoming pair whose predecessor sits in
-    /// this arm. That indicates malformed IR or a stale `arm_blocks`;
-    /// surface it loudly rather than producing an incomplete RVSDG.
+    /// Errors if neither resolves — a malformed phi or a shape that still
+    /// needs the not-yet-built multi-continuation `p` dispatch.
     pub(super) fn arm_phi_contributions(
         &mut self,
         phis_at_join: &[&Phi],
-        arm_blocks: &FxHashSet<BasicBlockId>,
+        exit_pred: Option<BasicBlockId>,
     ) -> color_eyre::Result<Vec<ValueId>> {
         phis_at_join
             .iter()
             .map(|phi| {
-                let (operand, _pred) =
-                    phi_incoming_from(phi, self.fn_ctx.bb_mapper, |id| arm_blocks.contains(&id))
-                        .ok_or_else(|| {
-                            color_eyre::eyre::eyre!(
-                                "phi {:?} at join has no incoming value from this arm \
-                                 (predecessors in phi: {:?})",
-                                phi.dest,
-                                phi.incoming_values
-                                    .iter()
-                                    .map(|(_, p)| p)
-                                    .collect::<Vec<_>>(),
-                            )
-                        })?;
-                self.operand(operand)
+                // 1. Already bound by an inner gamma sharing this join.
+                if let Some(&v) = self.name_to_value.get(&phi.dest) {
+                    return Ok(v);
+                }
+                // 2. The incoming for the predecessor the arm exited from.
+                if let Some(pred) = exit_pred {
+                    if let Some((operand, _)) =
+                        phi_incoming_from(phi, self.fn_ctx.bb_mapper, |id| id == pred)
+                    {
+                        return self.operand(operand);
+                    }
+                }
+                Err(color_eyre::eyre::eyre!(
+                    "phi {:?} at join has no incoming value from this arm \
+                     (exit predecessor: {:?}, predecessors in phi: {:?})",
+                    phi.dest,
+                    exit_pred,
+                    phi.incoming_values
+                        .iter()
+                        .map(|(_, p)| p)
+                        .collect::<Vec<_>>(),
+                ))
             })
             .collect()
     }
@@ -364,11 +682,11 @@ fn lower_arm(
     rb: &mut RegionBuilder,
     fn_ctx: &FnCtx,
     state: State,
-    phis_at_join: &[&Phi],
     arm_root: BasicBlockId,
-    join: BasicBlockId,
-    arm_blocks: &FxHashSet<BasicBlockId>,
+    boundary: &[BasicBlockId],
     live_in_names: &[Name],
+    head: BasicBlockId,
+    leaf: &Leaf,
 ) -> color_eyre::Result<BranchResult> {
     let mut name_to_value = FxHashMap::default();
     for (i, name) in live_in_names.iter().enumerate() {
@@ -377,18 +695,66 @@ fn lower_arm(
 
     let mut arm = RegionLowerer::new_child(rb, fn_ctx, name_to_value);
 
-    let state = match arm.lower_region(state, arm_root, Some(join), None)? {
-        RegionExit::AtBoundary(state) => state,
-        RegionExit::Returned { .. } => {
-            return Err(color_eyre::eyre::eyre!(
-                "early returns are not supported within gamma-arm lowering"
-            ));
-        }
-    };
+    // Seed the walk's predecessor with the branching head so that an
+    // empty arm (arm_root in `boundary`) reports the head as its exit
+    // predecessor, and a shared first block resolves its phis path-aware.
+    let (state, exit_pred, reached) =
+        match arm.lower_region(state, arm_root, boundary, None, Some(head))? {
+            RegionExit::AtBoundary {
+                state,
+                exit_pred,
+                reached,
+            } => (state, exit_pred, reached),
+            RegionExit::Returned { .. } => {
+                return Err(color_eyre::eyre::eyre!(
+                    "early returns are not supported within gamma-arm lowering"
+                ));
+            }
+        };
 
-    let values = arm.arm_phi_contributions(phis_at_join, arm_blocks)?;
+    let values = leaf.produce(&mut arm, reached, exit_pred)?;
 
     Ok(BranchResult { state, values })
+}
+
+/// What a gamma arm produces when its walk reaches a region boundary — the
+/// arm's per-result-slot values. This is the one knob that lets the
+/// single-join γ, the `p`-demux, and the loop body share a single lowering
+/// primitive while differing only in the terminal computation.
+pub(super) enum Leaf<'a> {
+    /// Acyclic branch: the result slots are the join block's phis, resolved
+    /// from the predecessor the arm exited through.
+    JoinPhis(&'a [&'a Phi]),
+}
+
+impl Leaf<'_> {
+    /// Produce the arm's result vector for a path that reached boundary
+    /// block `reached` (via predecessor `exit_pred`).
+    fn produce(
+        &self,
+        arm: &mut RegionLowerer,
+        _reached: Option<BasicBlockId>,
+        exit_pred: Option<BasicBlockId>,
+    ) -> color_eyre::Result<Vec<ValueId>> {
+        match self {
+            Leaf::JoinPhis(phis) => arm.arm_phi_contributions(phis, exit_pred),
+        }
+    }
+}
+
+/// Coerce a slice of owned branch closures into the `&dyn Fn` trait-object
+/// references `RegionBuilder::gamma_n` expects. Centralises the coercion
+/// repeated at every gamma-construction site.
+pub(super) fn as_branch_refs<F>(
+    closures: &[F],
+) -> Vec<&dyn Fn(&mut RegionBuilder) -> color_eyre::Result<BranchResult>>
+where
+    F: Fn(&mut RegionBuilder) -> color_eyre::Result<BranchResult>,
+{
+    closures
+        .iter()
+        .map(|c| c as &dyn Fn(&mut RegionBuilder) -> color_eyre::Result<BranchResult>)
+        .collect()
 }
 
 #[cfg(test)]
@@ -401,14 +767,14 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     // ------------------------------------------------------------------------
-    // collect_arm_blocks
+    // collect_walked_blocks
     // ------------------------------------------------------------------------
 
     #[test]
-    fn collect_arm_blocks_simple_diamond() {
+    fn collect_walked_blocks_simple_diamond() {
         // entry -> t -> j
         //       -> f -> j
-        // Each arm is a single block dominated by its arm root.
+        // Each arm is a single block; the walk stops at the join.
         let test_fn = TestFn::from_ir(
             r#"
 define i32 @f(i32 %a, i32 %b, i1 %c) {
@@ -429,22 +795,22 @@ j:
         let j = test_fn.block("j");
 
         test_fn.with_lowerer(FxHashMap::default(), |lowerer| {
-            let true_arm = lowerer.collect_arm_blocks(t, j);
+            let true_arm = lowerer.collect_walked_blocks(t, &[j]);
             assert_eq!(true_arm.len(), 1);
             assert!(true_arm.contains(&t));
+            assert!(!true_arm.contains(&j), "join must not be in the arm");
 
-            let false_arm = lowerer.collect_arm_blocks(f, j);
+            let false_arm = lowerer.collect_walked_blocks(f, &[j]);
             assert_eq!(false_arm.len(), 1);
             assert!(false_arm.contains(&f));
         });
     }
 
     #[test]
-    fn collect_arm_blocks_includes_dominated_blocks() {
+    fn collect_walked_blocks_includes_chain() {
         // entry -> t -> mid -> j
         //       -> f -> j
-        // The true arm spans both `t` and `mid` (both dominated by t
-        // and not by j).
+        // The true arm spans both `t` and `mid` (reachable before the join).
         let test_fn = TestFn::from_ir(
             r#"
 define i32 @f(i32 %a, i32 %b, i1 %c) {
@@ -468,7 +834,7 @@ j:
         let j = test_fn.block("j");
 
         test_fn.with_lowerer(FxHashMap::default(), |lowerer| {
-            let true_arm = lowerer.collect_arm_blocks(t, j);
+            let true_arm = lowerer.collect_walked_blocks(t, &[j]);
             assert_eq!(true_arm.len(), 2);
             assert!(true_arm.contains(&t));
             assert!(true_arm.contains(&mid));
@@ -478,10 +844,10 @@ j:
     }
 
     #[test]
-    fn collect_arm_blocks_excludes_blocks_past_join() {
+    fn collect_walked_blocks_excludes_blocks_past_join() {
         // entry -> t -> j -> after
         //       -> f -> j
-        // `after` is past the join; it must not appear in either arm.
+        // `after` is past the join; the walk stops at the join.
         let test_fn = TestFn::from_ir(
             r#"
 define i32 @f(i32 %a, i32 %b, i1 %c) {
@@ -504,10 +870,85 @@ after:
         let after = test_fn.block("after");
 
         test_fn.with_lowerer(FxHashMap::default(), |lowerer| {
-            let true_arm = lowerer.collect_arm_blocks(t, j);
+            let true_arm = lowerer.collect_walked_blocks(t, &[j]);
             assert!(
                 !true_arm.contains(&after),
                 "post-join block must not be in arm"
+            );
+        });
+    }
+
+    #[test]
+    fn collect_walked_blocks_includes_shared_continuation() {
+        // entry -> t ------> shared -> j
+        //       -> f -> shared
+        // `shared` is reached from BOTH arms, so it is dominated by neither
+        // (its idom is `entry`). The old dominator-set collection excluded
+        // it from both arms even though both walk it — the use-before-def
+        // bug. Reachability must include it in each arm that reaches it.
+        let test_fn = TestFn::from_ir(
+            r#"
+define i32 @f(i32 %a, i32 %b, i1 %c) {
+entry:
+  br i1 %c, label %t, label %f
+t:
+  br label %shared
+f:
+  br label %shared
+shared:
+  %s = phi i32 [ %a, %t ], [ %b, %f ]
+  br label %j
+j:
+  ret i32 %s
+}
+"#,
+        );
+        let t = test_fn.block("t");
+        let f = test_fn.block("f");
+        let shared = test_fn.block("shared");
+        let j = test_fn.block("j");
+
+        test_fn.with_lowerer(FxHashMap::default(), |lowerer| {
+            let true_arm = lowerer.collect_walked_blocks(t, &[j]);
+            assert!(true_arm.contains(&t));
+            assert!(
+                true_arm.contains(&shared),
+                "shared continuation reached from this arm must be walked"
+            );
+
+            let false_arm = lowerer.collect_walked_blocks(f, &[j]);
+            assert!(false_arm.contains(&f));
+            assert!(
+                false_arm.contains(&shared),
+                "shared continuation reached from this arm must be walked"
+            );
+        });
+    }
+
+    #[test]
+    fn collect_walked_blocks_empty_arm_is_empty() {
+        // entry -> j (true arm goes straight to the join: an empty arm)
+        //       -> f -> j
+        let test_fn = TestFn::from_ir(
+            r#"
+define i32 @f(i32 %a, i32 %b, i1 %c) {
+entry:
+  br i1 %c, label %j, label %f
+f:
+  br label %j
+j:
+  %r = phi i32 [ %a, %entry ], [ %b, %f ]
+  ret i32 %r
+}
+"#,
+        );
+        let j = test_fn.block("j");
+
+        test_fn.with_lowerer(FxHashMap::default(), |lowerer| {
+            let empty_arm = lowerer.collect_walked_blocks(j, &[j]);
+            assert!(
+                empty_arm.is_empty(),
+                "an arm that is the join walks nothing"
             );
         });
     }
@@ -548,7 +989,7 @@ j:
         name_to_value.insert(local_name("b"), ValueId(101));
 
         test_fn.with_lowerer(name_to_value, |lowerer| {
-            let (names, values) = lowerer.compute_arm_live_ins(&arm_blocks, &phis);
+            let (names, values) = lowerer.compute_arm_live_ins(&arm_blocks, &phis, None);
             assert!(names.contains(&local_name("a")), "%a should be a live-in");
             assert!(names.contains(&local_name("b")), "%b should be a live-in");
             assert_eq!(names.len(), values.len());
@@ -589,7 +1030,7 @@ j:
         name_to_value.insert(local_name("a"), ValueId(100));
 
         test_fn.with_lowerer(name_to_value, |lowerer| {
-            let (names, _) = lowerer.compute_arm_live_ins(&arm_blocks, &phis);
+            let (names, _) = lowerer.compute_arm_live_ins(&arm_blocks, &phis, None);
             assert!(
                 names.contains(&local_name("a")),
                 "param %a must be a live-in"
@@ -636,7 +1077,7 @@ j:
         name_to_value.insert(local_name("a"), ValueId(100));
 
         test_fn.with_lowerer(name_to_value, |lowerer| {
-            let (names, values) = lowerer.compute_arm_live_ins(&arm_blocks, &phis);
+            let (names, values) = lowerer.compute_arm_live_ins(&arm_blocks, &phis, None);
             assert_eq!(names, vec![local_name("a")]);
             assert_eq!(values, vec![ValueId(100)]);
         });
@@ -670,7 +1111,7 @@ j:
         let arm_blocks = vec![t, f];
 
         test_fn.with_lowerer(FxHashMap::default(), |lowerer| {
-            let (names, values) = lowerer.compute_arm_live_ins(&arm_blocks, &phis);
+            let (names, values) = lowerer.compute_arm_live_ins(&arm_blocks, &phis, None);
             assert!(names.is_empty());
             assert!(values.is_empty());
         });
@@ -709,7 +1150,7 @@ j:
         name_to_value.insert(local_name("x"), ValueId(200));
 
         test_fn.with_lowerer(name_to_value, |lowerer| {
-            let (names, _) = lowerer.compute_arm_live_ins(&arm_blocks, &phis);
+            let (names, _) = lowerer.compute_arm_live_ins(&arm_blocks, &phis, None);
             assert!(
                 names.contains(&local_name("x")),
                 "%x used inside arm is a live-in"
@@ -756,7 +1197,7 @@ j:
         name_to_value.insert(local_name("a"), ValueId(100));
 
         test_fn.with_lowerer(name_to_value, |lowerer| {
-            let (names, _) = lowerer.compute_arm_live_ins(&arm_blocks, &phis);
+            let (names, _) = lowerer.compute_arm_live_ins(&arm_blocks, &phis, None);
             assert_eq!(
                 names.iter().filter(|n| **n == local_name("a")).count(),
                 1,

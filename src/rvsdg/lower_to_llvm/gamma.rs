@@ -40,29 +40,38 @@ impl RVSDGMod {
             })
             .collect();
 
-        // Emit the branch from the current block
-        if region_bbs.len() == 2 {
+        // Emit the branch from the current block. The choice of branch vs
+        // switch is driven by the condition TYPE, not the arm count: an
+        // `i1` condition is a two-way predicate (true -> region 0, false ->
+        // region 1), while any wider integer is an arm INDEX (value k
+        // selects region k, with region 0 as the switch default). Arm count
+        // alone can't disambiguate — a 2-arm gamma can come from a switch
+        // with one case plus default, whose selector is an i32 index, not a
+        // bool.
+        let cond_int = cond.into_int_value();
+        if cond_int.get_type().get_bit_width() == 1 {
+            debug_assert_eq!(
+                region_bbs.len(),
+                2,
+                "an i1-conditioned gamma must have exactly two regions"
+            );
             llvm_builder.builder.build_conditional_branch(
-                cond.into_int_value(),
+                cond_int,
                 region_bbs[0],
                 region_bbs[1],
             )?;
         } else {
-            // the first block is skipped from the cases and is placed as the default
+            // The first block is the switch default; cases 1..N map value
+            // `i` to region `i`.
             let cases: Vec<_> = region_bbs
                 .iter()
                 .enumerate()
                 .skip(1)
-                .map(|(i, &bb)| {
-                    (
-                        cond.get_type().into_int_type().const_int(i as u64, false),
-                        bb,
-                    )
-                })
+                .map(|(i, &bb)| (cond_int.get_type().const_int(i as u64, false), bb))
                 .collect();
             llvm_builder
                 .builder
-                .build_switch(cond.into_int_value(), region_bbs[0], &cases)?;
+                .build_switch(cond_int, region_bbs[0], &cases)?;
         }
 
         // Lower each region, collecting (result_values, basic_block) per region

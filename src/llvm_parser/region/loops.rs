@@ -26,7 +26,9 @@
 //! Multi-back-edge components are rejected until a future phase adds
 //! the demand-analysis that produces the dedicated latch transform.
 
-use llvm_ir::{Instruction, Name, Operand, instruction::Phi, terminator::CondBr};
+use llvm_ir::{
+    Instruction, Name, Operand, TypeRef as LLVMTypeRef, instruction::Phi, terminator::CondBr,
+};
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 
@@ -34,18 +36,19 @@ use crate::{
     llvm_parser::{
         FnCtx,
         block_mapper::BasicBlockId,
+        dominance::dominates,
         instructions::{
-            RegionLowerer, for_each_operand, for_each_terminator_operand,
-            instruction_dest,
+            RegionLowerer, for_each_operand, for_each_terminator_operand, instruction_dest,
         },
         region::{
             RegionExit,
+            branches::as_branch_refs,
             phi::{phi_incoming_from, phi_instructions_at},
         },
         scc_tree::SccTreeNodeId,
     },
     rvsdg::{
-        ConstValue, ICmpPred, State, ValueId,
+        ConstValue, State, ValueId,
         builder::{BranchResult, LoopResult, RegionBuilder},
         types::{BOOL, ScalarType, TypeRef},
     },
@@ -156,8 +159,7 @@ pub(super) struct LoopLowerCtx<'m> {
     /// holds `(lcssa_dest_name, binding)` pairs for the loop-closed
     /// phis at that exit target whose incoming comes from the
     /// corresponding exit arc's source block.
-    pub(super) lcssa_bindings_per_exit:
-        SmallVec<[SmallVec<[(Name, LcssaBinding); 2]>; 4]>,
+    pub(super) lcssa_bindings_per_exit: SmallVec<[SmallVec<[(Name, LcssaBinding); 2]>; 4]>,
 }
 
 impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
@@ -166,22 +168,29 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
     /// lowering at: either the single exit target (single-exit case)
     /// or the post-dominator join of all exit targets (multi-exit
     /// case).
+    ///
+    /// `entry` is the SCC entry vertex through which control arrived. For
+    /// a single-entry loop it equals the sole entry block; for a
+    /// multi-entry (irreducible) loop it selects which entry the theta's
+    /// `q` dispatch starts at this iteration.
     pub(super) fn lower_scc_as_theta(
         &mut self,
         state: State,
         scc_id: SccTreeNodeId,
+        entry: BasicBlockId,
     ) -> color_eyre::Result<(State, BasicBlockId)> {
         let arcs = &self.fn_ctx.scc_tree.arcs[scc_id.0 as usize];
         if arcs.entry_blocks.len() != 1 {
+            // Irreducible / multi-entry loop: lowered via the `q`
+            // entry-dispatch at the SCC's dispatch dominator
+            // (`lower_multi_entry_dispatch`), reached from `lower_region`
+            // before control ever arrives at an individual entry vertex.
+            // Reaching it here would mean the dispatch-dominator trigger
+            // was missed.
             bail!(
-                "multi-entry strongly connected component at block {} (entries: {:?}): \
-                 needs the not-yet-implemented auxiliary entry predicate transform \
-                 (Bahmann et al. 2015 section 4.1). Workaround in the meantime: \
-                 run the LLVM opt pass `fix-irreducible` upstream.",
-                arcs.entry_blocks
-                    .first()
-                    .map(|b| b.0)
-                    .unwrap_or(u32::MAX),
+                "multi-entry SCC reached at entry vertex {} without going \
+                 through its dispatch dominator (entries: {:?})",
+                entry.0,
                 arcs.entry_blocks.iter().map(|b| b.0).collect::<Vec<_>>(),
             );
         }
@@ -216,8 +225,7 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
         // typical loops have well under 16 blocks in the body and a
         // linear scan over a contiguous SmallVec slice beats a hash
         // lookup at that size (and avoids the per-SCC allocation).
-        let scc_body: &[BasicBlockId] =
-            &self.fn_ctx.scc_tree.blocks[scc_id.0 as usize];
+        let scc_body: &[BasicBlockId] = &self.fn_ctx.scc_tree.blocks[scc_id.0 as usize];
 
         let ctx = self.analyze_loop(scc_id, header, &exit_arcs)?;
 
@@ -231,8 +239,7 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
         // q's init value is arbitrary: every body iteration overwrites
         // it via the walker's leaf, and only the last iteration's value
         // is read at the post-theta dispatch.
-        let mut inits_with_q: SmallVec<[ValueId; 16]> =
-            ctx.inits.all().iter().copied().collect();
+        let mut inits_with_q: SmallVec<[ValueId; 16]> = ctx.inits.all().iter().copied().collect();
         let q_init = self.rb.const_i32(0);
         inits_with_q.push(q_init);
 
@@ -247,18 +254,25 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
             // resolve slot values by name without falling back to
             // `body.rb.param(slot_idx)` (which would break inside the
             // gamma arm regions the walker builds at every CondBr).
-            let cap = n_header + n_live_in + n_lcssa_extra
-                + ctx_ref.body_instr_count as usize;
-            let mut name_to_value =
-                FxHashMap::with_capacity_and_hasher(cap, Default::default());
+            let cap = n_header + n_live_in + n_lcssa_extra + ctx_ref.body_instr_count as usize;
+            let mut name_to_value = FxHashMap::with_capacity_and_hasher(cap, Default::default());
             for (i, info) in ctx_ref.header_phis.iter().enumerate() {
                 name_to_value.insert(info.phi.dest.clone(), body_rb.param(i as u32));
             }
             for (j, name) in ctx_ref.live_in_names.iter().enumerate() {
-                name_to_value
-                    .insert(name.clone(), body_rb.param((n_header + j) as u32));
+                name_to_value.insert(name.clone(), body_rb.param((n_header + j) as u32));
             }
             for (k, slot) in ctx_ref.lcssa_extras.iter().enumerate() {
+                // An extra slot that captures a header phi dest (the
+                // non-header sub-case-B binding) shares that name, which is
+                // already bound to its header param above. Don't overwrite
+                // it: the body must keep seeing the header value, and the
+                // leaf fills the extra slot from that same binding. Other
+                // extras name body-internal values not yet bound, so they
+                // bind normally.
+                if name_to_value.contains_key(&slot.name) {
+                    continue;
+                }
                 name_to_value.insert(
                     slot.name.clone(),
                     body_rb.param((n_header + n_live_in + k) as u32),
@@ -277,8 +291,7 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
 
             // Walk the body from the header. Returns a value tuple of
             // length `slot_count + 2`: slot values, then q, then r.
-            let (final_state, values) =
-                lower_body_walk(&mut body, state, header, None, &walker)?;
+            let (final_state, values) = lower_body_walk(&mut body, state, header, None, &walker)?;
 
             // Theta's next_vars include the q slot but not r (which is
             // the loop's repetition predicate, returned separately).
@@ -301,6 +314,16 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
         for (i, info) in ctx.header_phis.iter().enumerate() {
             self.name_to_value
                 .insert(info.phi.dest.clone(), theta_result.result(i as u16));
+        }
+
+        if n_exits == 0 {
+            // Infinite loop: the theta has no exit arc, so control never
+            // leaves it (the repetition predicate is always 1). Nothing
+            // after the loop is reachable, so resume at the synthetic
+            // function-exit block; the enclosing walk then terminates at
+            // its boundary and the post-loop code is left as the dead code
+            // it is (at runtime control never returns here).
+            return Ok((theta_result.state, self.fn_ctx.exit_block_id));
         }
 
         if n_exits == 1 {
@@ -342,11 +365,10 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
                         .map(|(name, binding)| {
                             let value = match binding {
                                 LcssaBinding::Constant(v) => *v,
-                                LcssaBinding::HeaderPhi { index } => {
-                                    theta_result.result(*index)
+                                LcssaBinding::HeaderPhi { index } => theta_result.result(*index),
+                                LcssaBinding::Extra { index } => {
+                                    theta_result.result(header_count + live_in_count + *index)
                                 }
-                                LcssaBinding::Extra { index } => theta_result
-                                    .result(header_count + live_in_count + *index),
                             };
                             (name.clone(), value)
                         })
@@ -362,6 +384,253 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
                 &lcssa_per_exit_resolved,
             )?;
 
+            Ok((state_after, join))
+        }
+    }
+
+    /// If `block` is the dispatch dominator of some multi-entry
+    /// (irreducible) SCC — the lowest block in the dominator tree that
+    /// dominates all the SCC's entry vertices — return that SCC. This is
+    /// where the `q` entry-dispatch is lowered: every path from here to the
+    /// loop reaches one of the entries, so `q` can be computed in the
+    /// branch structure between this block and the entries.
+    pub(super) fn multi_entry_dispatch_at(&self, block: BasicBlockId) -> Option<SccTreeNodeId> {
+        for i in 0..self.fn_ctx.scc_tree.len() {
+            let arcs = &self.fn_ctx.scc_tree.arcs[i];
+            if arcs.entry_blocks.len() <= 1 {
+                continue;
+            }
+            if self.entries_dispatch_dom(&arcs.entry_blocks) == Some(block) {
+                return Some(SccTreeNodeId(i as u32));
+            }
+        }
+        None
+    }
+
+    /// Lowest common ancestor of `entries` in the (forward) dominator tree:
+    /// the deepest block that dominates every entry vertex. Walks up the
+    /// first entry's immediate-dominator chain until it dominates them all.
+    fn entries_dispatch_dom(&self, entries: &[BasicBlockId]) -> Option<BasicBlockId> {
+        let idoms = self.fn_ctx.immediate_dominators;
+        let mut cand = *entries.first()?;
+        loop {
+            if entries.iter().all(|&e| dominates(cand, e, idoms)) {
+                return Some(cand);
+            }
+            match idoms[cand.0 as usize] {
+                Some(parent) if parent != cand => cand = parent,
+                _ => return None,
+            }
+        }
+    }
+
+    /// Lower an irreducible (multi-entry) strongly connected component
+    /// into a theta with an auxiliary `q` entry-dispatch — Bahmann et al.
+    /// 2015 §4.1's `q` predicate, built in-tree rather than via an upstream
+    /// `fix-irreducible` pass.
+    ///
+    /// Shape: the theta carries one loop_var per phi at every entry vertex,
+    /// plus a `q_entry` selector and a `q_exit` index. Each iteration the
+    /// body dispatches on `q_entry` (a γ-node) to the code of one entry
+    /// vertex, walks it until it reaches a repetition arc (an edge back to
+    /// some entry — sets `q_entry` to that entry and repeats) or an exit
+    /// arc (sets `q_exit` and stops). `entry` is the vertex control arrived
+    /// through, so its phis take their real preheader value and `q_entry`
+    /// starts there; the other entries' phi slots start at zero and are
+    /// only read after a repetition arc has written them.
+    ///
+    /// This first cut bails on shapes it doesn't yet model: a nested inner
+    /// SCC, a `switch`/`return` inside an entry's region, or a loop-closed
+    /// value that is an entry phi (rather than a body-internal value or a
+    /// constant). Those fall back to an error rather than miscompiling.
+    pub(super) fn lower_multi_entry_dispatch(
+        &mut self,
+        state: State,
+        scc_id: SccTreeNodeId,
+        dispatch_dom: BasicBlockId,
+    ) -> color_eyre::Result<(State, BasicBlockId)> {
+        let arcs = self.fn_ctx.scc_tree.arcs[scc_id.0 as usize].clone();
+        let entries: SmallVec<[BasicBlockId; 4]> = arcs.entry_blocks.clone();
+        let scc_body: SmallVec<[BasicBlockId; 8]> = self.fn_ctx.scc_tree.blocks[scc_id.0 as usize]
+            .iter()
+            .copied()
+            .collect();
+
+        // Entry phis: every phi at every entry vertex becomes a loop_var.
+        // Their init values come from the entry-region walk below.
+        let mut entry_phis: SmallVec<[EntryPhi<'m>; 4]> = SmallVec::new();
+        for &e in &entries {
+            let bb = &self.fn_ctx.func.basic_blocks[e.0 as usize];
+            for phi in phi_instructions_at(bb) {
+                entry_phis.push(EntryPhi { entry: e, phi });
+            }
+        }
+        let n_entry_phi = entry_phis.len();
+
+        // Loop-closed values: values defined inside the SCC and used
+        // outside it. Irreducible loops are left un-lcssa'd by the opt
+        // pipeline, so detect direct cross-boundary uses here. Each becomes
+        // an extra loop_var threaded out and bound at its outer uses. The
+        // type comes straight off the using `LocalOperand`.
+        let closed_typed: Vec<(Name, LLVMTypeRef)> = {
+            let mut defined_inside: FxHashSet<&Name> = FxHashSet::default();
+            for &b in &scc_body {
+                for inst in &self.fn_ctx.func.basic_blocks[b.0 as usize].instrs {
+                    if let Some(d) = instruction_dest(inst) {
+                        defined_inside.insert(d);
+                    }
+                }
+            }
+            let mut out: Vec<(Name, LLVMTypeRef)> = Vec::new();
+            let mut seen: FxHashSet<Name> = FxHashSet::default();
+            for (i, bb) in self.fn_ctx.func.basic_blocks.iter().enumerate() {
+                if scc_body.contains(&BasicBlockId(i as u32)) {
+                    continue;
+                }
+                let mut visit = |op: &Operand| {
+                    if let Operand::LocalOperand { name, ty } = op {
+                        if defined_inside.contains(name) && seen.insert(name.clone()) {
+                            out.push((name.clone(), ty.clone()));
+                        }
+                    }
+                };
+                for inst in &bb.instrs {
+                    for_each_operand(inst, &mut visit);
+                }
+                for_each_terminator_operand(&bb.term, &mut visit);
+            }
+            out
+        };
+        // Extra loop_var per closed value; init is a placeholder (the slot
+        // is written on the exiting iteration's leaf).
+        let mut closed_extras: SmallVec<[Name; 4]> = SmallVec::new();
+        let mut closed_inits: SmallVec<[ValueId; 4]> = SmallVec::new();
+        for (name, llvm_ty) in &closed_typed {
+            let ty = self
+                .rb
+                .graph
+                .types
+                .convert_type_ref(llvm_ty, self.fn_ctx.llvm_mod)?;
+            closed_inits.push(self.zero_of(ty)?);
+            closed_extras.push(name.clone());
+        }
+        let n_closed = closed_extras.len();
+        let base = n_entry_phi + n_closed;
+
+        // Entry-region walk from the dispatch dominator: each path ends at
+        // a loop entry and yields (q, entry-phi inits); branches merge them
+        // with gamma nodes. This is the paper's §4.1 `q` assignment on the
+        // entry arcs, computed as a value rather than via CFG edits.
+        let (state, q_and_inits) = {
+            let ectx = EntryCtx {
+                entries: &entries,
+                entry_phis: &entry_phis,
+                scc_body: &scc_body,
+            };
+            entry_walk(self, state, dispatch_dom, None, &ectx)?
+        };
+        let q_init = q_and_inits[0];
+
+        // Theta inits: entry-phi inits (from the walk), then closed-value
+        // placeholders, then q_entry (= the dispatched q) and q_exit (0).
+        let mut inits: SmallVec<[ValueId; 16]> = q_and_inits[1..].iter().copied().collect();
+        inits.extend(closed_inits.iter().copied());
+        inits.push(q_init); // q_entry init
+        inits.push(self.rb.const_i32(0)); // q_exit init
+
+        let exit_arcs: SmallVec<[(BasicBlockId, BasicBlockId); 4]> =
+            arcs.exit_arcs.iter().copied().collect();
+
+        let fn_ctx = self.fn_ctx;
+        let entries_ref = &entries;
+        let scc_body_ref = &scc_body;
+        let entry_phis_ref = &entry_phis;
+        let closed_ref = &closed_extras;
+        let exit_arcs_ref = &exit_arcs;
+
+        let theta_result = self.rb.theta(state, &inits, |body_rb| {
+            // Seed loop-var params by name. Entry phi dests, then closed
+            // extras. q slots are read positionally, not by name.
+            let mut name_to_value = FxHashMap::default();
+            for (i, ep) in entry_phis_ref.iter().enumerate() {
+                name_to_value.insert(ep.phi.dest.clone(), body_rb.param(i as u32));
+            }
+            for (k, name) in closed_ref.iter().enumerate() {
+                name_to_value.insert(name.clone(), body_rb.param((n_entry_phi + k) as u32));
+            }
+            let q_entry = body_rb.param(base as u32);
+
+            let walker = MultiWalker {
+                entries: entries_ref,
+                scc_body: scc_body_ref,
+                entry_phis: entry_phis_ref,
+                closed: closed_ref,
+                exit_arcs: exit_arcs_ref,
+                base,
+            };
+
+            // Dispatch on q_entry to each entry's region. Each arm walks
+            // from one entry and produces the full leaf tuple
+            // [base..., q_entry', q_exit, r].
+            let snapshot: Vec<(Name, ValueId)> =
+                name_to_value.iter().map(|(n, &v)| (n.clone(), v)).collect();
+            let snapshot_ref = &snapshot;
+            let walker_ref = &walker;
+            let arm_closures: Vec<_> = entries_ref
+                .iter()
+                .map(|&entry| {
+                    move |arm_rb: &mut RegionBuilder| -> color_eyre::Result<BranchResult> {
+                        let mut n2v = FxHashMap::default();
+                        for (i, (name, _)) in snapshot_ref.iter().enumerate() {
+                            n2v.insert(name.clone(), arm_rb.param(i as u32));
+                        }
+                        let mut arm = RegionLowerer::new_child(arm_rb, fn_ctx, n2v);
+                        let (st, vals) = multi_walk(&mut arm, state, entry, None, walker_ref)?;
+                        Ok(BranchResult {
+                            state: st,
+                            values: vals,
+                        })
+                    }
+                })
+                .collect();
+            let branch_refs = as_branch_refs(&arm_closures);
+            let live_in_vals: Vec<ValueId> = snapshot.iter().map(|(_, v)| *v).collect();
+            let gamma = body_rb.gamma_n(q_entry, state, &live_in_vals, &branch_refs)?;
+
+            let total = base + 3; // base slots + q_entry + q_exit + r
+            let values: Vec<ValueId> = (0..total as u16).map(|i| gamma.result(i)).collect();
+            let next_vars: Vec<ValueId> = values[..base + 2].to_vec();
+            Ok(LoopResult {
+                condition: values[base + 2],
+                next_state: gamma.state,
+                next_vars,
+            })
+        })?;
+
+        // Bind loop-closed values to their theta projections for the outer
+        // scope.
+        for (k, name) in closed_extras.iter().enumerate() {
+            self.name_to_value
+                .insert(name.clone(), theta_result.result((n_entry_phi + k) as u16));
+        }
+
+        // Post-theta exit dispatch on q_exit.
+        let q_exit_value = theta_result.result((base + 1) as u16);
+        let exit_targets: SmallVec<[BasicBlockId; 4]> =
+            exit_arcs.iter().map(|&(_, dst)| dst).collect();
+        if exit_targets.len() == 1 {
+            Ok((theta_result.state, exit_targets[0]))
+        } else {
+            let join = self.compute_exit_targets_join(&exit_targets)?;
+            let empty: Vec<Vec<(Name, ValueId)>> =
+                exit_targets.iter().map(|_| Vec::new()).collect();
+            let state_after = self.lower_exit_dispatch(
+                theta_result.state,
+                q_exit_value,
+                &exit_targets,
+                join,
+                &empty,
+            )?;
             Ok((state_after, join))
         }
     }
@@ -384,8 +653,24 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
         &self,
         exit_targets: &[BasicBlockId],
     ) -> color_eyre::Result<BasicBlockId> {
-        let mut join = exit_targets[0];
-        for &target in &exit_targets[1..] {
+        // Only exit targets that can reach the function exit have a
+        // continuation to reconverge at. An exit-unreachable target — one
+        // that traps (`unreachable`) or otherwise never returns, so it has
+        // no post-dominator — has no continuation, so it is excluded from
+        // the join: the dispatch still routes to it, but it need not meet
+        // the others. Without this, a returning exit and a trapping exit
+        // share no post-dominator and `post_dominator_lca` bails.
+        let mut reachable = exit_targets
+            .iter()
+            .copied()
+            .filter(|&t| self.fn_ctx.post_immediate_dominators[t.0 as usize].is_some());
+        let Some(first) = reachable.next() else {
+            // Every exit traps; the loop has no live continuation. Resume
+            // at the synthetic function exit (the resume point is dead).
+            return Ok(self.fn_ctx.exit_block_id);
+        };
+        let mut join = first;
+        for target in reachable {
             join = self.post_dominator_lca(join, target)?;
         }
         Ok(join)
@@ -448,12 +733,11 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
         join: BasicBlockId,
         lcssa_per_exit: &[Vec<(Name, ValueId)>],
     ) -> color_eyre::Result<State> {
-        let phis_at_join =
-            phi_instructions_at(&self.fn_ctx.func.basic_blocks[join.0 as usize]);
+        let phis_at_join = phi_instructions_at(&self.fn_ctx.func.basic_blocks[join.0 as usize]);
 
         let arm_blocks_per_arm: Vec<FxHashSet<BasicBlockId>> = exit_targets
             .iter()
-            .map(|&target| self.collect_arm_blocks(target, join))
+            .map(|&target| self.collect_walked_blocks(target, &[join]))
             .collect();
 
         let combined_arm_blocks: SmallVec<[BasicBlockId; 8]> = arm_blocks_per_arm
@@ -461,13 +745,12 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
             .flat_map(|set| set.iter().copied())
             .collect();
         let (standard_live_in_names, mut all_live_in_values) =
-            self.compute_arm_live_ins(&combined_arm_blocks, &phis_at_join);
+            self.compute_arm_live_ins(&combined_arm_blocks, &phis_at_join, None);
 
         // Per-exit loop-closed phi values become additional live-ins.
         // Record where each exit's block starts so the arm closure can
         // map names back to the right arm-param index.
-        let mut lcssa_start_per_exit: Vec<usize> =
-            Vec::with_capacity(exit_targets.len());
+        let mut lcssa_start_per_exit: Vec<usize> = Vec::with_capacity(exit_targets.len());
         for lcssas in lcssa_per_exit {
             lcssa_start_per_exit.push(all_live_in_values.len());
             for (_, value) in lcssas {
@@ -475,18 +758,41 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
             }
         }
 
+        // Types of the join phis, used to synthesise poison results for any
+        // exit-unreachable (trapping) arm so all arms share a signature.
+        let phi_types: Vec<TypeRef> = phis_at_join
+            .iter()
+            .map(|p| {
+                self.rb
+                    .graph
+                    .types
+                    .convert_type_ref(&p.to_type, self.fn_ctx.llvm_mod)
+            })
+            .collect::<color_eyre::Result<Vec<_>>>()?;
+
         let fn_ctx = self.fn_ctx;
         let phis_slice: &[&Phi] = &phis_at_join;
+        let phi_types_slice: &[TypeRef] = &phi_types;
         let standard_live_in_names_slice: &[Name] = &standard_live_in_names;
 
         let arm_closures: Vec<_> = exit_targets
             .iter()
-            .zip(arm_blocks_per_arm.iter())
             .enumerate()
-            .map(|(arm_idx, (&target, arm_blocks))| {
+            .map(|(arm_idx, &target)| {
                 let lcssa_start = lcssa_start_per_exit[arm_idx];
                 let lcssas_for_arm = &lcssa_per_exit[arm_idx];
                 move |rb: &mut RegionBuilder| -> color_eyre::Result<BranchResult> {
+                    // An exit-unreachable target traps and never reaches the
+                    // join. Emit poison for each join phi so this arm matches
+                    // the others' signature; it is dead at runtime (taking
+                    // this exit is undefined behaviour).
+                    if fn_ctx.post_immediate_dominators[target.0 as usize].is_none() {
+                        let values = phi_types_slice
+                            .iter()
+                            .map(|&ty| rb.constant(ty, ConstValue::Poison))
+                            .collect();
+                        return Ok(BranchResult { state, values });
+                    }
                     let mut name_to_value = FxHashMap::with_capacity_and_hasher(
                         standard_live_in_names_slice.len() + lcssas_for_arm.len() + 4,
                         Default::default(),
@@ -500,24 +806,26 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
                     // right input count) but their names are not
                     // referenced by this arm's walk.
                     for (i, (name, _)) in lcssas_for_arm.iter().enumerate() {
-                        name_to_value
-                            .insert(name.clone(), rb.param((lcssa_start + i) as u32));
+                        name_to_value.insert(name.clone(), rb.param((lcssa_start + i) as u32));
                     }
 
-                    let mut arm =
-                        RegionLowerer::new_child(rb, fn_ctx, name_to_value);
+                    let mut arm = RegionLowerer::new_child(rb, fn_ctx, name_to_value);
 
-                    let arm_state =
-                        match arm.lower_region(state, target, Some(join), None)? {
-                            RegionExit::AtBoundary(s) => s,
+                    // Exit-target loop-closed phis were already bound above,
+                    // so the walk starts with no linear predecessor.
+                    let (arm_state, exit_pred) =
+                        match arm.lower_region(state, target, &[join], None, None)? {
+                            RegionExit::AtBoundary {
+                                state: s,
+                                exit_pred,
+                                ..
+                            } => (s, exit_pred),
                             RegionExit::Returned { .. } => {
-                                return Err(eyre!(
-                                    "early return inside multi-exit dispatch arm"
-                                ));
+                                return Err(eyre!("early return inside multi-exit dispatch arm"));
                             }
                         };
 
-                    let values = arm.arm_phi_contributions(phis_slice, arm_blocks)?;
+                    let values = arm.arm_phi_contributions(phis_slice, exit_pred)?;
                     Ok(BranchResult {
                         state: arm_state,
                         values,
@@ -526,29 +834,14 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
             })
             .collect();
 
-        let branch_refs: Vec<&dyn Fn(&mut RegionBuilder) -> color_eyre::Result<BranchResult>> =
-            arm_closures
-                .iter()
-                .map(|c| {
-                    c as &dyn Fn(&mut RegionBuilder) -> color_eyre::Result<BranchResult>
-                })
-                .collect();
-        // gamma_n's LLVM lowering uses `build_conditional_branch` for
-        // exactly 2 arms (which requires an `i1` condition) and
-        // `build_switch` for 3+ arms (which accepts any integer type).
-        // q is an i32 carrying the exit-arc index. For the 2-arm case
-        // we synthesise a boolean by comparing q to 0 so that the
-        // q==0 path runs arm 0 (which corresponds to exit_arc 0) and
-        // the q!=0 path runs arm 1.
-        let result = if exit_targets.len() == 2 {
-            let zero = self.rb.const_i32(0);
-            let q_is_zero = self.rb.icmp(ICmpPred::Eq, q_value, zero);
-            self.rb
-                .gamma_n(q_is_zero, state, &all_live_in_values, &branch_refs)?
-        } else {
-            self.rb
-                .gamma_n(q_value, state, &all_live_in_values, &branch_refs)?
-        };
+        let branch_refs = as_branch_refs(&arm_closures);
+        // `q` is the i32 exit-arc index; the gamma routes value `k` to arm
+        // `k`. The backend lowers an integer-conditioned gamma to a switch
+        // (default = arm 0) regardless of arm count, so q feeds the gamma
+        // directly — no need to special-case two exits into a boolean.
+        let result = self
+            .rb
+            .gamma_n(q_value, state, &all_live_in_values, &branch_refs)?;
 
         for (i, phi) in phis_at_join.iter().enumerate() {
             self.name_to_value
@@ -624,9 +917,8 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
                     init = Some(self.operand(op)?);
                 }
             }
-            let init = init.ok_or_else(|| {
-                eyre!("header phi {:?} has no preheader incoming", phi.dest)
-            })?;
+            let init =
+                init.ok_or_else(|| eyre!("header phi {:?} has no preheader incoming", phi.dest))?;
             let next_operand = next_operand.ok_or_else(|| {
                 eyre!(
                     "header phi {:?} has no in-body (back-edge) incoming",
@@ -644,9 +936,8 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
         // For each exit arc (src, dst): scan dst's phis; for each phi
         // that has an incoming from `src`, classify the operand
         // (sub-case A / B / C). Record per-exit.
-        let mut lcssa_bindings_per_exit: SmallVec<
-            [SmallVec<[(Name, LcssaBinding); 2]>; 4],
-        > = SmallVec::with_capacity(exit_arcs.len());
+        let mut lcssa_bindings_per_exit: SmallVec<[SmallVec<[(Name, LcssaBinding); 2]>; 4]> =
+            SmallVec::with_capacity(exit_arcs.len());
         let mut lcssa_extras: SmallVec<[LcssaExtraSlot; 2]> = SmallVec::new();
         let mut lcssa_extra_inits: SmallVec<[ValueId; 2]> = SmallVec::new();
 
@@ -660,11 +951,8 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
                 // predecessor is `exit_src`). Other incomings belong
                 // to other exit arcs; they'll be classified when we
                 // process those.
-                let incoming = phi_incoming_from(
-                    lcssa_phi,
-                    self.fn_ctx.bb_mapper,
-                    |id| id == exit_src,
-                );
+                let incoming =
+                    phi_incoming_from(lcssa_phi, self.fn_ctx.bb_mapper, |id| id == exit_src);
                 let (op, _) = match incoming {
                     Some(p) => p,
                     None => continue,
@@ -682,45 +970,42 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
                                 Operand::LocalOperand { name: n, .. } if n == name
                             )
                         });
+                        let header_dest_match =
+                            header_phis.iter().position(|info| &info.phi.dest == name);
                         if let Some(idx) = back_edge_match {
+                            // Sub-case A: the loop-closed phi references a
+                            // header phi's back-edge operand; the slot's
+                            // post-loop projection is exactly that value.
                             LcssaBinding::HeaderPhi { index: idx as u16 }
-                        } else if let Some(idx) = header_phis
-                            .iter()
-                            .position(|info| &info.phi.dest == name)
-                        {
-                            // Sub-case B: the loop-closed phi references
-                            // a header phi destination. The
-                            // source-semantic value at this exit is the
-                            // header phi's input for the exiting
-                            // iteration (theta_param). Our walker's
-                            // leaf code falls back to that value WHEN
-                            // the back-edge operand has not been
-                            // defined along the path leading to this
-                            // exit, which is precisely when the exit
-                            // source is the header (no body work has
-                            // executed yet). At any other exit source
-                            // the body may have defined the back-edge
-                            // operand, which would make the projection
-                            // give the wrong (back-edge) value; that
-                            // shape needs the not-yet-implemented
-                            // demand-analysis pass.
-                            if exit_src == header {
-                                LcssaBinding::HeaderPhi { index: idx as u16 }
-                            } else {
-                                bail!(
-                                    "loop-closed phi {:?} at exit ({}, {}) references the \
-                                     header phi destination {:?}, but the exit source is \
-                                     not the loop header. Phase 2 only allows this binding \
-                                     at the natural exit (where no body work has been \
-                                     executed before the exit); the general case needs the \
-                                     not-yet-implemented demand-analysis pass.",
-                                    lcssa_phi.dest,
-                                    exit_src.0,
-                                    exit_dst.0,
-                                    name,
-                                );
-                            }
+                        } else if let Some(idx) = header_dest_match.filter(|_| exit_src == header) {
+                            // Sub-case B at the natural (header) exit: no
+                            // body work has executed, so the slot still
+                            // holds the header phi's input value, which is
+                            // exactly the slot's post-loop projection. Fast
+                            // path that avoids allocating an extra slot.
+                            LcssaBinding::HeaderPhi { index: idx as u16 }
                         } else {
+                            // One of:
+                            //   - a body-internal value used after the loop, or
+                            //   - sub-case B at a NON-header exit: the
+                            //     loop-closed phi references a header phi
+                            //     dest but the exit leaves mid-body.
+                            //
+                            // Both thread out through a dedicated extra
+                            // loop_var slot that captures the CURRENT value
+                            // of `name` at the exiting iteration's leaf. For
+                            // a header phi dest, `name` is never reassigned
+                            // inside the body (it is an SSA def at the
+                            // header), so the slot captures the pre-update
+                            // header value - precisely what the loop-closed
+                            // phi wants, regardless of whether the back-edge
+                            // operand happens to be defined before the exit.
+                            // This is the demand-analysis binding that
+                            // replaces the previous bail for non-natural
+                            // exits. The body-seeding step in
+                            // `lower_scc_as_theta` skips re-binding names
+                            // already bound as header params, so the header
+                            // binding the body relies on is preserved.
                             let rvsdg_ty = self
                                 .rb
                                 .graph
@@ -728,24 +1013,21 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
                                 .convert_type_ref(llvm_ty, self.fn_ctx.llvm_mod)?;
                             let init_id = self.zero_of(rvsdg_ty)?;
                             // Reuse an existing extra slot if this name
-                            // already has one (could happen if two
-                            // exits' loop-closed phis reference the
-                            // same body-internal value).
-                            let extra_idx = match lcssa_extras
-                                .iter()
-                                .position(|slot| slot.name == *name)
-                            {
-                                Some(idx) => idx as u16,
-                                None => {
-                                    let idx = lcssa_extras.len() as u16;
-                                    lcssa_extras.push(LcssaExtraSlot {
-                                        name: name.clone(),
-                                        ty: rvsdg_ty,
-                                    });
-                                    lcssa_extra_inits.push(init_id);
-                                    idx
-                                }
-                            };
+                            // already has one (two exits' loop-closed phis
+                            // can reference the same value).
+                            let extra_idx =
+                                match lcssa_extras.iter().position(|slot| slot.name == *name) {
+                                    Some(idx) => idx as u16,
+                                    None => {
+                                        let idx = lcssa_extras.len() as u16;
+                                        lcssa_extras.push(LcssaExtraSlot {
+                                            name: name.clone(),
+                                            ty: rvsdg_ty,
+                                        });
+                                        lcssa_extra_inits.push(init_id);
+                                        idx
+                                    }
+                                };
                             LcssaBinding::Extra { index: extra_idx }
                         }
                     }
@@ -888,6 +1170,41 @@ struct BodyWalker<'a, 'm> {
 /// subsequent instructions in the join block that use the phi's
 /// destination panic in `operand()` because the phi was skipped by
 /// `lower_instructions_skip_phis`.
+/// If the branch terminating `block` reconverges inside the loop body,
+/// return that join. The join is the block's post-dominator when it lies
+/// within the SCC body and is not the header: the arms then form an
+/// acyclic single-join branch of L* (the body minus the repetition arc),
+/// which Bahmann et al. §4.1 lowers by recursing into §4.2 branch
+/// restructuring. The join is lowered exactly once.
+///
+/// `None` when any arm is instead a leaf — a repetition (target is the
+/// header) or an exit/trap (target leaves the SCC body, e.g. a `return`
+/// or `unreachable` block) — which the body walk handles directly. This
+/// guard is necessary because post-dominance *ignores* paths that cannot
+/// reach the function exit (trapping `unreachable` arms get no post-idom),
+/// so a mixed branch's post-idom can be an in-body block even though one
+/// arm never reaches it (fixture 35). Requiring every arm target to be a
+/// non-header body block rules that out: post-dominance then guarantees
+/// every arm reaches the join before looping or exiting, so the arm walk
+/// stays inside the body.
+fn in_body_join(
+    body: &RegionLowerer<'_, '_, '_>,
+    block: BasicBlockId,
+    walker: &BodyWalker<'_, '_>,
+) -> Option<BasicBlockId> {
+    let join = body.fn_ctx.post_immediate_dominators[block.0 as usize]?;
+    if join == walker.header || !walker.scc_body.contains(&join) {
+        return None;
+    }
+    let all_arms_reconverge = body
+        .fn_ctx
+        .bb_mapper
+        .outputs(block)
+        .iter()
+        .all(|target| *target != walker.header && walker.scc_body.contains(target));
+    all_arms_reconverge.then_some(join)
+}
+
 fn lower_body_walk<'m>(
     body: &mut RegionLowerer<'_, '_, 'm>,
     state: State,
@@ -913,11 +1230,8 @@ fn lower_body_walk<'m>(
     // happened. Detect and reject this shape rather than miscompile.
     if block != walker.header {
         if let Some(inner_scc_id) = fn_ctx.scc_entry_block_to_id[block.0 as usize] {
-            let (next_state, inner_exit) =
-                body.lower_scc_as_theta(state, inner_scc_id)?;
-            if inner_exit != walker.header
-                && !walker.scc_body.contains(&inner_exit)
-            {
+            let (next_state, inner_exit) = body.lower_scc_as_theta(state, inner_scc_id, block)?;
+            if inner_exit != walker.header && !walker.scc_body.contains(&inner_exit) {
                 bail!(
                     "loop body at block {} contains an inner loop whose exit \
                      target ({}) lies outside the outer loop body. This is the \
@@ -968,9 +1282,7 @@ fn lower_body_walk<'m>(
         let bb = &fn_ctx.func.basic_blocks[block.0 as usize];
         let phis = phi_instructions_at(bb);
         for phi in &phis {
-            if let Some((op, _)) =
-                phi_incoming_from(phi, fn_ctx.bb_mapper, |id| id == pred)
-            {
+            if let Some((op, _)) = phi_incoming_from(phi, fn_ctx.bb_mapper, |id| id == pred) {
                 let value = body.operand(op)?;
                 body.name_to_value.insert(phi.dest.clone(), value);
             }
@@ -986,6 +1298,20 @@ fn lower_body_walk<'m>(
             walk_target(body, state, block, target, walker)
         }
         llvm_ir::Terminator::CondBr(cond_br) => {
+            // If the arms reconverge at a block inside the loop body, this
+            // is an ordinary single-join branch of L* — the loop body minus
+            // the repetition arc, which Bahmann et al. §4.1 hands to the
+            // §4.2 branch restructuring. Lower it with the shared acyclic
+            // gamma machinery, which walks each arm only as far as the join
+            // and lowers the join (and everything after it) exactly once,
+            // then resume the body walk from the join. This is what keeps
+            // body lowering linear: the leaf walk below instead re-walks the
+            // whole post-join suffix once per arm, which is exponential on a
+            // chain of reconverging branches (and overflows the stack).
+            if let Some(join) = in_body_join(body, block, walker) {
+                let state = body.lower_cond_branch(state, cond_br, block, join)?;
+                return lower_body_walk(body, state, join, None, walker);
+            }
             let cond_value = body.operand(&cond_br.condition)?;
             let true_target = *fn_ctx.bb_mapper.get_expect(&cond_br.true_dest);
             let false_target = *fn_ctx.bb_mapper.get_expect(&cond_br.false_dest);
@@ -999,12 +1325,13 @@ fn lower_body_walk<'m>(
                 walker,
             )
         }
-        llvm_ir::Terminator::Switch(_) => {
-            bail!(
-                "switch terminator inside loop body at block {} not yet supported \
-                 by the Phase 2 walker",
-                block.0
-            )
+        llvm_ir::Terminator::Switch(switch) => {
+            // Same single-join shortcut as CondBr (see above).
+            if let Some(join) = in_body_join(body, block, walker) {
+                let state = body.lower_switch(state, switch, block, join)?;
+                return lower_body_walk(body, state, join, None, walker);
+            }
+            lower_body_switch(body, state, block, switch, walker)
         }
         llvm_ir::Terminator::Ret(_) => {
             bail!(
@@ -1054,17 +1381,18 @@ fn walk_target<'m>(
     lower_body_walk(body, state, target, Some(src), walker)
 }
 
-/// Build a gamma at a conditional branch inside the body. Snapshots the
-/// caller's `name_to_value` as live-ins so each arm's region can
-/// resolve any SSA names defined along the path leading up to the
-/// branch.
-fn lower_body_cond_branch<'m>(
+/// Build an n-arm gamma at an in-body branch. Snapshots the body's
+/// `name_to_value` as live-ins so each arm's region can resolve SSA names
+/// defined along the path leading up to the branch, then builds one arm
+/// per `target` (each continues the walk via `walk_target`) selected by
+/// `selector`. Shared by the conditional-branch and switch lowering below,
+/// which differ only in how they compute `selector`/`targets`.
+fn lower_body_n_way<'m>(
     body: &mut RegionLowerer<'_, '_, 'm>,
     state: State,
     block: BasicBlockId,
-    cond_value: ValueId,
-    true_target: BasicBlockId,
-    false_target: BasicBlockId,
+    selector: ValueId,
+    targets: &[BasicBlockId],
     walker: &BodyWalker<'_, 'm>,
 ) -> color_eyre::Result<(State, Vec<ValueId>)> {
     let fn_ctx = body.fn_ctx;
@@ -1075,9 +1403,8 @@ fn lower_body_cond_branch<'m>(
     // Box<String>) into a temporary pairs vector; the only clones
     // that survive are those that end up in each arm's permanent
     // name_to_value map.
-    let live_in_count = body.name_to_value.len();
-    let mut live_in_names: Vec<&Name> = Vec::with_capacity(live_in_count);
-    let mut live_in_values: Vec<ValueId> = Vec::with_capacity(live_in_count);
+    let mut live_in_names: Vec<&Name> = Vec::with_capacity(body.name_to_value.len());
+    let mut live_in_values: Vec<ValueId> = Vec::with_capacity(body.name_to_value.len());
     for (name, &value) in &body.name_to_value {
         live_in_names.push(name);
         live_in_values.push(value);
@@ -1087,37 +1414,68 @@ fn lower_body_cond_branch<'m>(
     let names_ref = &live_in_names;
     let block_src = block;
 
-    let build_arm = |arm_rb: &mut RegionBuilder,
-                     target: BasicBlockId|
-     -> color_eyre::Result<BranchResult> {
-        let mut arm_n2v = FxHashMap::with_capacity_and_hasher(
-            names_ref.len() + 4,
-            Default::default(),
-        );
-        for (i, name) in names_ref.iter().enumerate() {
-            arm_n2v.insert((*name).clone(), arm_rb.param(i as u32));
-        }
-        let mut arm = RegionLowerer::new_child(arm_rb, fn_ctx, arm_n2v);
-        let (arm_state, values) =
-            walk_target(&mut arm, state, block_src, target, walker_ref)?;
-        Ok(BranchResult {
-            state: arm_state,
-            values,
+    let arm_closures: Vec<_> = targets
+        .iter()
+        .map(|&target| {
+            move |arm_rb: &mut RegionBuilder| -> color_eyre::Result<BranchResult> {
+                let mut arm_n2v =
+                    FxHashMap::with_capacity_and_hasher(names_ref.len() + 4, Default::default());
+                for (i, name) in names_ref.iter().enumerate() {
+                    arm_n2v.insert((*name).clone(), arm_rb.param(i as u32));
+                }
+                let mut arm = RegionLowerer::new_child(arm_rb, fn_ctx, arm_n2v);
+                let (arm_state, values) =
+                    walk_target(&mut arm, state, block_src, target, walker_ref)?;
+                Ok(BranchResult {
+                    state: arm_state,
+                    values,
+                })
+            }
         })
-    };
+        .collect();
+    let branch_refs = as_branch_refs(&arm_closures);
 
-    let true_arm = |arm_rb: &mut RegionBuilder| build_arm(arm_rb, true_target);
-    let false_arm = |arm_rb: &mut RegionBuilder| build_arm(arm_rb, false_target);
-
-    let gamma =
-        body.rb
-            .gamma(cond_value, state, &live_in_values, true_arm, false_arm)?;
+    let gamma = body
+        .rb
+        .gamma_n(selector, state, &live_in_values, &branch_refs)?;
 
     let total_outputs = walker.slot_count as usize + 2;
-    let values: Vec<ValueId> = (0..total_outputs as u16)
-        .map(|i| gamma.result(i))
-        .collect();
+    let values: Vec<ValueId> = (0..total_outputs as u16).map(|i| gamma.result(i)).collect();
     Ok((gamma.state, values))
+}
+
+/// Conditional branch inside the body: a two-arm gamma (arm 0 = true
+/// target, arm 1 = false target).
+fn lower_body_cond_branch<'m>(
+    body: &mut RegionLowerer<'_, '_, 'm>,
+    state: State,
+    block: BasicBlockId,
+    cond_value: ValueId,
+    true_target: BasicBlockId,
+    false_target: BasicBlockId,
+    walker: &BodyWalker<'_, 'm>,
+) -> color_eyre::Result<(State, Vec<ValueId>)> {
+    lower_body_n_way(
+        body,
+        state,
+        block,
+        cond_value,
+        &[true_target, false_target],
+        walker,
+    )
+}
+
+/// Switch inside the body: an n-arm gamma. Reuses the same arm-index
+/// selector as the acyclic switch lowering (`RegionLowerer::switch_selector`).
+fn lower_body_switch<'m>(
+    body: &mut RegionLowerer<'_, '_, 'm>,
+    state: State,
+    block: BasicBlockId,
+    switch: &llvm_ir::terminator::Switch,
+    walker: &BodyWalker<'_, 'm>,
+) -> color_eyre::Result<(State, Vec<ValueId>)> {
+    let (selector, targets) = body.switch_selector(switch)?;
+    lower_body_n_way(body, state, block, selector, &targets, walker)
 }
 
 /// Build the slot values portion of a leaf tuple. Each header phi
@@ -1137,24 +1495,26 @@ fn make_leaf_slot_values<'m>(
         match try_operand(body, info.next_operand)? {
             Some(v) => values.push(v),
             None => {
-                let dest_value = body
-                    .name_to_value
-                    .get(&info.phi.dest)
-                    .copied()
-                    .ok_or_else(|| {
-                        eyre!(
-                            "header phi dest {:?} not in name_to_value at leaf",
-                            info.phi.dest
-                        )
-                    })?;
+                let dest_value =
+                    body.name_to_value
+                        .get(&info.phi.dest)
+                        .copied()
+                        .ok_or_else(|| {
+                            eyre!(
+                                "header phi dest {:?} not in name_to_value at leaf",
+                                info.phi.dest
+                            )
+                        })?;
                 values.push(dest_value);
             }
         }
     }
     for name in &walker.ctx.live_in_names {
-        let v = body.name_to_value.get(name).copied().ok_or_else(|| {
-            eyre!("live-in name {:?} not in name_to_value at leaf", name)
-        })?;
+        let v = body
+            .name_to_value
+            .get(name)
+            .copied()
+            .ok_or_else(|| eyre!("live-in name {:?} not in name_to_value at leaf", name))?;
         values.push(v);
     }
     for slot in &walker.ctx.lcssa_extras {
@@ -1214,6 +1574,376 @@ fn try_operand<'m>(
     }
 }
 
+// ============================================================================
+// Multi-entry (irreducible) body walker: the paper's §4.1 `q` entry dispatch.
+// ============================================================================
+
+/// One phi at an entry vertex of a multi-entry SCC. Each becomes a theta
+/// loop_var carried across the `q` entry dispatch.
+struct EntryPhi<'m> {
+    entry: BasicBlockId,
+    phi: &'m Phi,
+}
+
+/// Context for the multi-entry body walk. A leaf produces the tuple
+/// `[entry_phis..., closed..., q_entry, q_exit, r]` — `base + 3` values
+/// where `base = entry_phis.len() + closed.len()`.
+struct MultiWalker<'a, 'm> {
+    entries: &'a [BasicBlockId],
+    scc_body: &'a [BasicBlockId],
+    entry_phis: &'a [EntryPhi<'m>],
+    closed: &'a [Name],
+    exit_arcs: &'a [(BasicBlockId, BasicBlockId)],
+    base: usize,
+}
+
+/// Walk one entry vertex's region inside an irreducible loop body.
+/// Recurses through `Br`/`CondBr`; a target that is an entry vertex is a
+/// repetition (sets `q_entry` to that entry), a target outside the SCC is
+/// an exit (sets `q_exit`).
+fn multi_walk<'m>(
+    body: &mut RegionLowerer<'_, '_, 'm>,
+    state: State,
+    block: BasicBlockId,
+    prev: Option<BasicBlockId>,
+    walker: &MultiWalker<'_, 'm>,
+) -> color_eyre::Result<(State, Vec<ValueId>)> {
+    let fn_ctx = body.fn_ctx;
+
+    // A nested inner loop inside an irreducible loop is not modelled yet.
+    if !walker.entries.contains(&block) {
+        if fn_ctx.scc_entry_block_to_id[block.0 as usize].is_some() {
+            bail!(
+                "nested loop inside an irreducible loop is not yet supported (block {})",
+                block.0
+            );
+        }
+    }
+
+    // Interior-join phis resolve from the predecessor we arrived through.
+    // Entry-vertex phis are loop_vars (seeded), so are not rebound here.
+    if let Some(pred) = prev {
+        if !walker.entries.contains(&block) {
+            let bb = &fn_ctx.func.basic_blocks[block.0 as usize];
+            for phi in &phi_instructions_at(bb) {
+                if let Some((op, _)) = phi_incoming_from(phi, fn_ctx.bb_mapper, |id| id == pred) {
+                    let v = body.operand(op)?;
+                    body.name_to_value.insert(phi.dest.clone(), v);
+                }
+            }
+        }
+    }
+
+    let state = body.lower_instructions_skip_phis(state, block)?;
+    let bb = &fn_ctx.func.basic_blocks[block.0 as usize];
+    match &bb.term {
+        llvm_ir::Terminator::Br(br) => {
+            let t = *fn_ctx.bb_mapper.get_expect(&br.dest);
+            multi_walk_target(body, state, block, t, walker)
+        }
+        llvm_ir::Terminator::CondBr(cb) => {
+            let cond = body.operand(&cb.condition)?;
+            let tt = *fn_ctx.bb_mapper.get_expect(&cb.true_dest);
+            let ft = *fn_ctx.bb_mapper.get_expect(&cb.false_dest);
+            multi_cond_branch(body, state, block, cond, tt, ft, walker)
+        }
+        other => bail!(
+            "unsupported terminator in irreducible loop body (block {}): {:?}",
+            block.0,
+            other
+        ),
+    }
+}
+
+fn multi_walk_target<'m>(
+    body: &mut RegionLowerer<'_, '_, 'm>,
+    state: State,
+    src: BasicBlockId,
+    target: BasicBlockId,
+    walker: &MultiWalker<'_, 'm>,
+) -> color_eyre::Result<(State, Vec<ValueId>)> {
+    if let Some(q) = walker.entries.iter().position(|&e| e == target) {
+        let vals = make_multi_rep_leaf(body, src, target, q as i32, walker)?;
+        return Ok((state, vals));
+    }
+    if !walker.scc_body.contains(&target) {
+        let k = walker
+            .exit_arcs
+            .iter()
+            .position(|&a| a == (src, target))
+            .ok_or_else(|| eyre!("exit arc ({}, {}) not in SCC exit arcs", src.0, target.0))?
+            as i32;
+        let vals = make_multi_exit_leaf(body, k, walker)?;
+        return Ok((state, vals));
+    }
+    multi_walk(body, state, target, Some(src), walker)
+}
+
+/// Two-way branch inside an irreducible loop body: a gamma whose arms each
+/// continue the multi-entry walk. Mirrors `lower_body_cond_branch` but
+/// produces the wider `base + 3` leaf tuple.
+fn multi_cond_branch<'m>(
+    body: &mut RegionLowerer<'_, '_, 'm>,
+    state: State,
+    block: BasicBlockId,
+    cond: ValueId,
+    true_target: BasicBlockId,
+    false_target: BasicBlockId,
+    walker: &MultiWalker<'_, 'm>,
+) -> color_eyre::Result<(State, Vec<ValueId>)> {
+    let fn_ctx = body.fn_ctx;
+    let mut names: Vec<&Name> = Vec::with_capacity(body.name_to_value.len());
+    let mut vals: Vec<ValueId> = Vec::with_capacity(body.name_to_value.len());
+    for (n, &v) in &body.name_to_value {
+        names.push(n);
+        vals.push(v);
+    }
+    let names_ref = &names;
+    let walker_ref = walker;
+    let src = block;
+
+    let build = |arm_rb: &mut RegionBuilder,
+                 target: BasicBlockId|
+     -> color_eyre::Result<BranchResult> {
+        let mut n2v = FxHashMap::with_capacity_and_hasher(names_ref.len() + 4, Default::default());
+        for (i, n) in names_ref.iter().enumerate() {
+            n2v.insert((*n).clone(), arm_rb.param(i as u32));
+        }
+        let mut arm = RegionLowerer::new_child(arm_rb, fn_ctx, n2v);
+        let (st, v) = multi_walk_target(&mut arm, state, src, target, walker_ref)?;
+        Ok(BranchResult {
+            state: st,
+            values: v,
+        })
+    };
+    let ta = |rb: &mut RegionBuilder| build(rb, true_target);
+    let fa = |rb: &mut RegionBuilder| build(rb, false_target);
+    let gamma = body.rb.gamma(cond, state, &vals, ta, fa)?;
+
+    let total = walker.base + 3;
+    let out: Vec<ValueId> = (0..total as u16).map(|i| gamma.result(i)).collect();
+    Ok((gamma.state, out))
+}
+
+/// Repetition leaf: control loops back to entry `rep_target` (q index
+/// `q_idx`) from block `src`. The target entry's phis take their values
+/// off that repetition arc; all other entry phis and closed values pass
+/// through unchanged.
+fn make_multi_rep_leaf<'m>(
+    body: &mut RegionLowerer<'_, '_, 'm>,
+    src: BasicBlockId,
+    rep_target: BasicBlockId,
+    q_idx: i32,
+    walker: &MultiWalker<'_, 'm>,
+) -> color_eyre::Result<Vec<ValueId>> {
+    let mut vals: Vec<ValueId> = Vec::with_capacity(walker.base + 3);
+    for ep in walker.entry_phis {
+        if ep.entry == rep_target {
+            let (op, _) = phi_incoming_from(ep.phi, body.fn_ctx.bb_mapper, |id| id == src)
+                .ok_or_else(|| {
+                    eyre!(
+                        "entry phi {:?} has no incoming for repetition arc from block {}",
+                        ep.phi.dest,
+                        src.0
+                    )
+                })?;
+            vals.push(body.operand(op)?);
+        } else {
+            vals.push(*body.name_to_value.get(&ep.phi.dest).ok_or_else(|| {
+                eyre!("entry phi {:?} not bound at repetition leaf", ep.phi.dest)
+            })?);
+        }
+    }
+    for name in walker.closed {
+        vals.push(
+            *body.name_to_value.get(name).ok_or_else(|| {
+                eyre!("loop-closed value {:?} not bound at repetition leaf", name)
+            })?,
+        );
+    }
+    vals.push(body.rb.const_i32(q_idx)); // q_entry
+    vals.push(body.rb.const_i32(0)); // q_exit (unused on repetition)
+    vals.push(body.rb.constant(BOOL, ConstValue::Int(1))); // r = repeat
+    Ok(vals)
+}
+
+/// Exit leaf: control leaves the loop on exit-arc index `exit_idx`. Entry
+/// phis and closed values pass through (their final values become theta
+/// outputs the post-loop dispatch reads).
+fn make_multi_exit_leaf<'m>(
+    body: &mut RegionLowerer<'_, '_, 'm>,
+    exit_idx: i32,
+    walker: &MultiWalker<'_, 'm>,
+) -> color_eyre::Result<Vec<ValueId>> {
+    let mut vals: Vec<ValueId> = Vec::with_capacity(walker.base + 3);
+    for ep in walker.entry_phis {
+        vals.push(
+            *body
+                .name_to_value
+                .get(&ep.phi.dest)
+                .ok_or_else(|| eyre!("entry phi {:?} not bound at exit leaf", ep.phi.dest))?,
+        );
+    }
+    for name in walker.closed {
+        vals.push(
+            *body
+                .name_to_value
+                .get(name)
+                .ok_or_else(|| eyre!("loop-closed value {:?} not bound at exit leaf", name))?,
+        );
+    }
+    vals.push(body.rb.const_i32(0)); // q_entry (unused on exit)
+    vals.push(body.rb.const_i32(exit_idx)); // q_exit
+    vals.push(body.rb.constant(BOOL, ConstValue::Int(0))); // r = exit
+    Ok(vals)
+}
+
+/// Context for the entry-region walk that computes the initial `q` and the
+/// entry-phi init values for an irreducible loop. Runs in the outer scope
+/// (before the theta), producing the tuple `[q, init_0, .., init_{n-1}]`.
+struct EntryCtx<'a, 'm> {
+    entries: &'a [BasicBlockId],
+    entry_phis: &'a [EntryPhi<'m>],
+    #[allow(dead_code)]
+    scc_body: &'a [BasicBlockId],
+}
+
+/// Walk the acyclic entry region from the dispatch dominator toward the
+/// loop entries. Each path ends at a loop entry (a leaf yielding `q` plus
+/// the entry-phi inits); a branch becomes a gamma that merges the tuples.
+fn entry_walk<'m>(
+    lowerer: &mut RegionLowerer<'_, '_, 'm>,
+    state: State,
+    block: BasicBlockId,
+    prev: Option<BasicBlockId>,
+    ctx: &EntryCtx<'_, 'm>,
+) -> color_eyre::Result<(State, Vec<ValueId>)> {
+    let fn_ctx = lowerer.fn_ctx;
+
+    if ctx.entries.contains(&block) {
+        let src = prev.ok_or_else(|| {
+            eyre!(
+                "loop entry {} reached with no predecessor in entry region",
+                block.0
+            )
+        })?;
+        let vals = make_entry_leaf(lowerer, block, src, ctx)?;
+        return Ok((state, vals));
+    }
+
+    // Interior-join phis in the entry region resolve from `prev`.
+    if let Some(pred) = prev {
+        let bb = &fn_ctx.func.basic_blocks[block.0 as usize];
+        for phi in &phi_instructions_at(bb) {
+            if let Some((op, _)) = phi_incoming_from(phi, fn_ctx.bb_mapper, |id| id == pred) {
+                let v = lowerer.operand(op)?;
+                lowerer.name_to_value.insert(phi.dest.clone(), v);
+            }
+        }
+    }
+
+    let state = lowerer.lower_instructions_skip_phis(state, block)?;
+    let bb = &fn_ctx.func.basic_blocks[block.0 as usize];
+    match &bb.term {
+        llvm_ir::Terminator::Br(br) => {
+            let t = *fn_ctx.bb_mapper.get_expect(&br.dest);
+            entry_walk(lowerer, state, t, Some(block), ctx)
+        }
+        llvm_ir::Terminator::CondBr(cb) => {
+            let cond = lowerer.operand(&cb.condition)?;
+            let tt = *fn_ctx.bb_mapper.get_expect(&cb.true_dest);
+            let ft = *fn_ctx.bb_mapper.get_expect(&cb.false_dest);
+            entry_cond_branch(lowerer, state, block, cond, tt, ft, ctx)
+        }
+        other => bail!(
+            "unsupported terminator in irreducible-loop entry region (block {}): {:?}",
+            block.0,
+            other
+        ),
+    }
+}
+
+/// Two-way branch in the entry region: a gamma whose arms each continue
+/// the entry walk, merging their `[q, inits]` tuples.
+fn entry_cond_branch<'m>(
+    lowerer: &mut RegionLowerer<'_, '_, 'm>,
+    state: State,
+    block: BasicBlockId,
+    cond: ValueId,
+    true_target: BasicBlockId,
+    false_target: BasicBlockId,
+    ctx: &EntryCtx<'_, 'm>,
+) -> color_eyre::Result<(State, Vec<ValueId>)> {
+    let fn_ctx = lowerer.fn_ctx;
+    let mut names: Vec<&Name> = Vec::with_capacity(lowerer.name_to_value.len());
+    let mut vals: Vec<ValueId> = Vec::with_capacity(lowerer.name_to_value.len());
+    for (n, &v) in &lowerer.name_to_value {
+        names.push(n);
+        vals.push(v);
+    }
+    let names_ref = &names;
+    let ctx_ref = ctx;
+    let src = block;
+
+    let build = |arm_rb: &mut RegionBuilder,
+                 target: BasicBlockId|
+     -> color_eyre::Result<BranchResult> {
+        let mut n2v = FxHashMap::with_capacity_and_hasher(names_ref.len() + 4, Default::default());
+        for (i, n) in names_ref.iter().enumerate() {
+            n2v.insert((*n).clone(), arm_rb.param(i as u32));
+        }
+        let mut arm = RegionLowerer::new_child(arm_rb, fn_ctx, n2v);
+        let (st, v) = entry_walk(&mut arm, state, target, Some(src), ctx_ref)?;
+        Ok(BranchResult {
+            state: st,
+            values: v,
+        })
+    };
+    let ta = |rb: &mut RegionBuilder| build(rb, true_target);
+    let fa = |rb: &mut RegionBuilder| build(rb, false_target);
+    let gamma = lowerer.rb.gamma(cond, state, &vals, ta, fa)?;
+
+    let total = ctx.entry_phis.len() + 1;
+    let out: Vec<ValueId> = (0..total as u16).map(|i| gamma.result(i)).collect();
+    Ok((gamma.state, out))
+}
+
+/// Entry leaf: control enters the loop at `entry_e` from `src`. Yields the
+/// q index of that entry, then for each entry phi its incoming along this
+/// entry arc (for phis at `entry_e`) or zero (for other entries' phis,
+/// whose slots are written by a repetition arc before first use).
+fn make_entry_leaf<'m>(
+    lowerer: &mut RegionLowerer<'_, '_, 'm>,
+    entry_e: BasicBlockId,
+    src: BasicBlockId,
+    ctx: &EntryCtx<'_, 'm>,
+) -> color_eyre::Result<Vec<ValueId>> {
+    let q_idx = ctx.entries.iter().position(|&e| e == entry_e).unwrap() as i32;
+    let mut vals: Vec<ValueId> = Vec::with_capacity(ctx.entry_phis.len() + 1);
+    vals.push(lowerer.rb.const_i32(q_idx));
+    for ep in ctx.entry_phis {
+        if ep.entry == entry_e {
+            let (op, _) = phi_incoming_from(ep.phi, lowerer.fn_ctx.bb_mapper, |id| id == src)
+                .ok_or_else(|| {
+                    eyre!(
+                        "entry phi {:?} has no incoming for entry arc from block {}",
+                        ep.phi.dest,
+                        src.0
+                    )
+                })?;
+            vals.push(lowerer.operand(op)?);
+        } else {
+            let ty = lowerer
+                .rb
+                .graph
+                .types
+                .convert_type_ref(&ep.phi.to_type, lowerer.fn_ctx.llvm_mod)?;
+            vals.push(lowerer.zero_of(ty)?);
+        }
+    }
+    Ok(vals)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1261,10 +1991,7 @@ exit:
             assert_eq!(ctx.lcssa_bindings_per_exit[0].len(), 1);
             let (lcssa_dest, binding) = &ctx.lcssa_bindings_per_exit[0][0];
             assert_eq!(*lcssa_dest, local_name("out"));
-            assert!(matches!(
-                binding,
-                LcssaBinding::HeaderPhi { index: 0 }
-            ));
+            assert!(matches!(binding, LcssaBinding::HeaderPhi { index: 0 }));
         });
     }
 

@@ -8,7 +8,7 @@ use inkwell::{
     builder::{Builder, BuilderError},
     context::Context,
     module::Module,
-    targets::{CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetTriple},
+    targets::{CodeModel, FileType, RelocMode, Target, TargetTriple},
     types::{BasicMetadataTypeEnum, BasicType, BasicTypeEnum},
     values::{BasicValue, BasicValueEnum, FunctionValue, GlobalValue},
 };
@@ -90,9 +90,9 @@ impl RVSDGMod {
     }
 
     pub fn output_with_llvm(&self, output: &str) -> Result<(), Box<dyn Error>> {
-        // initialise things
-        Target::initialize_native(&InitializationConfig::default())
-            .expect("Failed to initialize native target");
+        // initialise things (guarded so concurrent callers don't race the
+        // process-global target registry)
+        crate::init_llvm_native();
 
         let context = Context::create();
         let module = self.lower_to_llvm_module(&context)?;
@@ -118,7 +118,9 @@ impl RVSDGMod {
             .write_to_file(&module, FileType::Object, obj_path)
             .expect("Failed to write object file");
 
-        println!("Wrote object file: {}", obj_path.display());
+        // Status/diagnostics go to stderr so the compiler never writes to
+        // stdout — that belongs to the compiled program when it runs.
+        eprintln!("Wrote object file: {}", obj_path.display());
 
         // link, this will need to be conditional depending on the mode
         let status = Command::new("cc")
@@ -127,8 +129,8 @@ impl RVSDGMod {
             .expect("Failed to invoke linker (cc)");
 
         if status.success() {
-            println!("Linked executable: ./{output}");
-            println!("\nRun it with:  ./{output}");
+            eprintln!("Linked executable: ./{output}");
+            eprintln!("Run it with:  ./{output}");
         } else {
             eprintln!("Linking failed with status: {status}");
         }
@@ -154,10 +156,10 @@ impl RVSDGMod {
             }
             self.lower_fn(llvm_builder, mapper, func)?;
         }
-        llvm_builder
-            .module
-            .verify()
-            .expect("Module verification failed");
+        if let Err(e) = llvm_builder.module.verify() {
+            eprintln!("VERIFY-ERR: {}", e.to_string());
+            panic!("Module verification failed");
+        }
 
         Ok(())
     }
@@ -167,6 +169,12 @@ impl RVSDGMod {
         llvm_builder: &LLVMBuilderCtx<'a, 'ctx>,
         mapper: &mut ValueMapper<'ctx>,
     ) {
+        // Pass 1: declare every global. This must finish before any
+        // initializer is lowered, because an initializer can reference another
+        // global that is declared later (e.g. `@a = ptr @b` with `@b` below
+        // `@a`); that GlobalAddr resolves through the mapper, which only has
+        // the global once it's declared here. Same two-pass shape as the
+        // frontend's `from_llvm_mod`.
         for (i, global) in self.globals.iter().enumerate() {
             let llvm_type = self.type_to_basic_type_llvm(llvm_builder.context, global.ty);
             let glob = llvm_builder
@@ -176,14 +184,18 @@ impl RVSDGMod {
                 .add_global(llvm_type, None, &global.name);
             glob.set_constant(global.is_constant);
             glob.set_linkage(global.linkage.to_llvm());
-            match global.initializer {
-                GlobalInit::Extern => (),
-                GlobalInit::Init(const_id) => {
-                    let const_val = self.lower_const_id(llvm_builder, mapper, const_id);
-                    glob.set_initializer(&const_val as &dyn BasicValue);
-                }
-            };
             mapper.set_global(GlobalId(i as u32), glob);
+        }
+
+        // Pass 2: set initializers, now that every global resolves.
+        for (i, global) in self.globals.iter().enumerate() {
+            if let GlobalInit::Init(const_id) = global.initializer {
+                let const_val = self.lower_const_id(llvm_builder, mapper, const_id);
+                mapper
+                    .get_global(GlobalId(i as u32))
+                    .expect("global declared in pass 1")
+                    .set_initializer(&const_val as &dyn BasicValue);
+            }
         }
     }
 

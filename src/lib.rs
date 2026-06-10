@@ -4,33 +4,64 @@
 use clap::{ArgGroup, Parser};
 use inkwell::OptimizationLevel;
 use inkwell::context::Context;
+use inkwell::targets::{InitializationConfig, Target};
 use llvm_ir::Module;
 use std::fs::read_to_string;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
+use tempfile::NamedTempFile;
 
 use crate::rvsdg::RVSDGMod;
+
+/// Initialise LLVM's native target exactly once.
+///
+/// The target registry is process-global; initialising it mutates global
+/// tables and is NOT safe to run concurrently. Once initialised the targets
+/// are read-only, so any number of threads can then build their own
+/// `Context`, module, and JIT/codegen fully in parallel. The `OnceLock`
+/// makes the registry mutation happen a single time regardless of how many
+/// threads race into it - this is the only synchronisation parallel LLVM
+/// compilation actually needs.
+pub(crate) fn init_llvm_native() {
+    static INIT: OnceLock<()> = OnceLock::new();
+    INIT.get_or_init(|| {
+        Target::initialize_native(&InitializationConfig::default())
+            .expect("Failed to initialize native target");
+    });
+}
 
 pub mod llvm_parser;
 pub mod rvsdg;
 
-fn c_file_to_mod(c_file_path: &Path) -> color_eyre::Result<Module> {
-    // let ll_output = NamedTempFile::with_suffix(".ll")?;
-    let ll_output: PathBuf = "c_mod_llvm.ll".into();
+fn c_file_to_mod(
+    c_file_path: &Path,
+    include_dirs: &[String],
+    quiet: bool,
+) -> color_eyre::Result<Module> {
+    let ll_file = NamedTempFile::with_suffix(".ll")?;
+    let ll_output = ll_file.path();
+    // let ll_output: PathBuf = "c_mod_llvm.ll".into();
 
-    let clang_cmd = Command::new("clang-19")
-        .args([
-            "-O1",
-            "-Xclang",
-            "-disable-llvm-passes",
-            "-emit-llvm",
-            "-c",
-            c_file_path.to_str().unwrap_or_default(),
-            "-o",
-            "-",
-        ])
-        .stdout(Stdio::piped())
-        .spawn()?;
+    let mut clang = Command::new("clang-19");
+    // `-w`: we don't care about clang's warnings on the input here (it's
+    // just the SSA frontend), and on fuzzer input they flood stderr and
+    // bury our own diagnostics.
+    clang.args([
+        "-O1",
+        "-w",
+        "-Xclang",
+        "-disable-llvm-passes",
+        "-emit-llvm",
+        "-c",
+    ]);
+    // Header search paths (e.g. csmith's runtime header dir). One `-I` per
+    // entry so paths with spaces are passed as single arguments.
+    for dir in include_dirs {
+        clang.arg("-I").arg(dir);
+    }
+    clang.arg(c_file_path).args(["-o", "-"]);
+    let clang_cmd = clang.stdout(Stdio::piped()).spawn()?;
 
     // The LLVM opt pass list below contains ONLY structural normalisations
     // that adapt the C source language into a shape this compiler currently
@@ -93,7 +124,11 @@ fn c_file_to_mod(c_file_path: &Path) -> color_eyre::Result<Module> {
         .status()?;
 
     let llvm_ir_full_text = read_to_string(&ll_output).unwrap();
-    println!("Parsed LLVM IR (text): {}", llvm_ir_full_text);
+    // Diagnostics go to stderr so a compiled program's own stdout (e.g. a
+    // csmith checksum) is never mixed with compiler logging.
+    if !quiet {
+        eprintln!("Parsed LLVM IR (text): {}", llvm_ir_full_text);
+    }
 
     let module = match Module::from_ir_path(&ll_output) {
         Ok(v) => v,
@@ -113,22 +148,41 @@ fn c_file_to_mod(c_file_path: &Path) -> color_eyre::Result<Module> {
 #[command(group(ArgGroup::new("mode").required(false).args(["output", "run"])))]
 pub struct Cli {
     #[arg(short, long)]
-    output: Option<String>,
+    pub(crate) output: Option<String>,
 
     #[arg(long, short, default_value_t = false)]
-    run: bool,
+    pub(crate) run: bool,
 
     #[arg(long, default_value_t = false)]
-    optimise: bool,
+    pub(crate) optimise: bool,
 
-    input: String,
+    #[arg(long, short, default_value_t = false)]
+    pub(crate) quiet: bool,
+
+    /// Header search path passed to the clang frontend (repeatable), e.g.
+    /// `-I /usr/include/csmith-2.3.0` so csmith's runtime header resolves.
+    #[arg(short = 'I', long = "include", value_name = "DIR")]
+    pub(crate) include: Vec<String>,
+
+    pub(crate) input: String,
 }
 
-pub fn run_cli() -> color_eyre::Result<Option<u8>> {
-    let cli = Cli::parse();
+impl Cli {
+    pub fn get_run_integration(input: String) -> Self {
+        Self {
+            output: None,
+            run: true,
+            optimise: false,
+            quiet: true,
+            include: Vec::new(),
+            input,
+        }
+    }
+}
 
+pub fn run_cli(cli: &Cli) -> color_eyre::Result<Option<u8>> {
     let c_file_path = Path::new(&cli.input);
-    let module = c_file_to_mod(c_file_path)?;
+    let module = c_file_to_mod(c_file_path, &cli.include, cli.quiet)?;
 
     let rvsdg = RVSDGMod::from_llvm_mod(module)?;
     if cli.optimise {
@@ -136,6 +190,8 @@ pub fn run_cli() -> color_eyre::Result<Option<u8>> {
     }
 
     if cli.run {
+        // Serialised once globally; all per-Context JIT work below runs in parallel.
+        init_llvm_native();
         let context = Context::create();
         let module = rvsdg.lower_to_llvm_module(&context)?;
         let engine = module
@@ -150,7 +206,7 @@ pub fn run_cli() -> color_eyre::Result<Option<u8>> {
         let res = unsafe { func.call() };
         Ok(Some(res))
     } else {
-        let output = match cli.output {
+        let output = match &cli.output {
             Some(v) => &v.to_string(),
             None => &rvsdg.mod_name,
         };

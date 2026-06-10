@@ -2,7 +2,7 @@ use crate::rvsdg::{
     FCmpPred, ICmpPred, RVSDGMod, ValueId, ValueKind,
     func::Function,
     lower_to_llvm::{LLVMBuilderCtx, ValueMapper},
-    types::TypeRef,
+    types::{TypeRef, VOID},
 };
 use inkwell::{
     FloatPredicate, IntPredicate,
@@ -388,14 +388,23 @@ impl RVSDGMod {
                     }
                 };
                 let func_type_def = self.types.get_fn(func_type_id);
-                let ret_type =
-                    self.type_to_basic_type_llvm(llvm_builder.context, func_type_def.ret);
                 let param_types: Vec<_> = func_type_def
                     .params
                     .iter()
                     .map(|&ty| self.type_to_basic_meta_llvm(llvm_builder.context, ty))
                     .collect();
-                let llvm_fn_type = ret_type.fn_type(&param_types, func_type_def.is_var_arg);
+                // A void return is not a BasicType in LLVM, so build the
+                // function type through `void_type()` in that case (mirrors
+                // `register_fn`). Common for `noreturn` callees like abort().
+                let llvm_fn_type = if func_type_def.ret == VOID {
+                    llvm_builder
+                        .context
+                        .void_type()
+                        .fn_type(&param_types, func_type_def.is_var_arg)
+                } else {
+                    self.type_to_basic_type_llvm(llvm_builder.context, func_type_def.ret)
+                        .fn_type(&param_types, func_type_def.is_var_arg)
+                };
                 let llvm_args: Vec<BasicMetadataValueEnum<'ctx>> = self
                     .value_pool
                     .get(args)

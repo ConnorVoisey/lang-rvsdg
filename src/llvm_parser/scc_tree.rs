@@ -154,8 +154,7 @@ impl SccTree {
         // Filter for inner SCC discovery: removing the repetition arcs
         // matches the paper's L* construction (section 4.1) without
         // mutating the control flow graph.
-        let rep_arcs: SmallVec<[(BasicBlockId, BasicBlockId); 4]> =
-            arcs.repetition_arcs.clone();
+        let rep_arcs: SmallVec<[(BasicBlockId, BasicBlockId); 4]> = arcs.repetition_arcs.clone();
         self.arcs[node.0 as usize] = arcs;
 
         let inner = mapper.scc_in_subgraph(&blocks, &rep_arcs);
@@ -348,12 +347,8 @@ mod tests {
         assert!(tree.children[inner.0 as usize].is_empty());
 
         // Block sets are increasingly small as we descend.
-        assert!(
-            tree.blocks[outer.0 as usize].len() > tree.blocks[middle.0 as usize].len()
-        );
-        assert!(
-            tree.blocks[middle.0 as usize].len() > tree.blocks[inner.0 as usize].len()
-        );
+        assert!(tree.blocks[outer.0 as usize].len() > tree.blocks[middle.0 as usize].len());
+        assert!(tree.blocks[middle.0 as usize].len() > tree.blocks[inner.0 as usize].len());
     }
 
     #[test]

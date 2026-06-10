@@ -21,15 +21,21 @@
 pub mod branches;
 pub mod loops;
 pub mod phi;
+pub mod restructure;
 
 #[cfg(test)]
 pub(super) mod test_fixture;
 
 use llvm_ir::{Instruction, terminator::CondBr};
+use rustc_hash::FxHashSet;
+use smallvec::SmallVec;
 
 use crate::{
     llvm_parser::{
-        block_mapper::BasicBlockId, instructions::RegionLowerer, scc_tree::SccTreeNodeId,
+        block_mapper::BasicBlockId,
+        instructions::RegionLowerer,
+        region::phi::{phi_incoming_from, phi_instructions_at},
+        scc_tree::SccTreeNodeId,
     },
     rvsdg::{State, ValueId},
 };
@@ -37,15 +43,31 @@ use crate::{
 /// What a `lower_region` call produced at its exit point.
 ///
 /// - `AtBoundary` is returned when the region exits at its `end` block (a
-///   gamma-arm join) or at the synthetic function exit. There are no result
-///   values to wire out: a gamma arm computes its result values from phi
-///   contributions in the join block, not from a terminator.
+///   gamma-arm join) or at the synthetic function exit. `exit_pred` is the
+///   block the walk reached the boundary *from* (the predecessor of `end`
+///   along this path), or `None` when the boundary was reached without a
+///   meaningful predecessor (the start block already being the boundary
+///   gives the seeded entry predecessor). A gamma arm uses `exit_pred` to
+///   pick its contribution to each join phi when no inner gamma already
+///   bound it.
 /// - `Returned` is returned when the region terminated via `Ret`, carrying
 ///   the function's return operand (empty for void returns).
 #[derive(Debug)]
 pub enum RegionExit {
-    AtBoundary(State),
-    Returned { state: State, values: Vec<ValueId> },
+    AtBoundary {
+        state: State,
+        exit_pred: Option<BasicBlockId>,
+        /// Which boundary block the walk stopped at (the synthetic function
+        /// exit, or one of the caller's boundary blocks). `None` for a dead
+        /// end (`Unreachable`). With a multi-block boundary this is how the
+        /// caller learns *which* continuation an arm reached — the paper's
+        /// `p` value.
+        reached: Option<BasicBlockId>,
+    },
+    Returned {
+        state: State,
+        values: Vec<ValueId>,
+    },
 }
 
 impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
@@ -69,23 +91,57 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
         &mut self,
         entry_state: State,
         start: BasicBlockId,
-        end: Option<BasicBlockId>,
+        boundary: &[BasicBlockId],
         skip_loop_dispatch_at: Option<BasicBlockId>,
+        entry_prev: Option<BasicBlockId>,
     ) -> color_eyre::Result<RegionExit> {
         let mut current = start;
         let mut state = entry_state;
+        // The block we arrived at `current` from. Seeded with `entry_prev`
+        // (the branching head for a gamma arm) so an interior-join phi at
+        // the arm's first block resolves correctly. Set to `None` after a
+        // gamma/theta dispatch, whose join/exit phis are already bound by
+        // that dispatch and must not be re-resolved here.
+        let mut prev = entry_prev;
 
         loop {
-            // Hit the region's caller-supplied boundary (typically a
-            // gamma-arm join block).
-            if end == Some(current) {
-                return Ok(RegionExit::AtBoundary(state));
+            // Hit one of the region's caller-supplied boundary blocks
+            // (typically gamma-arm joins / continuation points). Report the
+            // block we reached it from (so an arm can pick its join-phi
+            // contribution) and which boundary block it was (the `p` the
+            // caller demultiplexes on).
+            if boundary.contains(&current) {
+                return Ok(RegionExit::AtBoundary {
+                    state,
+                    exit_pred: prev,
+                    reached: Some(current),
+                });
             }
 
             // Hit the synthetic function-exit block (added by the parser to
             // give every `Ret` a common destination).
             if current == self.fn_ctx.exit_block_id {
-                return Ok(RegionExit::AtBoundary(state));
+                return Ok(RegionExit::AtBoundary {
+                    state,
+                    exit_pred: prev,
+                    reached: Some(current),
+                });
+            }
+
+            // A multi-entry (irreducible) SCC is lowered at its dispatch
+            // dominator: the `q` entry-predicate is computed in the branch
+            // structure from here to the loop's entries, then a single
+            // theta runs the loop. Done before the per-entry loop dispatch
+            // below so control never reaches an individual entry vertex.
+            if Some(current) != skip_loop_dispatch_at {
+                if let Some(scc_id) = self.multi_entry_dispatch_at(current) {
+                    let (next_state, exit_target) =
+                        self.lower_multi_entry_dispatch(state, scc_id, current)?;
+                    state = next_state;
+                    current = exit_target;
+                    prev = None;
+                    continue;
+                }
             }
 
             // A block that is the entry vertex of a strongly connected
@@ -96,10 +152,35 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
             // comment).
             if Some(current) != skip_loop_dispatch_at {
                 if let Some(scc_id) = self.loop_at(current) {
-                    let (next_state, exit_target) = self.lower_scc_as_theta(state, scc_id)?;
+                    let (next_state, exit_target) =
+                        self.lower_scc_as_theta(state, scc_id, current)?;
                     state = next_state;
                     current = exit_target;
+                    // The loop bound any loop-closed phis at its exit target;
+                    // don't re-resolve them from a stale predecessor.
+                    prev = None;
                     continue;
+                }
+            }
+
+            // Interior-join phi resolution. When `current` is reached
+            // linearly (via a `Br`, or as a gamma arm's first block) from a
+            // known predecessor, bind any phi destinations here to the
+            // incoming value for that predecessor. This is what lets two
+            // arms that fall through to (or otherwise share) the same tail
+            // block each lower it path-aware — the shared block's phis pick
+            // the value for the path that arrived. Reached-via-gamma/theta
+            // joins have `prev = None` and are skipped (already bound).
+            if let Some(pred) = prev {
+                let bb = &self.fn_ctx.func.basic_blocks[current.0 as usize];
+                let phis = phi_instructions_at(bb);
+                for phi in &phis {
+                    if let Some((op, _)) =
+                        phi_incoming_from(phi, self.fn_ctx.bb_mapper, |id| id == pred)
+                    {
+                        let value = self.operand(op)?;
+                        self.name_to_value.insert(phi.dest.clone(), value);
+                    }
                 }
             }
 
@@ -121,6 +202,7 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
                 }
                 llvm_ir::Terminator::Br(br) => {
                     let next = self.fn_ctx.bb_mapper.get_expect(&br.dest);
+                    prev = Some(current);
                     current = *next;
                 }
                 llvm_ir::Terminator::CondBr(cond_br) => {
@@ -130,49 +212,101 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
                     // place every path leaving either arm must converge
                     // before continuing in the surrounding region.
                     //
-                    // We require that an immediate post-dominator exists
-                    // for every conditional branch we encounter. This is a
-                    // structured-branches assumption: both arms must
-                    // reconverge inside this region before the region
-                    // ends. Bahmann, Reissmann, Jahre, Meyer (2015)
-                    // section 4.2 handles the unstructured case by
-                    // partitioning the acyclic subgraph after a fan-out
-                    // into a head, several branch subgraphs, and a tail,
-                    // then introducing an auxiliary continuation
-                    // predicate p with assignments inside each branch
-                    // subgraph and a dispatching branch on p inside the
-                    // tail. That transform has not been implemented yet.
+                    // The arms are walked path-aware to this join (see the
+                    // interior-join phi resolution above and
+                    // `arm_phi_contributions`), so shared continuations —
+                    // switch fall-through tails, cross edges where two arms
+                    // reach the same block — are handled even though they
+                    // are dominated by no single arm.
                     //
-                    // Until it lands, sources with unstructured branches
-                    // (early returns inside conditionals, breaks out of
-                    // nested gammas, switch statements with shared
-                    // fall-through tails) panic here.
-                    let join = self.fn_ctx.post_immediate_dominators[current.0 as usize]
-                        .expect(
-                            "conditional branch has no immediate post-dominator: \
-                             arms do not reconverge inside the surrounding region. \
-                             Needs the not-yet-implemented continuation-predicate \
-                             transform (Bahmann et al. 2015 section 4.2).",
-                        );
-                    state = self.lower_cond_branch(state, cond_br, join)?;
+                    // The remaining unhandled shape is a branch with NO
+                    // common post-dominator at all (arms that never
+                    // reconverge before the function exit). Bahmann et al.
+                    // 2015 §4.2's auxiliary continuation predicate `p`
+                    // covers it; with this compiler's synthetic unified
+                    // exit block every branch has at least that as a
+                    // post-dominator, so the `.expect` is a guard against a
+                    // genuinely malformed/unreachable CFG rather than the
+                    // common path.
+                    let true_target = *self.fn_ctx.bb_mapper.get_expect(&cond_br.true_dest);
+                    let false_target = *self.fn_ctx.bb_mapper.get_expect(&cond_br.false_dest);
+                    let arm_targets = [true_target, false_target];
+                    let continuation_points =
+                        restructure::continuation_points(self.fn_ctx, &arm_targets, boundary);
+                    let join = self
+                        .resolve_branch_join(current, &continuation_points)
+                        .ok_or_else(|| {
+                            color_eyre::eyre::eyre!(
+                                "conditional branch at block {} has no post-dominator: \
+                                 its arms never reconverge, not even at the function exit",
+                                current.0
+                            )
+                        })?;
+                    if continuation_points.len() > 1
+                        && self.arms_reconverge(&arm_targets, &continuation_points, join)
+                    {
+                        // §4.2 multi-continuation: p-demux, lowered once.
+                        let predicate = self.operand(&cond_br.condition)?;
+                        state = self.lower_multi_continuation_branch(
+                            state,
+                            predicate,
+                            &arm_targets,
+                            &continuation_points,
+                            current,
+                            join,
+                        )?;
+                    } else {
+                        state = self.lower_cond_branch(state, cond_br, current, join)?;
+                    }
+                    // The gamma(s) bound `join`'s phis; resume there with no
+                    // linear predecessor so they are not re-resolved.
+                    prev = None;
                     current = join;
                 }
                 llvm_ir::Terminator::Switch(switch) => {
                     // An n-way switch lowers to an n-arm gamma node. Same
                     // post-dominator requirement and same continuation-
                     // predicate gap as the conditional branch case above.
-                    let join = self.fn_ctx.post_immediate_dominators[current.0 as usize]
-                        .expect(
-                            "switch terminator has no immediate post-dominator: \
-                             arms do not reconverge inside the surrounding region. \
-                             Needs the not-yet-implemented continuation-predicate \
-                             transform (Bahmann et al. 2015 section 4.2).",
-                        );
-                    state = self.lower_switch(state, switch, join)?;
+                    let mut arm_targets: SmallVec<[BasicBlockId; 8]> = SmallVec::new();
+                    arm_targets.push(*self.fn_ctx.bb_mapper.get_expect(&switch.default_dest));
+                    for (_, dest) in &switch.dests {
+                        arm_targets.push(*self.fn_ctx.bb_mapper.get_expect(dest));
+                    }
+                    let continuation_points =
+                        restructure::continuation_points(self.fn_ctx, &arm_targets, boundary);
+                    let join = self
+                        .resolve_branch_join(current, &continuation_points)
+                        .ok_or_else(|| {
+                            color_eyre::eyre::eyre!(
+                                "switch at block {} has no post-dominator: \
+                                 its arms do not reconverge inside the surrounding region",
+                                current.0
+                            )
+                        })?;
+                    if continuation_points.len() > 1
+                        && self.arms_reconverge(&arm_targets, &continuation_points, join)
+                    {
+                        let (selector, targets) = self.switch_selector(switch)?;
+                        state = self.lower_multi_continuation_branch(
+                            state,
+                            selector,
+                            &targets,
+                            &continuation_points,
+                            current,
+                            join,
+                        )?;
+                    } else {
+                        state = self.lower_switch(state, switch, current, join)?;
+                    }
+                    prev = None;
                     current = join;
                 }
                 llvm_ir::Terminator::Unreachable(_) => {
-                    return Ok(RegionExit::AtBoundary(state));
+                    return Ok(RegionExit::AtBoundary {
+                        state,
+                        exit_pred: prev,
+                        reached: None,
+                    });
                 }
                 t => todo!("handle terminator: {t:?}"),
             }
@@ -238,5 +372,92 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
     /// component's body but not at its entry).
     fn loop_at(&self, id: BasicBlockId) -> Option<SccTreeNodeId> {
         self.fn_ctx.scc_entry_block_to_id[id.0 as usize]
+    }
+
+    /// The block at which the build resumes after the branch terminating
+    /// `head`. With exactly one continuation point that IS the join. With
+    /// more than one (the `p`-demux) it is the post-dominator — the single
+    /// point all the continuations reconverge at, where the demux's outputs
+    /// land. Zero continuation points (arms that all return / exit) also use
+    /// the post-dominator, which the synthetic exit makes the function exit.
+    fn resolve_branch_join(
+        &self,
+        head: BasicBlockId,
+        continuation_points: &[BasicBlockId],
+    ) -> Option<BasicBlockId> {
+        if continuation_points.len() == 1 {
+            Some(continuation_points[0])
+        } else {
+            self.fn_ctx.post_immediate_dominators[head.0 as usize]
+        }
+    }
+
+    /// Whether the `p`-demux can lower this branch: every arm, walked to the
+    /// demux-target boundary (the continuation points plus `join`), must
+    /// actually reach one of those targets. An arm that instead escapes the
+    /// region — returning (reaching the synthetic exit) or hitting
+    /// `unreachable` first — cannot be expressed as a demux output yet, so
+    /// the caller falls back to the single-join path (which clones the
+    /// shared continuation but handles the escaping arm). Fixture 34's
+    /// done/spin branch is such a case.
+    fn arms_reconverge(
+        &self,
+        arm_targets: &[BasicBlockId],
+        continuation_points: &[BasicBlockId],
+        join: BasicBlockId,
+    ) -> bool {
+        let exit = self.fn_ctx.exit_block_id;
+        // A join at the function exit means the branch never reconverges at a
+        // real block (its arms return / diverge); the demux can't express
+        // that, so let the single-join path handle it.
+        if join == exit {
+            return false;
+        }
+        let is_target = |b: BasicBlockId| b == join || continuation_points.contains(&b);
+
+        // Forward region: every block an arm can reach before a demux target.
+        // Sinks (the function exit, `unreachable` blocks, infinite sub-loops)
+        // are included so we can detect them below. Bounded to the region —
+        // the walk never crosses a target, so it cannot run away through the
+        // rest of the function.
+        let mut region: FxHashSet<BasicBlockId> = FxHashSet::default();
+        let mut stack: SmallVec<[BasicBlockId; 16]> = SmallVec::new();
+        for &arm in arm_targets {
+            if !is_target(arm) {
+                stack.push(arm);
+            }
+        }
+        while let Some(b) = stack.pop() {
+            if !region.insert(b) {
+                continue;
+            }
+            for &succ in self.fn_ctx.bb_mapper.outputs(b) {
+                if !is_target(succ) && !region.contains(&succ) {
+                    stack.push(succ);
+                }
+            }
+        }
+
+        // Reverse reachability of a demux target, restricted to the region
+        // (only region predecessors are followed, so this is also bounded).
+        let mut can_reach: FxHashSet<BasicBlockId> = FxHashSet::default();
+        let mut reverse: SmallVec<[BasicBlockId; 16]> = SmallVec::new();
+        for &t in continuation_points {
+            reverse.push(t);
+        }
+        reverse.push(join);
+        while let Some(b) = reverse.pop() {
+            for &pred in self.fn_ctx.bb_mapper.inputs(b) {
+                if region.contains(&pred) && can_reach.insert(pred) {
+                    reverse.push(pred);
+                }
+            }
+        }
+
+        // The demux can lower this branch iff every block an arm reaches can
+        // itself reach a target — i.e. the region has no sink. A region block
+        // that cannot reach a target is a return / trap / infinite loop, which
+        // the demux cannot express; fall back to the single-join path.
+        region.iter().all(|b| can_reach.contains(b))
     }
 }

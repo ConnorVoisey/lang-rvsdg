@@ -78,6 +78,19 @@ fn get_reverse_post_order<V: CfgView>(view: &V) -> Vec<BasicBlockId> {
     ordered
 }
 
+/// Compute the immediate-dominator tree for `view`, indexed by block id.
+///
+/// The returned vector has one entry per block. A block's entry is:
+///   - `Some(idom)` for blocks reachable from the view's entry,
+///   - `Some(self)` for the entry block itself,
+///   - `None` for blocks NOT reachable from the view's entry.
+///
+/// For a [`ReverseView`] (post-dominators) the "entry" is the function
+/// exit, so the unreachable blocks are exactly those that cannot reach the
+/// exit: arms ending in a `noreturn` call, `unreachable`, or an infinite
+/// loop. Those have no post-dominator, hence `None`. Callers that need a
+/// post-dominator at a branch read it for the branch block, which (because
+/// at least one arm reaches the exit) is itself reachable and so resolves.
 pub fn compute_dominance<V: CfgView>(view: &V) -> Vec<Option<BasicBlockId>> {
     let reverse_post_order = get_reverse_post_order(view);
     compute_dominance_with_order(view, &reverse_post_order)
@@ -87,7 +100,12 @@ fn compute_dominance_with_order<V: CfgView>(
     view: &V,
     reverse_post_order: &[BasicBlockId],
 ) -> Vec<Option<BasicBlockId>> {
-    debug_assert_eq!(view.block_count(), reverse_post_order.len());
+    // `reverse_post_order` covers only the blocks reachable from the view's
+    // entry; blocks that cannot reach it are absent and keep `idom = None`
+    // below. The iterative solver and `intersect` only ever touch RPO
+    // blocks (a non-RPO block has `idom = None`, so it is skipped as a
+    // predecessor and never walked into), so a partial order is sound.
+    debug_assert!(reverse_post_order.len() <= view.block_count());
 
     // immediate_dominators[bb_id.0 as usize] = the immediate dominator of block bb_id,
     // or None if it hasn't been computed yet.
@@ -553,6 +571,26 @@ mod tests {
     }
 
     #[test]
+    fn post_dom_block_that_cannot_reach_exit_is_none() {
+        // 0 → 1 → 3 (exit)
+        // 0 → 2 → 2 (self-loop: block 2 never reaches the exit)
+        // Block 2 is unreachable in the reverse CFG, so it has no
+        // post-dominator (None) rather than tripping a precondition. The
+        // branch at 0 still resolves: its only exit-reaching path is via 1.
+        let (mut mapper, bbs) = init(4);
+        mapper.add_connection(bbs[0], bbs[1]);
+        mapper.add_connection(bbs[0], bbs[2]);
+        mapper.add_connection(bbs[1], bbs[3]);
+        mapper.add_connection(bbs[2], bbs[2]);
+
+        let pdoms = post_idoms_of(&mapper, bbs[3]);
+        assert_eq!(Some(bbs[3]), pdoms[3]); // exit post-dominates itself
+        assert_eq!(Some(bbs[3]), pdoms[1]); // 1 → 3
+        assert_eq!(Some(bbs[1]), pdoms[0]); // only exit path is 0 → 1 → 3
+        assert_eq!(None, pdoms[2]); // 2 cannot reach the exit
+    }
+
+    #[test]
     fn post_dom_linear_chain() {
         // 0 → 1 → 2 → 3 (exit)
         // Each block's post-idom is its only successor.
@@ -824,15 +862,23 @@ mod tests {
         // Each block dominates everything below it in the chain.
         for i in 0..bbs.len() {
             for j in i..bbs.len() {
-                assert!(dominates(bbs[i], bbs[j], &idoms),
-                    "block {} should dominate block {}", i, j);
+                assert!(
+                    dominates(bbs[i], bbs[j], &idoms),
+                    "block {} should dominate block {}",
+                    i,
+                    j
+                );
             }
         }
         // Blocks lower in the chain do NOT dominate higher ones.
         for i in 0..bbs.len() {
             for j in 0..i {
-                assert!(!dominates(bbs[i], bbs[j], &idoms),
-                    "block {} should NOT dominate block {}", i, j);
+                assert!(
+                    !dominates(bbs[i], bbs[j], &idoms),
+                    "block {} should NOT dominate block {}",
+                    i,
+                    j
+                );
             }
         }
     }
@@ -862,8 +908,11 @@ mod tests {
         mapper.add_connection(bbs[1], bbs[4]);
         let idoms = idoms_of(&mapper);
         for &b in &bbs {
-            assert!(dominates(bbs[0], b, &idoms),
-                "entry should dominate block {}", b.0);
+            assert!(
+                dominates(bbs[0], b, &idoms),
+                "entry should dominate block {}",
+                b.0
+            );
         }
     }
 }

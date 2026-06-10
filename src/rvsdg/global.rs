@@ -48,6 +48,14 @@ impl RVSDGMod {
         id
     }
 
+    /// Set (or replace) a global's initializer after it was declared.
+    /// Used by the two-pass global lowering: every global is registered
+    /// first so initializers can forward-reference globals declared later.
+    #[inline]
+    pub fn set_global_init(&mut self, id: GlobalId, initializer: GlobalInit) {
+        self.globals[id.0 as usize].initializer = initializer;
+    }
+
     #[inline]
     pub fn get_global(&self, id: GlobalId) -> &GlobalDef {
         &self.globals[id.0 as usize]

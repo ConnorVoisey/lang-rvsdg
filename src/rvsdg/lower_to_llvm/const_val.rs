@@ -113,6 +113,40 @@ impl RVSDGMod {
                     .as_pointer_value()
                     .as_basic_value_enum()
             }
+            ConstantKind::GetElementPointer {
+                base,
+                source_type,
+                indices,
+                in_bounds,
+            } => {
+                let base_ptr = self
+                    .lower_const_id(llvm_builder, mapper, *base)
+                    .into_pointer_value();
+                let source = self.type_to_basic_type_llvm(llvm_builder.context, *source_type);
+                let index_ids = self.constants.get_aggregate_elements(*indices).to_vec();
+                let index_vals: Vec<inkwell::values::IntValue<'ctx>> = index_ids
+                    .iter()
+                    .map(|&id| {
+                        self.lower_const_id(llvm_builder, mapper, id)
+                            .into_int_value()
+                    })
+                    .collect();
+                // SAFETY: inkwell marks every GEP constructor `unsafe`
+                // because mismatched indices/type are UB in LLVM. `source` is
+                // the source type the frontend recovered to match this GEP's
+                // index shape (i8 for the single-index byte form, the base's
+                // pointee type for a typed multi-index access), so the indices
+                // are valid for the type by construction. Same contract as
+                // the runtime GEP lowering in `value.rs`.
+                let result = unsafe {
+                    if *in_bounds {
+                        base_ptr.const_in_bounds_gep(source, &index_vals)
+                    } else {
+                        base_ptr.const_gep(source, &index_vals)
+                    }
+                };
+                result.as_basic_value_enum()
+            }
         }
     }
 
