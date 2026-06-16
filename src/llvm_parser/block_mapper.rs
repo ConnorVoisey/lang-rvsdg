@@ -38,7 +38,11 @@ impl BasicBlockMapper {
 
     #[inline]
     pub fn get_exit(&self) -> Option<&BasicBlockId> {
-        self.map.iter().last().map(|(_, v)| v)
+        // The synthetic exit is interned under the reserved `exit_name`; look
+        // it up by that name. (Not `map.iter().last()` -- `FxHashMap` iteration
+        // is in hash order, not insertion order, so the "last" entry is
+        // arbitrary and need not be the exit block.)
+        self.get(&self.exit_name())
     }
 
     #[inline]

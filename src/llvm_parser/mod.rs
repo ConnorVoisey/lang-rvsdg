@@ -1,9 +1,13 @@
 use crate::{
     llvm_parser::{
         block_mapper::{BasicBlockId, BasicBlockMapper},
+        control_flow::{
+            analysis::loops::compute_multi_entry_dispatch, construct::ConstructExit,
+            restructure::restructure_fn,
+        },
         dominance::{ForwardView, ReverseView, compute_dominance},
         instructions::RegionLowerer,
-        scc_tree::{SccTree, SccTreeNodeId},
+        scc::{SccTree, SccTreeNodeId},
     },
     rvsdg::{
         GlobalId, GlobalInit, InlineHint, Linkage, RVSDGMod, Visibility,
@@ -25,12 +29,10 @@ use target_lexicon::Triple;
 pub mod block_mapper;
 pub mod call_instructions;
 pub mod const_instructions;
+pub mod control_flow;
 pub mod dominance;
 pub mod instructions;
-pub mod loop_arcs;
-pub mod region;
-pub mod scc_tree;
-pub mod strongly_connected_components;
+pub mod scc;
 #[cfg(test)]
 pub mod test_utils;
 pub mod vector_instructions;
@@ -41,14 +43,20 @@ struct FnCtx<'m> {
     pub bb_mapper: &'m BasicBlockMapper,
     /// Tree of every non-trivial strongly connected component in the
     /// function, with parent / child nesting and per-component entry,
-    /// exit, and repetition arc analysis attached. Replaces the
-    /// natural-loop forest as the source of truth for loop detection.
+    /// exit, and repetition arc analysis attached. The source of truth
+    /// for loop detection.
     pub scc_tree: &'m SccTree,
     /// Per-block lookup: for each block id, the strongly connected
-    /// component whose entry vertex this block is (if any). Region
-    /// lowering uses this to dispatch into a theta node when it reaches
-    /// the start of a loop.
+    /// component whose entry vertex this block is (if any). The
+    /// restructuring transform uses this to dispatch into a theta node
+    /// when it reaches the start of a loop.
     pub scc_entry_block_to_id: &'m [Option<SccTreeNodeId>],
+    /// Per-block lookup: for each block id, the multi-entry (irreducible)
+    /// strongly connected component whose *dispatch dominator* this block is
+    /// (if any). Precomputed so the restructuring transform detects
+    /// irreducible-loop dispatch in O(1) rather than scanning every component
+    /// per block.
+    pub multi_entry_dispatch: &'m [Option<SccTreeNodeId>],
     /// Forward immediate dominators, indexed by block id. Used by
     /// branch-arm collection during gamma construction.
     pub immediate_dominators: &'m [Option<BasicBlockId>],
@@ -61,7 +69,107 @@ struct FnCtx<'m> {
     pub exit_block_id: BasicBlockId,
 }
 
+/// Intern every basic block of `func` to a dense [`BasicBlockId`], append the
+/// synthetic exit block, and add the CFG arcs of every block **reachable from
+/// the entry** -- including each `Ret`'s arc to that synthetic exit. This
+/// establishes the *closed CFG* (Bahmann, Reissmann, Jahre, Meyer 2015, Def 2.1:
+/// a unique entry with no predecessors and a unique exit with no successors) that
+/// the restructuring transform and construction walk operate on. Block 0 is the
+/// unique entry; the synthetic exit (`BasicBlockMapper::exit_name`) is the unique
+/// exit, recoverable from the returned mapper via `get_exit_expect`.
+///
+/// Arcs out of **unreachable** blocks are deliberately omitted. `clang
+/// -disable-llvm-passes` leaves dead blocks in place (no CFG cleanup runs), and
+/// an arc from a dead block *into* a loop fabricates a second entry vertex that
+/// makes a reducible loop look irreducible. Dead code cannot affect behaviour, so
+/// dropping its arcs is sound and keeps the loop analysis honest. Unreachable
+/// blocks stay interned (ids must keep matching `func.basic_blocks` indices) but
+/// end up arc-isolated, so the construction walk never reaches them.
+fn intern_blocks_and_arcs(func: &llvm_ir::Function) -> BasicBlockMapper {
+    let mut bb_mapper = BasicBlockMapper::new(func.basic_blocks.len());
+    for block in &func.basic_blocks {
+        bb_mapper.intern(&block.name);
+    }
+
+    // append the fake exit block to the blocks.
+    // this is used to map return values
+    let exit_block_id = {
+        let fake_exit_name = bb_mapper.exit_name();
+        debug_assert!(
+            bb_mapper.get(&fake_exit_name).is_none(),
+            "basic block used reserved name {fake_exit_name}"
+        );
+        bb_mapper.intern(&fake_exit_name)
+    };
+
+    // Mark the blocks reachable from the entry (block 0) by walking terminator
+    // successors. Arcs are added only for these, so dead blocks stay isolated.
+    let mut reachable = vec![false; func.basic_blocks.len()];
+    reachable[0] = true;
+    let mut stack = vec![0usize];
+    while let Some(i) = stack.pop() {
+        let mut succ_names: Vec<&llvm_ir::Name> = Vec::new();
+        match &func.basic_blocks[i].term {
+            llvm_ir::Terminator::Br(br) => succ_names.push(&br.dest),
+            llvm_ir::Terminator::CondBr(cond_br) => {
+                succ_names.push(&cond_br.true_dest);
+                succ_names.push(&cond_br.false_dest);
+            }
+            llvm_ir::Terminator::Switch(switch) => {
+                succ_names.push(&switch.default_dest);
+                for (_, dest) in &switch.dests {
+                    succ_names.push(dest);
+                }
+            }
+            _ => {}
+        }
+        for name in succ_names {
+            let succ = bb_mapper.get_expect(name).0 as usize;
+            if !reachable[succ] {
+                reachable[succ] = true;
+                stack.push(succ);
+            }
+        }
+    }
+
+    for (i, block) in func.basic_blocks.iter().enumerate() {
+        if !reachable[i] {
+            continue;
+        }
+        let from = BasicBlockId(i as u32);
+        match &block.term {
+            llvm_ir::Terminator::Br(br) => {
+                let to = *bb_mapper.get_expect(&br.dest);
+                bb_mapper.add_connection(from, to);
+            }
+            llvm_ir::Terminator::CondBr(cond_br) => {
+                let true_block = *bb_mapper.get_expect(&cond_br.true_dest);
+                let false_block = *bb_mapper.get_expect(&cond_br.false_dest);
+                bb_mapper.add_connection(from, true_block);
+                bb_mapper.add_connection(from, false_block);
+            }
+            llvm_ir::Terminator::Ret(_) => {
+                bb_mapper.add_connection(from, exit_block_id);
+            }
+            llvm_ir::Terminator::Switch(switch) => {
+                let default = *bb_mapper.get_expect(&switch.default_dest);
+                bb_mapper.add_connection(from, default);
+                for (_, dest) in &switch.dests {
+                    let dest_id = *bb_mapper.get_expect(dest);
+                    bb_mapper.add_connection(from, dest_id);
+                }
+            }
+            llvm_ir::Terminator::Unreachable(_) => (),
+            llvm_ir::Terminator::Invoke(_) => todo!(),
+            other => todo!("handle terminator case: {other:?}"),
+        }
+    }
+
+    bb_mapper
+}
+
 impl RVSDGMod {
+    #[tracing::instrument(skip_all)]
     pub fn from_llvm_mod(module: Module) -> color_eyre::Result<RVSDGMod> {
         let mut rvsdg_mod = match &module.target_triple {
             Some(triple) => RVSDGMod::new(
@@ -76,17 +184,17 @@ impl RVSDGMod {
 
         // lower function declerations
         for func in &module.func_declarations {
-            let decl = FnDecl::from_fn_decleration(&func, &mut rvsdg_mod.types, &module)?;
+            let decl = FnDecl::from_signature(func, &mut rvsdg_mod.types, &module)?;
             rvsdg_mod.declare_fn_full(decl);
         }
         for func in &module.functions {
-            let decl = FnDecl::from_fn(&func, &mut rvsdg_mod.types, &module)?;
+            let decl = FnDecl::from_fn(func, &mut rvsdg_mod.types, &module)?;
             rvsdg_mod.declare_fn_full(decl);
         }
 
         // Globals are lowered in two passes so an initializer can reference
         // a global/alias declared later in the module (csmith emits such
-        // forward references freely — e.g. one global initialised with the
+        // forward references freely -- e.g. one global initialised with the
         // address of another). Pass 1 registers every global, alias, and
         // ifunc name (and its type) in `global_map`; pass 2 resolves the
         // initializers, which may now look up any global by name.
@@ -99,10 +207,13 @@ impl RVSDGMod {
                     let ty = module.types.type_of(init.as_ref());
                     rvsdg_mod.types.convert_type_ref(&ty, &module)?
                 }
-                None => match rvsdg_mod.types.convert_type_ref(&global.ty, &module)? {
-                    TypeRef::Ptr(id) => rvsdg_mod.types.get_ptr(id).pointee.unwrap_or(VOID),
-                    ty => ty,
-                },
+                // No initializer (external/declared global): use its declared
+                // type directly. Under opaque pointers `global.ty` is already
+                // the content type (e.g. `@stderr = external global ptr` has
+                // content type `ptr`); the old code dereferenced it and fell
+                // back to `void` for an opaque pointee, which is not a valid
+                // value type and crashed the backend.
+                None => rvsdg_mod.types.convert_type_ref(&global.ty, &module)?,
             };
             let id = rvsdg_mod.define_global(
                 global_name_string(&global.name),
@@ -158,57 +269,19 @@ impl RVSDGMod {
         Ok(rvsdg_mod)
     }
 
+    #[tracing::instrument(skip_all, fields(func = %func.name))]
     fn lower_fn_body(
         &mut self,
         func: &llvm_ir::Function,
         module: &Module,
     ) -> color_eyre::Result<()> {
-        let rvsdg_fn = self.get_func_by_name(&func.name).unwrap();
-        let mut bb_mapper = BasicBlockMapper::new(func.basic_blocks.len());
-        for block in &func.basic_blocks {
-            bb_mapper.intern(&block.name);
-        }
+        let fn_id = self
+            .get_func_by_name(&func.name)
+            .ok_or_else(|| color_eyre::eyre::eyre!("function `{}` was not declared", func.name))?
+            .id;
+        let bb_mapper = intern_blocks_and_arcs(func);
+        let exit_block_id = *bb_mapper.get_exit_expect();
 
-        // append the fake exit block to the blocks.
-        // this is used to map return values
-        let exit_block_id = {
-            let fake_exit_name = bb_mapper.exit_name();
-            debug_assert!(
-                bb_mapper.get(&fake_exit_name).is_none(),
-                "basic block used reserved name {fake_exit_name}"
-            );
-            bb_mapper.intern(&fake_exit_name)
-        };
-
-        for (i, block) in func.basic_blocks.iter().enumerate() {
-            let from = BasicBlockId(i as u32);
-            match &block.term {
-                llvm_ir::Terminator::Br(br) => {
-                    let to = *bb_mapper.get_expect(&br.dest);
-                    bb_mapper.add_connection(from, to);
-                }
-                llvm_ir::Terminator::CondBr(cond_br) => {
-                    let true_block = *bb_mapper.get_expect(&cond_br.true_dest);
-                    let false_block = *bb_mapper.get_expect(&cond_br.false_dest);
-                    bb_mapper.add_connection(from, true_block);
-                    bb_mapper.add_connection(from, false_block);
-                }
-                llvm_ir::Terminator::Ret(_) => {
-                    bb_mapper.add_connection(from, exit_block_id);
-                }
-                llvm_ir::Terminator::Switch(switch) => {
-                    let default = *bb_mapper.get_expect(&switch.default_dest);
-                    bb_mapper.add_connection(from, default);
-                    for (_, dest) in &switch.dests {
-                        let d = *bb_mapper.get_expect(dest);
-                        bb_mapper.add_connection(from, d);
-                    }
-                }
-                llvm_ir::Terminator::Unreachable(_) => (),
-                llvm_ir::Terminator::Invoke(invoke) => todo!(),
-                t => todo!("handle terminator case: {t:?}"),
-            }
-        }
         // Compute dominators and post-dominators once per function;
         // both are borrowed by FnCtx during lowering.
         let forward_view = ForwardView {
@@ -224,10 +297,12 @@ impl RVSDGMod {
 
         // Build the strongly connected component tree. This performs the
         // whole-function Tarjan pass plus one sub-Tarjan per non-trivial
-        // component to recover nested-loop structure. See
-        // scc_tree.rs for the algorithm.
+        // component to recover nested-loop structure. See the `scc` module
+        // for the algorithm.
         let scc_tree = SccTree::build(&bb_mapper);
         let scc_entry_block_to_id = scc_tree.entry_block_to_node(bb_mapper.blocks.len());
+        let multi_entry_dispatch =
+            compute_multi_entry_dispatch(&scc_tree, &immediate_dominators, bb_mapper.blocks.len());
 
         let fn_ctx = FnCtx {
             llvm_mod: module,
@@ -235,28 +310,29 @@ impl RVSDGMod {
             bb_mapper: &bb_mapper,
             scc_tree: &scc_tree,
             scc_entry_block_to_id: &scc_entry_block_to_id,
+            multi_entry_dispatch: &multi_entry_dispatch,
             immediate_dominators: &immediate_dominators,
             post_immediate_dominators: &post_immediate_dominators,
             exit_block_id,
         };
 
-        self.define_fn(rvsdg_fn.id, |rb, state| {
+        // Two-phase construction: materialize the structured region tree, then
+        // construct the RVSDG from it.
+        let rst = restructure_fn(&fn_ctx)?;
+        self.define_fn(fn_id, |rb, state| {
             let mut builder = RegionLowerer::new(rb, &fn_ctx);
 
             // register function parameters
             for (i, param) in func.parameters.iter().enumerate() {
-                let val = builder.rb.param(i as u32);
-                builder.name_to_value.insert(param.name.clone(), val);
+                let value = builder.rb.param(i as u32);
+                builder.name_to_value.insert(param.name.clone(), value);
             }
 
-            // Lower the body from the entry block. lower_region returns the
-            // exit state plus any operand values from the function's `ret`
-            // terminator (empty Vec for void returns).
-            let exit = builder.lower_region(state, BasicBlockId(0), &[], None, None)?;
-
+            let exit = builder.construct(&rst, state, None, &[])?;
             let (state, values) = match exit {
-                region::RegionExit::AtBoundary { state, .. } => (state, vec![]),
-                region::RegionExit::Returned { state, values } => (state, values),
+                ConstructExit::Returned { state, values } => (state, values),
+                ConstructExit::AtBoundary { state, .. } => (state, vec![]),
+                ConstructExit::Diverge { state } => (state, vec![]),
             };
             Ok(FnResult { state, values })
         })
@@ -272,7 +348,7 @@ impl TypeArena {
             llvm_ir::Type::VoidType => VOID,
             llvm_ir::Type::IntegerType { bits } => TypeRef::Scalar(int_bit_to_scalar(*bits)?),
             llvm_ir::Type::PointerType { addr_space: _ } => {
-                // Opaque pointers in LLVM 17+ — no pointee type
+                // Opaque pointers in LLVM 17+ -- no pointee type
                 TypeRef::Ptr(self.intern_ptr(PtrType {
                     pointee: None,
                     alias_set: None,
@@ -382,23 +458,71 @@ impl TypeArena {
     }
 }
 
+/// The function-signature fields shared by `llvm_ir::Function` and
+/// `FunctionDeclaration`. Implementing it for both lets the signature ->
+/// `FnDecl` conversion read the fields by reference from either, instead of
+/// cloning a whole temporary `FunctionDeclaration` per defined function.
+trait FnSignature {
+    fn sig_name(&self) -> &str;
+    fn sig_parameters(&self) -> &[llvm_ir::function::Parameter];
+    fn sig_is_var_arg(&self) -> bool;
+    fn sig_return_type(&self) -> &LLVMTypeRef;
+    fn sig_linkage(&self) -> llvm_ir::module::Linkage;
+    fn sig_visibility(&self) -> llvm_ir::module::Visibility;
+    fn sig_calling_convention(&self) -> llvm_ir::function::CallingConvention;
+    fn sig_alignment(&self) -> u32;
+}
+
+macro_rules! impl_fn_signature {
+    ($t:ty) => {
+        impl FnSignature for $t {
+            fn sig_name(&self) -> &str {
+                &self.name
+            }
+            fn sig_parameters(&self) -> &[llvm_ir::function::Parameter] {
+                &self.parameters
+            }
+            fn sig_is_var_arg(&self) -> bool {
+                self.is_var_arg
+            }
+            fn sig_return_type(&self) -> &LLVMTypeRef {
+                &self.return_type
+            }
+            fn sig_linkage(&self) -> llvm_ir::module::Linkage {
+                self.linkage
+            }
+            fn sig_visibility(&self) -> llvm_ir::module::Visibility {
+                self.visibility
+            }
+            fn sig_calling_convention(&self) -> llvm_ir::function::CallingConvention {
+                self.calling_convention
+            }
+            fn sig_alignment(&self) -> u32 {
+                self.alignment
+            }
+        }
+    };
+}
+impl_fn_signature!(FunctionDeclaration);
+impl_fn_signature!(llvm_ir::Function);
+
 impl FnDecl {
-    fn from_fn_decleration(
-        func: &FunctionDeclaration,
+    fn from_signature<S: FnSignature + ?Sized>(
+        func: &S,
         types: &mut TypeArena,
         module: &Module,
     ) -> color_eyre::Result<Self> {
-        let ret_ty = types.convert_type_ref(&func.return_type, module)?;
+        let ret_ty = types.convert_type_ref(func.sig_return_type(), module)?;
         let return_types = if ret_ty == VOID { vec![] } else { vec![ret_ty] };
 
         Ok(Self {
-            name: func.name.clone(),
+            name: func.sig_name().to_string(),
             params: func
-                .parameters
+                .sig_parameters()
                 .iter()
                 .map(|param| {
                     Ok(Param {
-                        ty: types.convert_type_ref(&param.ty.clone(), module)?,
+                        ty: types.convert_type_ref(&param.ty, module)?,
                         flags: ParamAttrFlags::empty(),
                         extra: None,
                     })
@@ -409,16 +533,16 @@ impl FnDecl {
                 flags: ParamAttrFlags::empty(),
                 extra: None,
             },
-            linkage_type: convert_linkage(func.linkage),
-            calling_convention: convert_calling_convention(func.calling_convention),
-            is_var_arg: func.is_var_arg,
-            is_exported: func.visibility != llvm_ir::module::Visibility::Hidden,
+            linkage_type: convert_linkage(func.sig_linkage()),
+            calling_convention: convert_calling_convention(func.sig_calling_convention())?,
+            is_var_arg: func.sig_is_var_arg(),
+            is_exported: func.sig_visibility() != llvm_ir::module::Visibility::Hidden,
             inline_hint: InlineHint::Auto,
-            visibility: convert_visibility(func.visibility),
+            visibility: convert_visibility(func.sig_visibility()),
             attrs: FnAttrs {
                 flags: FnAttrFlags::empty(),
-                alignment: if func.alignment > 0 {
-                    Some(func.alignment)
+                alignment: if func.sig_alignment() > 0 {
+                    Some(func.sig_alignment())
                 } else {
                     None
                 },
@@ -432,25 +556,10 @@ impl FnDecl {
         types: &mut TypeArena,
         module: &Module,
     ) -> color_eyre::Result<Self> {
-        // Function and FunctionDeclaration share the same signature fields,
-        // so we construct a temporary FunctionDeclaration to reuse the logic.
-        // TODO: this is very imperformant, replace with a trait that allows us to inline getting
-        // each field
-        let as_decl = FunctionDeclaration {
-            name: func.name.clone(),
-            parameters: func.parameters.clone(),
-            is_var_arg: func.is_var_arg,
-            return_type: func.return_type.clone(),
-            return_attributes: func.return_attributes.clone(),
-            linkage: func.linkage,
-            visibility: func.visibility,
-            dll_storage_class: func.dll_storage_class,
-            calling_convention: func.calling_convention,
-            alignment: func.alignment,
-            garbage_collector_name: func.garbage_collector_name.clone(),
-            debugloc: func.debugloc.clone(),
-        };
-        let mut decl = Self::from_fn_decleration(&as_decl, types, module)?;
+        // Read the signature fields directly off the `Function` (it and
+        // `FunctionDeclaration` both implement `FnSignature`) -- no temporary
+        // clone -- then layer on the function-level attributes declarations lack.
+        let mut decl = Self::from_signature(func, types, module)?;
 
         // Apply function-level attributes that declarations don't have
         for attr in &func.function_attributes {
@@ -515,8 +624,14 @@ fn convert_linkage(linkage: llvm_ir::module::Linkage) -> Linkage {
     }
 }
 
-fn convert_calling_convention(cc: llvm_ir::function::CallingConvention) -> CallingConvention {
-    match cc {
+fn convert_calling_convention(
+    cc: llvm_ir::function::CallingConvention,
+) -> color_eyre::Result<CallingConvention> {
+    // Only conventions with an exact RVSDG counterpart are accepted. An unknown
+    // or unmappable convention is rejected rather than silently remapped (e.g.
+    // to C) -- remapping a calling convention is a silent miscompile, which is
+    // exactly the kind of bug differential testing must not paper over.
+    let converted = match cc {
         llvm_ir::function::CallingConvention::C => CallingConvention::C,
         llvm_ir::function::CallingConvention::Fast => CallingConvention::Fast,
         llvm_ir::function::CallingConvention::Cold => CallingConvention::Cold,
@@ -525,12 +640,13 @@ fn convert_calling_convention(cc: llvm_ir::function::CallingConvention) -> Calli
         llvm_ir::function::CallingConvention::PreserveMost => CallingConvention::PreserveMost,
         llvm_ir::function::CallingConvention::PreserveAll => CallingConvention::PreserveAll,
         llvm_ir::function::CallingConvention::Swift => CallingConvention::Swift,
-        llvm_ir::function::CallingConvention::CXX_FastTLS => CallingConvention::Fast,
         other => {
-            eprintln!("warning: unsupported calling convention {other:?}, defaulting to C");
-            CallingConvention::C
+            return Err(color_eyre::eyre::eyre!(
+                "unsupported calling convention: {other:?}"
+            ));
         }
-    }
+    };
+    Ok(converted)
 }
 
 fn convert_visibility(vis: llvm_ir::module::Visibility) -> Visibility {
@@ -549,10 +665,10 @@ fn convert_visibility(vis: llvm_ir::module::Visibility) -> Visibility {
 /// width so that negative values are represented correctly in the i64.
 ///
 /// Examples:
-///   - i8 `-1`:  LLVM stores 0xFF (255). Sign-extend → -1i64. Lowering: -1i64 as u64 = 0xFFFFFFFF_FFFFFFFF, truncated to i8 = 0xFF. ✓
-///   - i8 `127`: LLVM stores 0x7F (127). Sign-extend → 127i64. ✓
-///   - i32 `-1`: LLVM stores 0xFFFFFFFF. Sign-extend → -1i64. ✓
-///   - i64 `-1`: LLVM stores 0xFFFFFFFF_FFFFFFFF. Cast → -1i64. ✓
+///   - i8 `-1`:  LLVM stores 0xFF (255). Sign-extend -> -1i64. Lowering: -1i64 as u64 = 0xFFFFFFFF_FFFFFFFF, truncated to i8 = 0xFF. OK
+///   - i8 `127`: LLVM stores 0x7F (127). Sign-extend -> 127i64. OK
+///   - i32 `-1`: LLVM stores 0xFFFFFFFF. Sign-extend -> -1i64. OK
+///   - i64 `-1`: LLVM stores 0xFFFFFFFF_FFFFFFFF. Cast -> -1i64. OK
 pub(super) fn sign_extend_to_i64(value: u64, bits: u32) -> i64 {
     if bits >= 64 {
         value as i64

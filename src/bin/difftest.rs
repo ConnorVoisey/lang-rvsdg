@@ -1,22 +1,22 @@
 //! Differential-testing / fuzzing driver for the RVSDG compiler.
 //!
-//! For each C input it compiles two binaries — one with the RVSDG compiler
+//! For each C input it compiles two binaries -- one with the RVSDG compiler
 //! (`lang-rvsdg`, this crate's main binary) and one with `clang` as the
-//! reference — runs both, and compares their stdout and exit code. With
+//! reference -- runs both, and compares their stdout and exit code. With
 //! `--count` it instead fuzzes: it generates programs with `csmith` and
 //! runs the same comparison in a loop, saving any failing input.
 //!
 //! Everything is run as a subprocess with a timeout, so a compiler crash,
 //! an `abort()`, or an infinite loop is isolated and reported rather than
-//! taking the driver down — and a slow/hanging compile is itself a finding.
+//! taking the driver down -- and a slow/hanging compile is itself a finding.
 //!
 //! Outcomes:
-//!   - PASS         — same stdout and exit code
-//!   - MISMATCH     — different stdout/exit (the real correctness bug)
-//!   - ICE          — the RVSDG compiler exited nonzero (unsupported feature / crash)
-//!   - COMPILE-SLOW — the RVSDG compile exceeded the timeout (possible hang)
-//!   - RUN-TIMEOUT  — the RVSDG-produced binary hung
-//!   - (clang-fail) — the reference didn't compile; the input is skipped
+//!   - PASS         -- same stdout and exit code
+//!   - MISMATCH     -- different stdout/exit (the real correctness bug)
+//!   - ICE          -- the RVSDG compiler exited nonzero (unsupported feature / crash)
+//!   - COMPILE-SLOW -- the RVSDG compile exceeded the timeout (possible hang)
+//!   - RUN-TIMEOUT  -- the RVSDG-produced binary hung
+//!   - (clang-fail) -- the reference didn't compile; the input is skipped
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -90,10 +90,9 @@ struct Args {
 /// The result of compiling one binary with the RVSDG compiler.
 enum Compile {
     Ok {
-        bin: PathBuf,
         elapsed: Duration,
     },
-    /// Compiler exited nonzero (unsupported feature, panic, …).
+    /// Compiler exited nonzero (unsupported feature, panic, ...).
     Ice {
         elapsed: Duration,
         stderr: String,
@@ -114,7 +113,8 @@ enum Outcome {
     Pass {
         rvsdg_compile: Duration,
         clang_compile: Duration,
-        run: Duration,
+        rvsdg_run: Duration,
+        clang_run: Duration,
     },
     Mismatch {
         rvsdg: (Vec<u8>, Option<i32>),
@@ -189,10 +189,7 @@ fn compile_rvsdg(
     let (status, elapsed) = spawn_timed(cmd, Duration::from_secs(args.compile_timeout))?;
     Ok(match status {
         None => Compile::Timeout { elapsed },
-        Some(s) if s.success() && out.exists() => Compile::Ok {
-            bin: out.to_path_buf(),
-            elapsed,
-        },
+        Some(s) if s.success() && out.exists() => Compile::Ok { elapsed },
         Some(_) => Compile::Ice {
             elapsed,
             stderr: fs::read_to_string(&err_path).unwrap_or_default(),
@@ -202,7 +199,10 @@ fn compile_rvsdg(
 
 fn compile_clang(c_file: &Path, out: &Path, args: &Args) -> std::io::Result<bool> {
     let mut cmd = Command::new("clang");
-    cmd.args(["-O2", "-w"]);
+    // `-O0`: the RVSDG path does no optimisation yet, so an unoptimised clang
+    // is the apples-to-apples baseline -- both the compile-time and runtime
+    // comparisons then reflect codegen, not clang's optimiser doing extra work.
+    cmd.args(["-O0", "-w"]);
     for dir in &args.include {
         cmd.arg("-I").arg(dir);
     }
@@ -269,7 +269,7 @@ fn differential_test(
         Run::Timeout => return Ok(Outcome::RunTimeout),
         Run::Ok { stdout, code } => (stdout, code),
     };
-    let (c_run, _) = run_binary(&clang_bin, run_timeout, tmp)?;
+    let (c_run, c_dur) = run_binary(&clang_bin, run_timeout, tmp)?;
     let c = match c_run {
         Run::Timeout => return Ok(Outcome::RunTimeout),
         Run::Ok { stdout, code } => (stdout, code),
@@ -279,7 +279,8 @@ fn differential_test(
         Ok(Outcome::Pass {
             rvsdg_compile,
             clang_compile,
-            run: r_dur,
+            rvsdg_run: r_dur,
+            clang_run: c_dur,
         })
     } else {
         Ok(Outcome::Mismatch { rvsdg: r, clang: c })
@@ -287,9 +288,9 @@ fn differential_test(
 }
 
 /// Pull the most informative one-liner out of a failed compile's stderr:
-/// the panic message (color-eyre prints `Message:  …`) or the propagated
+/// the panic message (color-eyre prints `Message:  ...`) or the propagated
 /// `Error:` text, skipping boilerplate.
-/// Drop ANSI escape sequences (`ESC [ … m`) so saved/printed reasons are
+/// Drop ANSI escape sequences (`ESC [ ... m`) so saved/printed reasons are
 /// plain text regardless of the compiler's coloring.
 fn strip_ansi(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -377,6 +378,17 @@ fn save_finding(c_file: &Path, tag: &str, outcome: &Outcome, dir: &Path) -> std:
     Ok(())
 }
 
+/// `a / b` as an f64, guarding the zero-duration denominator (sub-millisecond
+/// runtimes round to zero often enough on trivial programs to matter).
+fn ratio(a: Duration, b: Duration) -> f64 {
+    let b = b.as_secs_f64();
+    if b == 0.0 {
+        f64::NAN
+    } else {
+        a.as_secs_f64() / b
+    }
+}
+
 #[derive(Default)]
 struct Stats {
     total: u64,
@@ -386,6 +398,12 @@ struct Stats {
     compile_slow: u64,
     run_timeout: u64,
     clang_fail: u64,
+    /// Summed over passing programs, so the aggregate compares rvsdg vs clang
+    /// on the same corpus (the per-program ratio is reported by `report_single`).
+    rvsdg_compile_sum: Duration,
+    clang_compile_sum: Duration,
+    rvsdg_run_sum: Duration,
+    clang_run_sum: Duration,
     /// (compile time, tag) for the slowest RVSDG compiles seen.
     slowest: Vec<(Duration, String)>,
 }
@@ -394,8 +412,17 @@ impl Stats {
     fn record(&mut self, tag: &str, outcome: &Outcome) {
         self.total += 1;
         match outcome {
-            Outcome::Pass { rvsdg_compile, .. } => {
+            Outcome::Pass {
+                rvsdg_compile,
+                clang_compile,
+                rvsdg_run,
+                clang_run,
+            } => {
                 self.pass += 1;
+                self.rvsdg_compile_sum += *rvsdg_compile;
+                self.clang_compile_sum += *clang_compile;
+                self.rvsdg_run_sum += *rvsdg_run;
+                self.clang_run_sum += *clang_run;
                 self.note_compile(*rvsdg_compile, tag);
             }
             Outcome::Mismatch { .. } => self.mismatch += 1,
@@ -424,6 +451,23 @@ impl Stats {
         println!("  compile-slow:  {}", self.compile_slow);
         println!("  run-timeout:   {}", self.run_timeout);
         println!("  clang-fail:    {}", self.clang_fail);
+        if self.pass > 0 {
+            let n = self.pass as f64;
+            let mean = |d: Duration| d.as_secs_f64() / n;
+            println!("  over {} passing programs (mean per program):", self.pass);
+            println!(
+                "    compile:  rvsdg {:.3}s  clang {:.3}s  ({:.1}x slower)",
+                mean(self.rvsdg_compile_sum),
+                mean(self.clang_compile_sum),
+                ratio(self.rvsdg_compile_sum, self.clang_compile_sum),
+            );
+            println!(
+                "    run:      rvsdg {:.3}s  clang {:.3}s  ({:.1}x slower)",
+                mean(self.rvsdg_run_sum),
+                mean(self.clang_run_sum),
+                ratio(self.rvsdg_run_sum, self.clang_run_sum),
+            );
+        }
         if !self.slowest.is_empty() {
             println!("  slowest RVSDG compiles:");
             for (d, tag) in &self.slowest {
@@ -463,11 +507,11 @@ fn main() -> std::io::Result<()> {
 }
 
 /// Fuzz `args.count` csmith programs in parallel across all available cores
-/// (or `--jobs` of them). Each seed is fully independent — its own csmith
-/// program, its own compiles, its own run — so the only shared state is the
+/// (or `--jobs` of them). Each seed is fully independent -- its own csmith
+/// program, its own compiles, its own run -- so the only shared state is the
 /// findings directory (distinct filenames per seed) and stdout. Each worker
 /// gets a private temp dir so the fixed-name scratch files
-/// (`rvsdg_out`, `clang_out`, …) can't collide between threads.
+/// (`rvsdg_out`, `clang_out`, ...) can't collide between threads.
 fn fuzz(cc: &Path, args: &Args) -> std::io::Result<()> {
     if args.jobs > 0 {
         // Best-effort: ignore the error if the global pool is already set.
@@ -519,7 +563,7 @@ fn fuzz(cc: &Path, args: &Args) -> std::io::Result<()> {
                 // single line) so concurrent worker output stays readable.
                 match &outcome {
                     Outcome::Ice { stderr, .. } => {
-                        println!("seed {seed}: ICE — {}", ice_reason(stderr))
+                        println!("seed {seed}: ICE -- {}", ice_reason(stderr))
                     }
                     other => println!("seed {seed}: {}", other.label()),
                 }
@@ -549,13 +593,17 @@ fn report_single(input: &Path, outcome: &Outcome) {
         Outcome::Pass {
             rvsdg_compile,
             clang_compile,
-            run,
+            rvsdg_run,
+            clang_run,
         } => println!(
-            "PASS  {}  (rvsdg-compile {:.3}s, clang-compile {:.3}s, run {:.3}s)",
+            "PASS  {}  compile: rvsdg {:.3}s / clang {:.3}s ({:.1}x)  run: rvsdg {:.3}s / clang {:.3}s ({:.1}x)",
             input.display(),
             rvsdg_compile.as_secs_f64(),
             clang_compile.as_secs_f64(),
-            run.as_secs_f64(),
+            ratio(*rvsdg_compile, *clang_compile),
+            rvsdg_run.as_secs_f64(),
+            clang_run.as_secs_f64(),
+            ratio(*rvsdg_run, *clang_run),
         ),
         Outcome::Mismatch { rvsdg, clang } => {
             println!("MISMATCH  {}", input.display());

@@ -31,7 +31,7 @@ bitflags::bitflags! {
     pub struct FnAttrFlags: u16 {
         /// Function never returns (e.g. exit, abort)
         const NO_RETURN                 = 1 << 0;
-        /// Function never unwinds — no exceptions or longjmp
+        /// Function never unwinds -- no exceptions or longjmp
         const NO_UNWIND                 = 1 << 1;
         /// Function does not read or write any memory visible to the caller
         const NO_MEMORY                 = 1 << 2;
@@ -47,7 +47,7 @@ bitflags::bitflags! {
         const ONLY_ACCESSES_ARG_MEMORY  = 1 << 7;
         /// Function returns its first argument (e.g. memcpy returns dst)
         const RETURNS_FIRST_ARG         = 1 << 8;
-        /// Function is rarely called — backend may place in cold section
+        /// Function is rarely called -- backend may place in cold section
         const COLD                      = 1 << 9;
         /// Must not be inlined
         const NO_INLINE                 = 1 << 10;
@@ -114,9 +114,9 @@ pub struct ParamAttrs {
 /// Extended parameter attributes that are rarely present.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParamAttrsExtra {
-    /// Aggregate passed by value — pointee is copied to the stack
+    /// Aggregate passed by value -- pointee is copied to the stack
     pub by_value: Option<TypeRef>,
-    /// Hidden struct-return pointer — callee writes return value here
+    /// Hidden struct-return pointer -- callee writes return value here
     pub struct_return: Option<TypeRef>,
     /// Pointer argument must be aligned to at least this many bytes
     pub alignment: Option<u32>,
@@ -132,13 +132,13 @@ pub enum CallingConvention {
     /// Standard C calling convention
     #[default]
     C,
-    /// Fast — allows tail calls, passes args in registers aggressively
+    /// Fast -- allows tail calls, passes args in registers aggressively
     Fast,
-    /// Cold — optimised for rarely-called functions
+    /// Cold -- optimised for rarely-called functions
     Cold,
-    /// GHC — Glasgow Haskell Compiler convention
+    /// GHC -- Glasgow Haskell Compiler convention
     GHC,
-    /// HiPE — High Performance Erlang convention
+    /// HiPE -- High Performance Erlang convention
     HiPE,
     /// Preserves most registers across the call
     PreserveMost,
@@ -290,7 +290,7 @@ pub struct CallResult {
     pub result_count: u16,
 }
 
-// TODO: Same short-lived Vec allocation as BranchResult/LoopResult — see
+// TODO: Same short-lived Vec allocation as BranchResult/LoopResult -- see
 // builder/mod.rs for the profiling note about SmallVec.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FnResult {

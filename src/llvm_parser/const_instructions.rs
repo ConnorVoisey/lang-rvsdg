@@ -1,5 +1,3 @@
-use std::any::Any;
-
 use crate::{
     llvm_parser::{global_name_string, int_bit_to_scalar, sign_extend_to_i64},
     rvsdg::{
@@ -53,7 +51,7 @@ impl RVSDGMod {
                 // same as an array (the backend dispatches on the type:
                 // arrays use const_array, structs use const_struct). The
                 // struct type comes from the whole constant's type. Packing
-                // is not tracked here — the backend builds non-packed
+                // is not tracked here -- the backend builds non-packed
                 // structs, and csmith is run with --no-packed-struct.
                 let llvm_ty = module.types.type_of(const_ref.as_ref());
                 let ty = self.types.convert_type_ref(&llvm_ty, module)?;
@@ -150,10 +148,10 @@ impl RVSDGMod {
                 let base_type = self.constants.get(base).ty;
                 // llvm-ir drops the source element type on a constant GEP
                 // (opaque pointers), so recover it from the index shape:
-                //   - one index  → LLVM's canonical byte form
+                //   - one index  -> LLVM's canonical byte form
                 //     `getelementptr (i8, ptr base, i64 offset)`; index over i8.
-                //   - many indices → a typed aggregate access
-                //     `getelementptr (T, ptr base, 0, k, …)`; the source type
+                //   - many indices -> a typed aggregate access
+                //     `getelementptr (T, ptr base, 0, k, ...)`; the source type
                 //     T is what `base` points to.
                 let source_type = if gep.indices.len() == 1 {
                     TypeRef::Scalar(ScalarType::I8)
@@ -193,7 +191,7 @@ impl RVSDGMod {
         Ok(self.constants.intern(const_def))
     }
 
-    /// The element type a pointer constant points to — the *source type* for a
+    /// The element type a pointer constant points to -- the *source type* for a
     /// typed GEP applied to it. A global points to its value type; a nested
     /// constant GEP points to the element its own indices land on (its source
     /// type descended by every index after the leading pointer-stride index).

@@ -51,7 +51,7 @@ pub enum BinaryOp {
     FloatRem,
 }
 
-/// Arithmetic flags. Not all flags apply to all ops —
+/// Arithmetic flags. Not all flags apply to all ops --
 /// no_signed_wrap/no_unsigned_wrap apply to add/sub/mul/shl,
 /// exact applies to udiv/sdiv/lshr/ashr.
 /// Unused flags for a given op are simply false.
@@ -207,7 +207,7 @@ pub enum AtomicRMWOp {
 /// All memory intrinsics take state and produce state. Args layout is documented per variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum IntrinsicOp {
-    // ── Memory operations ───────────────────────────────────────
+    // -- Memory operations ---------------------------------------
     /// Copy non-overlapping memory. Args: [dst, src, len]
     MemCopy,
     /// Copy possibly-overlapping memory. Args: [dst, src, len]
@@ -215,21 +215,21 @@ pub enum IntrinsicOp {
     /// Fill memory with a byte value. Args: [dst, val, len]
     MemSet,
 
-    // ── Overflow-checked arithmetic (result + overflow flag) ────
-    /// Signed add with overflow. Args: [lhs, rhs] → (result, overflow_bit)
+    // -- Overflow-checked arithmetic (result + overflow flag) ----
+    /// Signed add with overflow. Args: [lhs, rhs] -> (result, overflow_bit)
     SignedAddOverflow,
-    /// Unsigned add with overflow. Args: [lhs, rhs] → (result, overflow_bit)
+    /// Unsigned add with overflow. Args: [lhs, rhs] -> (result, overflow_bit)
     UnsignedAddOverflow,
-    /// Signed sub with overflow. Args: [lhs, rhs] → (result, overflow_bit)
+    /// Signed sub with overflow. Args: [lhs, rhs] -> (result, overflow_bit)
     SignedSubOverflow,
-    /// Unsigned sub with overflow. Args: [lhs, rhs] → (result, overflow_bit)
+    /// Unsigned sub with overflow. Args: [lhs, rhs] -> (result, overflow_bit)
     UnsignedSubOverflow,
-    /// Signed mul with overflow. Args: [lhs, rhs] → (result, overflow_bit)
+    /// Signed mul with overflow. Args: [lhs, rhs] -> (result, overflow_bit)
     SignedMulOverflow,
-    /// Unsigned mul with overflow. Args: [lhs, rhs] → (result, overflow_bit)
+    /// Unsigned mul with overflow. Args: [lhs, rhs] -> (result, overflow_bit)
     UnsignedMulOverflow,
 
-    // ── Saturating arithmetic ──────────────────────────────────
+    // -- Saturating arithmetic ----------------------------------
     /// Signed add clamped to min/max. Args: [lhs, rhs]
     SignedAddSaturate,
     /// Unsigned add clamped to max. Args: [lhs, rhs]
@@ -239,7 +239,7 @@ pub enum IntrinsicOp {
     /// Unsigned sub clamped to 0. Args: [lhs, rhs]
     UnsignedSubSaturate,
 
-    // ── Min / Max ──────────────────────────────────────────────
+    // -- Min / Max ----------------------------------------------
     /// Signed integer minimum. Args: [lhs, rhs]
     SignedMin,
     /// Signed integer maximum. Args: [lhs, rhs]
@@ -249,7 +249,7 @@ pub enum IntrinsicOp {
     /// Unsigned integer maximum. Args: [lhs, rhs]
     UnsignedMax,
 
-    // ── Misc ───────────────────────────────────────────────────
+    // -- Misc ---------------------------------------------------
     /// Absolute value of a signed integer. Args: [value]
     IntAbs,
     /// Fused multiply-add (a*b + c). Args: [a, b, c]

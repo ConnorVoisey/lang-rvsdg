@@ -3,8 +3,8 @@ use crate::rvsdg::{
     func::Function,
     lower_to_llvm::{LLVMBuilderCtx, ValueMapper},
 };
+use color_eyre::eyre::{bail, eyre};
 use inkwell::{
-    builder::BuilderError,
     intrinsics::Intrinsic,
     types::BasicTypeEnum,
     values::{BasicMetadataValueEnum, BasicValueEnum, ValueKind},
@@ -19,7 +19,7 @@ impl RVSDGMod {
         rvsdg_func: &Function,
         op: UnaryOp,
         operand: ValueId,
-    ) -> Result<BasicValueEnum<'ctx>, BuilderError> {
+    ) -> color_eyre::Result<BasicValueEnum<'ctx>> {
         let val = self.expect_value(llvm_builder, mapper, rvsdg_func, operand)?;
         let b = &llvm_builder.builder;
         let val_int = || val.into_int_value();
@@ -40,7 +40,7 @@ impl RVSDGMod {
                     &[int_type],
                     &[int_val.into(), is_zero_poison.into()],
                     "ctlz",
-                )
+                )?
             }
             UnaryOp::CountTrailingZeros => {
                 let int_val = val_int();
@@ -52,7 +52,7 @@ impl RVSDGMod {
                     &[int_type],
                     &[int_val.into(), is_zero_poison.into()],
                     "cttz",
-                )
+                )?
             }
             UnaryOp::CountOnes => {
                 let int_val = val_int();
@@ -63,7 +63,7 @@ impl RVSDGMod {
                     &[int_type],
                     &[int_val.into()],
                     "ctpop",
-                )
+                )?
             }
             UnaryOp::ByteSwap => {
                 let int_val = val_int();
@@ -74,7 +74,7 @@ impl RVSDGMod {
                     &[int_type],
                     &[int_val.into()],
                     "bswap",
-                )
+                )?
             }
             UnaryOp::BitReverse => {
                 let int_val = val_int();
@@ -85,7 +85,7 @@ impl RVSDGMod {
                     &[int_type],
                     &[int_val.into()],
                     "bitrev",
-                )
+                )?
             }
             UnaryOp::FloatAbs => {
                 let float_val = val_float();
@@ -96,7 +96,7 @@ impl RVSDGMod {
                     &[float_type],
                     &[float_val.into()],
                     "fabs",
-                )
+                )?
             }
             UnaryOp::FloatFloor => {
                 let float_val = val_float();
@@ -107,7 +107,7 @@ impl RVSDGMod {
                     &[float_type],
                     &[float_val.into()],
                     "floor",
-                )
+                )?
             }
             UnaryOp::FloatCeil => {
                 let float_val = val_float();
@@ -118,7 +118,7 @@ impl RVSDGMod {
                     &[float_type],
                     &[float_val.into()],
                     "ceil",
-                )
+                )?
             }
             UnaryOp::FloatRound => {
                 let float_val = val_float();
@@ -129,7 +129,7 @@ impl RVSDGMod {
                     &[float_type],
                     &[float_val.into()],
                     "round",
-                )
+                )?
             }
             UnaryOp::FloatSqrt => {
                 let float_val = val_float();
@@ -140,7 +140,7 @@ impl RVSDGMod {
                     &[float_type],
                     &[float_val.into()],
                     "sqrt",
-                )
+                )?
             }
         })
     }
@@ -152,21 +152,20 @@ impl RVSDGMod {
         param_types: &[BasicTypeEnum<'ctx>],
         args: &[BasicMetadataValueEnum<'ctx>],
         name: &str,
-    ) -> BasicValueEnum<'ctx> {
+    ) -> color_eyre::Result<BasicValueEnum<'ctx>> {
         let intrinsic = Intrinsic::find(intrinsic_name)
-            .unwrap_or_else(|| panic!("intrinsic {intrinsic_name} not found"));
+            .ok_or_else(|| eyre!("intrinsic `{intrinsic_name}` not found"))?;
         let func = intrinsic
             .get_declaration(llvm_builder.module, param_types)
-            .unwrap_or_else(|| panic!("failed to get declaration for {intrinsic_name}"));
+            .ok_or_else(|| eyre!("failed to get declaration for intrinsic `{intrinsic_name}`"))?;
         match llvm_builder
             .builder
-            .build_call(func, args, name)
-            .expect("failed to build intrinsic call")
+            .build_call(func, args, name)?
             .try_as_basic_value()
         {
-            ValueKind::Basic(val) => val,
+            ValueKind::Basic(val) => Ok(val),
             ValueKind::Instruction(_) => {
-                panic!("intrinsic {intrinsic_name} returned void, expected a value")
+                bail!("intrinsic `{intrinsic_name}` returned void, expected a value")
             }
         }
     }

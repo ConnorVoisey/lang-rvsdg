@@ -39,24 +39,6 @@ pub enum ScalarType {
 
     Void,
 }
-impl ScalarType {
-    pub fn is_float(&self) -> bool {
-        match self {
-            ScalarType::F32 | ScalarType::F64 => true,
-            _ => false,
-        }
-    }
-    pub fn is_int(&self) -> bool {
-        match self {
-            ScalarType::I8
-            | ScalarType::I16
-            | ScalarType::I32
-            | ScalarType::I64
-            | ScalarType::I128 => true,
-            _ => false,
-        }
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TypeRef {
@@ -67,6 +49,16 @@ pub enum TypeRef {
     Struct(StructId),
     Vector(VectorTypeId),
     Func(FuncTypeId),
+    /// Predicate / control type with `n` alternatives (Bahmann, Reissmann,
+    /// Jahre, Meyer 2015 section 2.2, lines 270-276: "a predicate type that allows
+    /// the enumeration of alternatives"). A value of this type is an index in
+    /// `0..n` selecting a gamma sub-region (left-to-right) or a theta repetition
+    /// outcome (2-valued: 0 = exit, 1 = repeat). It is produced from an
+    /// integer condition by a [`crate::rvsdg::ValueKind::Match`] node -- never
+    /// the raw integer. Distinct from `Scalar` so the construction can keep
+    /// predicates in the single-use form perfect reconstruction requires
+    /// (Def 2.6). Lowers to an `i32` index in the backend.
+    Control(u32),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

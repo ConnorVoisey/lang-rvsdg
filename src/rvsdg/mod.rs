@@ -16,7 +16,7 @@ pub use ops::{
 };
 use rustc_hash::FxHashMap;
 pub use target_lexicon::Triple;
-use types::{TypeArena, TypeRef};
+use types::TypeArena;
 pub use value::{ConstValue, Value, ValueKind};
 
 #[derive(Debug)]
@@ -24,7 +24,7 @@ pub struct RVSDGMod {
     /// Target triple (e.g. x86_64-unknown-linux-gnu)
     pub target: Triple,
     pub mod_name: String,
-    /// LLVM data layout string — encodes pointer sizes, alignments, endianness
+    /// LLVM data layout string -- encodes pointer sizes, alignments, endianness
     /// for the target. Preserved verbatim for roundtripping through LLVM.
     pub data_layout: String,
     pub types: TypeArena,
@@ -36,6 +36,7 @@ pub struct RVSDGMod {
     pub value_pool: ValuePool,
     pub region_pool: RegionPool,
     pub u32_pool: U32Pool,
+    pub match_arm_pool: MatchArmPool,
 
     // These maps should probably use &str instead of String
     pub fn_map: FxHashMap<String, FuncId>,
@@ -57,6 +58,7 @@ impl RVSDGMod {
             value_pool: ValuePool(vec![]),
             region_pool: RegionPool(vec![]),
             u32_pool: U32Pool(vec![]),
+            match_arm_pool: MatchArmPool(vec![]),
             fn_map: FxHashMap::default(),
             global_map: FxHashMap::default(),
         }
@@ -166,7 +168,42 @@ pub struct U32Span {
     pub len: u16,
 }
 
-/// State edge — a newtype over Value for type safety.
+/// One arm of a [`ValueKind::Match`]: an integer input value and the control
+/// alternative it selects. Stored in [`MatchArmPool`] so `ValueKind` stays a
+/// span (all-`Copy`) rather than carrying a heap allocation per node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MatchArm {
+    /// An integer value the matched input may take (e.g. a `switch` case value).
+    pub value: i64,
+    /// The 0-based control alternative this input value selects.
+    pub alternative: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct MatchArmPool(Vec<MatchArm>);
+
+impl MatchArmPool {
+    pub fn push_slice(&mut self, arms: &[MatchArm]) -> MatchArmSpan {
+        let start = self.0.len() as u32;
+        self.0.extend_from_slice(arms);
+        MatchArmSpan {
+            start,
+            len: arms.len() as u16,
+        }
+    }
+
+    pub fn get(&self, span: MatchArmSpan) -> &[MatchArm] {
+        &self.0[span.start as usize..(span.start as usize + span.len as usize)]
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MatchArmSpan {
+    pub start: u32,
+    pub len: u16,
+}
+
+/// State edge -- a newtype over Value for type safety.
 /// Prevents accidentally passing a state where data is expected and vice versa.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct State(pub ValueId);
@@ -187,7 +224,7 @@ pub enum InlineHint {
     Always,
 }
 
-/// ELF/Mach-O symbol visibility — controls linker behavior for shared libraries.
+/// ELF/Mach-O symbol visibility -- controls linker behavior for shared libraries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Visibility {
     /// Symbol is visible to other shared objects

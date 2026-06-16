@@ -9,7 +9,7 @@ const BUF_SIZE: usize = 8192;
 
 fn main() -> color_eyre::Result<()> {
     let rvsdg = build_yes();
-    rvsdg.output_with_llvm("cat").unwrap();
+    rvsdg.output_with_llvm("cat", &[], &[]).unwrap();
     Ok(())
 }
 

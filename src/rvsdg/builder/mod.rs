@@ -8,7 +8,7 @@ use crate::rvsdg::{
     types::TypeRef,
 };
 
-/// Passed to a branch closure — represents being inside a gamma branch
+/// Passed to a branch closure -- represents being inside a gamma branch
 #[derive(Debug)]
 pub struct RegionBuilder<'a> {
     pub region_id: RegionId,
@@ -145,7 +145,7 @@ impl<'a> RegionBuilder<'a> {
     }
 }
 
-// ── Result types ────────────────────────────────────────────────
+// -- Result types ------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LoadResult {

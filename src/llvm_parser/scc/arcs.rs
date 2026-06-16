@@ -21,8 +21,8 @@
 //! forms a natural loop. Multi-entry and multi-exit subsets work
 //! identically; the paper's q and r predicates use these sets to
 //! produce a single-entry single-exit shape suitable for direct
-//! conversion into a theta node. See `scc_tree.rs` for how loop
-//! restructuring builds and consumes the analysis.
+//! conversion into a theta node. See the [`super::tree`] module for how the
+//! nesting tree builds and attaches this analysis.
 
 use smallvec::SmallVec;
 
@@ -76,14 +76,17 @@ impl LoopArcs {
             }
         }
 
-        let mut repetition_arcs: SmallVec<[(BasicBlockId, BasicBlockId); 4]> = SmallVec::new();
-        for &block in blocks {
-            for &succ in mapper.outputs(block) {
-                if is_entry[succ.0 as usize] {
-                    repetition_arcs.push((block, succ));
+        let repetition_arcs = {
+            let mut repetition_arcs: SmallVec<[(BasicBlockId, BasicBlockId); 4]> = SmallVec::new();
+            for &block in blocks {
+                for &succ in mapper.outputs(block) {
+                    if is_entry[succ.0 as usize] {
+                        repetition_arcs.push((block, succ));
+                    }
                 }
             }
-        }
+            repetition_arcs
+        };
 
         let mut entry_blocks: SmallVec<[BasicBlockId; 4]> = (0..block_count as u32)
             .filter(|i| is_entry[*i as usize])

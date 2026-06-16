@@ -3,6 +3,7 @@ use crate::rvsdg::{
     lower_to_llvm::{LLVMBuilderCtx, ValueMapper},
     types::TypeRef,
 };
+use color_eyre::eyre::eyre;
 use inkwell::{
     AddressSpace,
     types::BasicTypeEnum,
@@ -16,7 +17,7 @@ impl RVSDGMod {
         llvm_builder: &LLVMBuilderCtx<'a, 'ctx>,
         mapper: &mut ValueMapper<'ctx>,
         const_id: ConstId,
-    ) -> BasicValueEnum<'ctx> {
+    ) -> color_eyre::Result<BasicValueEnum<'ctx>> {
         let constant = self.constants.get(const_id);
         self.lower_const_def(llvm_builder, mapper, constant)
     }
@@ -27,25 +28,25 @@ impl RVSDGMod {
         llvm_builder: &LLVMBuilderCtx<'a, 'ctx>,
         mapper: &mut ValueMapper<'ctx>,
         constant: &ConstantDef,
-    ) -> BasicValueEnum<'ctx> {
-        match &constant.kind {
+    ) -> color_eyre::Result<BasicValueEnum<'ctx>> {
+        let lowered = match &constant.kind {
             ConstantKind::Scalar(const_value) => {
-                self.lower_const_value(llvm_builder, mapper, const_value, constant.ty)
+                self.lower_const_value(llvm_builder, const_value, constant.ty)?
             }
             ConstantKind::Zero => self
-                .type_to_basic_type_llvm(llvm_builder.context, constant.ty)
+                .type_to_basic_type_llvm(llvm_builder.context, constant.ty)?
                 .const_zero(),
             ConstantKind::Aggregate(const_ids_span) => {
                 let element_ids = self.constants.get_aggregate_elements(*const_ids_span);
                 let elements: Vec<BasicValueEnum<'ctx>> = element_ids
                     .iter()
                     .map(|&id| self.lower_const_id(llvm_builder, mapper, id))
-                    .collect();
+                    .collect::<color_eyre::Result<_>>()?;
                 match constant.ty {
                     TypeRef::Array(array_type_id) => {
                         let arr = self.types.get_array(array_type_id);
                         let elem_type =
-                            self.type_to_basic_type_llvm(llvm_builder.context, arr.element);
+                            self.type_to_basic_type_llvm(llvm_builder.context, arr.element)?;
                         BasicValueEnum::ArrayValue(match elem_type {
                             BasicTypeEnum::IntType(it) => {
                                 let vals: Vec<_> =
@@ -99,16 +100,16 @@ impl RVSDGMod {
             }
             ConstantKind::GlobalAddr(global_id) => mapper
                 .get_global(*global_id)
-                .expect("global should have been set during lower_globals")
+                .ok_or_else(|| eyre!("global {global_id:?} was not set during lower_globals"))?
                 .as_basic_value_enum(),
             ConstantKind::Undef => {
-                let llvm_type = self.type_to_basic_type_llvm(llvm_builder.context, constant.ty);
+                let llvm_type = self.type_to_basic_type_llvm(llvm_builder.context, constant.ty)?;
                 Self::get_undef(llvm_type)
             }
             ConstantKind::FuncAddr(func_id) => {
                 let func = mapper
                     .get_fn(*func_id)
-                    .expect("function show have been declared during lower_functions");
+                    .ok_or_else(|| eyre!("function {func_id:?} was not declared before use"))?;
                 func.as_global_value()
                     .as_pointer_value()
                     .as_basic_value_enum()
@@ -120,17 +121,17 @@ impl RVSDGMod {
                 in_bounds,
             } => {
                 let base_ptr = self
-                    .lower_const_id(llvm_builder, mapper, *base)
+                    .lower_const_id(llvm_builder, mapper, *base)?
                     .into_pointer_value();
-                let source = self.type_to_basic_type_llvm(llvm_builder.context, *source_type);
+                let source = self.type_to_basic_type_llvm(llvm_builder.context, *source_type)?;
                 let index_ids = self.constants.get_aggregate_elements(*indices).to_vec();
                 let index_vals: Vec<inkwell::values::IntValue<'ctx>> = index_ids
                     .iter()
                     .map(|&id| {
                         self.lower_const_id(llvm_builder, mapper, id)
-                            .into_int_value()
+                            .map(|v| v.into_int_value())
                     })
-                    .collect();
+                    .collect::<color_eyre::Result<_>>()?;
                 // SAFETY: inkwell marks every GEP constructor `unsafe`
                 // because mismatched indices/type are UB in LLVM. `source` is
                 // the source type the frontend recovered to match this GEP's
@@ -147,20 +148,20 @@ impl RVSDGMod {
                 };
                 result.as_basic_value_enum()
             }
-        }
+        };
+        Ok(lowered)
     }
 
     #[inline]
     pub(crate) fn lower_const_value<'a, 'ctx>(
         &self,
         llvm_builder: &LLVMBuilderCtx<'a, 'ctx>,
-        mapper: &mut ValueMapper<'ctx>,
         const_value: &ConstValue,
         ty: TypeRef,
-    ) -> BasicValueEnum<'ctx> {
-        match const_value {
+    ) -> color_eyre::Result<BasicValueEnum<'ctx>> {
+        let lowered = match const_value {
             ConstValue::Int(val) => BasicValueEnum::IntValue(
-                self.type_to_basic_type_llvm(llvm_builder.context, ty)
+                self.type_to_basic_type_llvm(llvm_builder.context, ty)?
                     .into_int_type()
                     .const_int(*val as u64, false),
             ),
@@ -183,10 +184,11 @@ impl RVSDGMod {
                     .const_null(),
             ),
             ConstValue::Poison => {
-                let llvm_type = self.type_to_basic_type_llvm(llvm_builder.context, ty);
+                let llvm_type = self.type_to_basic_type_llvm(llvm_builder.context, ty)?;
                 Self::get_poison(llvm_type)
             }
-        }
+        };
+        Ok(lowered)
     }
 
     fn get_undef<'ctx>(llvm_type: BasicTypeEnum<'ctx>) -> BasicValueEnum<'ctx> {
@@ -910,7 +912,7 @@ mod tests {
 
     #[test]
     fn const_undef_i32_compiles() {
-        // undef i32 used in an add — the result is undef but should not crash
+        // undef i32 used in an add -- the result is undef but should not crash
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
         let undef_id = rvsdg.constants.intern(crate::rvsdg::ConstantDef {
             ty: I32,
@@ -927,7 +929,7 @@ mod tests {
                 values: vec![result],
             })
         });
-        // Just verify it doesn't crash — the value is undefined
+        // Just verify it doesn't crash -- the value is undefined
         let _ = jit_run_i32(&rvsdg, "test");
     }
 
@@ -951,7 +953,7 @@ mod tests {
 
     #[test]
     fn const_poison_i32_compiles() {
-        // poison i32 — should compile and run without crashing
+        // poison i32 -- should compile and run without crashing
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg.define_fn(func_id, |rb, state| {
@@ -978,6 +980,29 @@ mod tests {
             })
         });
         let _ = jit_run_f32(&rvsdg, "test");
+    }
+
+    #[test]
+    fn deep_add_chain_does_not_overflow_lowering() {
+        // A long operand chain: if lowering recursed one stack frame per node,
+        // this overflows the (small) test-thread stack.
+        let mut rvsdg = RVSDGMod::new_host(String::from("test"));
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
+        rvsdg.define_fn(func_id, |rb, state| {
+            let mut v = rb.const_i32(0);
+            let one = rb.const_i32(1);
+            for _ in 0..300_000 {
+                v = rb.binary(BinaryOp::Add, ArithFlags::default(), v, one, I32);
+            }
+            Ok(FnResult {
+                state,
+                values: vec![v],
+            })
+        });
+        let context = inkwell::context::Context::create();
+        rvsdg
+            .lower_to_llvm_module(&context)
+            .expect("deep chain should lower without overflowing the stack");
     }
 
     #[test]

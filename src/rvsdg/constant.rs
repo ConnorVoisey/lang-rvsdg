@@ -6,7 +6,7 @@ use crate::rvsdg::{FuncId, GlobalId, types::TypeRef, value::ConstValue};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ConstId(u32);
 
-/// Span into the ConstIdPool — a contiguous slice of ConstIds.
+/// Span into the ConstIdPool -- a contiguous slice of ConstIds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ConstIdsSpan {
     pub start: u32,
@@ -42,7 +42,7 @@ pub struct ConstantDef {
 // TODO: `String(Vec<u8>)` is 24 bytes and forces the entire enum to 24 bytes,
 // while most variants fit in 8-16 bytes. A shared byte pool with a BytesSpan
 // would bring the enum down to 16 bytes. This pool should be designed alongside
-// string interning for struct names, function names, section names, etc. — all
+// string interning for struct names, function names, section names, etc. -- all
 // share the same "intern bytes, get a span back" pattern.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ConstantKind {

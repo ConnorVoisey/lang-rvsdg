@@ -2,25 +2,10 @@ use crate::llvm_parser::block_mapper::{BasicBlockId, BasicBlockInOuts, BasicBloc
 use smallvec::SmallVec;
 use std::collections::VecDeque;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct SccId(u32);
-
 #[derive(Clone, Debug, PartialEq)]
 pub struct SccAnalysis {
-    /// reverse topo order; reverse for forward
+    /// The components in reverse-topological order (reverse for forward order).
     pub sccs: Vec<Scc>,
-    pub block_to_scc: Vec<SccId>,
-}
-impl SccAnalysis {
-    #[inline]
-    pub fn get_scc(&self, scc_id: SccId) -> &Scc {
-        &self.sccs[scc_id.0 as usize]
-    }
-
-    #[inline]
-    pub fn get_scc_from_block(&self, block_id: BasicBlockId) -> SccId {
-        self.block_to_scc[block_id.0 as usize]
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Default)]
@@ -28,102 +13,114 @@ pub struct Scc {
     pub blocks: SmallVec<[BasicBlockId; 4]>,
     pub is_trivial: bool,
 }
+/// Tarjan's strongly-connected-components core, shared by the whole-function
+/// pass and the subgraph pass. `mask` (when `Some`) restricts the analysis to
+/// blocks marked `true`; `exclude` lists arcs treated as absent (the paper's
+/// "remove repetition arcs" for nested-loop discovery). The whole-function pass
+/// is just `mask = None, exclude = &[]`. Components are produced in reverse
+/// topological order; an id is a component's index in `sccs`.
+struct Tarjan<'a> {
+    blocks: &'a [BasicBlockInOuts],
+    mask: Option<&'a [bool]>,
+    exclude: &'a [(BasicBlockId, BasicBlockId)],
+    index: i32,
+    indices: Vec<i32>,
+    low_links: Vec<i32>,
+    on_stack: Vec<bool>,
+    stack: VecDeque<BasicBlockId>,
+    sccs: Vec<Scc>,
+}
+
+impl<'a> Tarjan<'a> {
+    fn new(
+        blocks: &'a [BasicBlockInOuts],
+        mask: Option<&'a [bool]>,
+        exclude: &'a [(BasicBlockId, BasicBlockId)],
+    ) -> Self {
+        let n = blocks.len();
+        Self {
+            blocks,
+            mask,
+            exclude,
+            index: 0,
+            indices: vec![-1; n],
+            low_links: vec![0; n],
+            on_stack: vec![false; n],
+            stack: VecDeque::new(),
+            sccs: Vec::new(),
+        }
+    }
+
+    /// Whether the arc `from -> to` is part of the analysed (sub)graph: its
+    /// target must be in the mask (if any), and the arc must not be excluded.
+    #[inline]
+    fn edge_live(&self, from: BasicBlockId, to: BasicBlockId) -> bool {
+        self.mask.map_or(true, |m| m[to.0 as usize])
+            && (self.exclude.is_empty() || !self.exclude.contains(&(from, to)))
+    }
+
+    /// Run the SCC search from every not-yet-visited root in `roots`.
+    fn run(&mut self, roots: impl Iterator<Item = BasicBlockId>) {
+        for root in roots {
+            if self.indices[root.0 as usize] == -1 {
+                self.strong_connect(root);
+            }
+        }
+    }
+
+    fn strong_connect(&mut self, id: BasicBlockId) {
+        let i = id.0 as usize;
+        self.indices[i] = self.index;
+        self.low_links[i] = self.index;
+        self.index += 1;
+        self.stack.push_back(id);
+        self.on_stack[i] = true;
+
+        // `blocks` is a shared-reference field, so copying it out lets the
+        // recursive `&mut self` call coexist with iterating this block's edges.
+        let blocks = self.blocks;
+        for &edge in &blocks[i].outputs {
+            if !self.edge_live(id, edge) {
+                continue;
+            }
+            let e = edge.0 as usize;
+            if self.indices[e] == -1 {
+                self.strong_connect(edge);
+                self.low_links[i] = self.low_links[i].min(self.low_links[e]);
+            } else if self.on_stack[e] {
+                self.low_links[i] = self.low_links[i].min(self.indices[e]);
+            }
+        }
+
+        if self.low_links[i] == self.indices[i] {
+            let mut scc = Scc {
+                blocks: SmallVec::new(),
+                is_trivial: false,
+            };
+            while let Some(node) = self.stack.pop_back() {
+                self.on_stack[node.0 as usize] = false;
+                scc.blocks.push(node);
+                if node == id {
+                    break;
+                }
+            }
+            // Trivial = a single block with no self-edge surviving the filter.
+            // Multi-block components are always cyclic; a surviving self-edge
+            // makes a singleton a (real, if trivial-looking) loop.
+            let self_loop = blocks[i].outputs.contains(&id) && self.edge_live(id, id);
+            scc.is_trivial = scc.blocks.len() == 1 && !self_loop;
+            if !scc.blocks.is_empty() {
+                self.sccs.push(scc);
+            }
+        }
+    }
+}
+
 impl BasicBlockMapper {
     pub fn get_strongly_connected_components(&self) -> SccAnalysis {
-        let mut scc_analysis = SccAnalysis {
-            sccs: vec![],
-            block_to_scc: vec![SccId(0); self.blocks.len()],
-        };
-        let mut stack = VecDeque::new();
-        let mut index = 0;
-        let mut indicies = vec![-1; self.blocks.len()];
-        let mut low_links = vec![0; self.blocks.len()];
-        let mut on_stack = vec![false; self.blocks.len()];
-
-        #[inline]
-        fn strong_connect(
-            id: BasicBlockId,
-            blocks: &[BasicBlockInOuts],
-            scc_analysis: &mut SccAnalysis,
-            stack: &mut VecDeque<BasicBlockId>,
-            index: &mut i32,
-            indicies: &mut Vec<i32>,
-            low_links: &mut Vec<i32>,
-            on_stack: &mut Vec<bool>,
-        ) {
-            // add current id to indicies, low_link and stack
-            indicies[id.0 as usize] = *index;
-            low_links[id.0 as usize] = *index;
-            *index += 1;
-            stack.push_back(id);
-            on_stack[id.0 as usize] = true;
-
-            let block = &blocks[id.0 as usize];
-            for edge in &block.outputs {
-                if indicies[edge.0 as usize] == -1 {
-                    // edge has not yet been visited, recusively do it.
-                    strong_connect(
-                        *edge,
-                        blocks,
-                        scc_analysis,
-                        stack,
-                        index,
-                        indicies,
-                        low_links,
-                        on_stack,
-                    );
-                    low_links[id.0 as usize] =
-                        low_links[id.0 as usize].min(low_links[edge.0 as usize]);
-                } else if on_stack[edge.0 as usize] {
-                    // edge is on the stack and therefor is the current scc
-                    low_links[id.0 as usize] =
-                        low_links[id.0 as usize].min(indicies[edge.0 as usize]);
-                }
-            }
-
-            if low_links[id.0 as usize] == indicies[id.0 as usize] {
-                // Compute the SCC's index now (it'll be the next slot when we push it
-                // after this loop). All blocks in this SCC get this same id.
-                let scc_id = SccId(scc_analysis.sccs.len() as u32);
-                let mut scc = Scc {
-                    blocks: SmallVec::new(),
-                    is_trivial: false,
-                };
-                while let Some(node) = stack.pop_back() {
-                    on_stack[node.0 as usize] = false;
-                    scc.blocks.push(node);
-                    scc_analysis.block_to_scc[node.0 as usize] = scc_id;
-                    if node == id {
-                        break;
-                    }
-                }
-                // Trivial = single block with no self-edge. Multi-block SCCs are
-                // always cyclic, and a single block with a self-edge is a (trivial)
-                // loop, so neither counts as trivial.
-                scc.is_trivial =
-                    scc.blocks.len() == 1 && !blocks[id.0 as usize].outputs.contains(&id);
-                if scc.blocks.len() > 0 {
-                    scc_analysis.sccs.push(scc);
-                }
-            }
-        }
-
-        for i in 0..self.blocks.len() {
-            if indicies[i] == -1 {
-                strong_connect(
-                    BasicBlockId(i as u32),
-                    &self.blocks,
-                    &mut scc_analysis,
-                    &mut stack,
-                    &mut index,
-                    &mut indicies,
-                    &mut low_links,
-                    &mut on_stack,
-                );
-            }
-        }
-
-        scc_analysis
+        let mut tarjan = Tarjan::new(&self.blocks, None, &[]);
+        tarjan.run((0..self.blocks.len() as u32).map(BasicBlockId));
+        SccAnalysis { sccs: tarjan.sccs }
     }
 
     /// Compute strongly connected components over a subgraph induced by
@@ -149,119 +146,17 @@ impl BasicBlockMapper {
         blocks: &[BasicBlockId],
         exclude_arcs: &[(BasicBlockId, BasicBlockId)],
     ) -> Vec<Scc> {
-        let block_count = self.blocks.len();
-        let mut in_subgraph = vec![false; block_count];
+        // Restrict Tarjan to `blocks` via a membership mask, with `exclude_arcs`
+        // removed. Roots are the subgraph's blocks; blocks outside it are never
+        // visited (their indices stay -1) and can't be reached through edges
+        // the mask filters out.
+        let mut in_subgraph = vec![false; self.blocks.len()];
         for b in blocks {
             in_subgraph[b.0 as usize] = true;
         }
-
-        let mut sccs: Vec<Scc> = Vec::new();
-        let mut stack: VecDeque<BasicBlockId> = VecDeque::new();
-        let mut index: i32 = 0;
-        let mut indicies = vec![-1; block_count];
-        let mut low_links = vec![0; block_count];
-        let mut on_stack = vec![false; block_count];
-
-        #[inline]
-        fn strong_connect(
-            id: BasicBlockId,
-            blocks: &[BasicBlockInOuts],
-            in_subgraph: &[bool],
-            exclude_arcs: &[(BasicBlockId, BasicBlockId)],
-            sccs: &mut Vec<Scc>,
-            stack: &mut VecDeque<BasicBlockId>,
-            index: &mut i32,
-            indicies: &mut Vec<i32>,
-            low_links: &mut Vec<i32>,
-            on_stack: &mut Vec<bool>,
-        ) {
-            indicies[id.0 as usize] = *index;
-            low_links[id.0 as usize] = *index;
-            *index += 1;
-            stack.push_back(id);
-            on_stack[id.0 as usize] = true;
-
-            let block = &blocks[id.0 as usize];
-            for edge in &block.outputs {
-                // Filter: edges whose target is outside the subgraph are
-                // not part of this analysis. Edges listed in
-                // exclude_arcs are treated as if they had been removed
-                // (this is how the paper's L* = SCC blocks minus
-                // repetition arcs is realised without mutating the CFG).
-                if !in_subgraph[edge.0 as usize] {
-                    continue;
-                }
-                if exclude_arcs.contains(&(id, *edge)) {
-                    continue;
-                }
-
-                if indicies[edge.0 as usize] == -1 {
-                    strong_connect(
-                        *edge,
-                        blocks,
-                        in_subgraph,
-                        exclude_arcs,
-                        sccs,
-                        stack,
-                        index,
-                        indicies,
-                        low_links,
-                        on_stack,
-                    );
-                    low_links[id.0 as usize] =
-                        low_links[id.0 as usize].min(low_links[edge.0 as usize]);
-                } else if on_stack[edge.0 as usize] {
-                    low_links[id.0 as usize] =
-                        low_links[id.0 as usize].min(indicies[edge.0 as usize]);
-                }
-            }
-
-            if low_links[id.0 as usize] == indicies[id.0 as usize] {
-                let mut scc = Scc {
-                    blocks: SmallVec::new(),
-                    is_trivial: false,
-                };
-                while let Some(node) = stack.pop_back() {
-                    on_stack[node.0 as usize] = false;
-                    scc.blocks.push(node);
-                    if node == id {
-                        break;
-                    }
-                }
-                // Trivial single-block component: only counts as trivial
-                // if the block has no self-edge surviving the subgraph
-                // filter. A self-edge that exists in the original CFG
-                // but is listed in exclude_arcs does not count.
-                let has_self_loop = blocks[id.0 as usize].outputs.contains(&id)
-                    && !exclude_arcs.contains(&(id, id));
-                scc.is_trivial = scc.blocks.len() == 1 && !has_self_loop;
-                if !scc.blocks.is_empty() {
-                    sccs.push(scc);
-                }
-            }
-        }
-
-        // Only start strong_connect from blocks in the subgraph. Blocks
-        // outside the subgraph are not visited; their indicies stay at
-        // -1 and they cannot be reached through filtered edges.
-        for b in blocks {
-            if indicies[b.0 as usize] == -1 {
-                strong_connect(
-                    *b,
-                    &self.blocks,
-                    &in_subgraph,
-                    exclude_arcs,
-                    &mut sccs,
-                    &mut stack,
-                    &mut index,
-                    &mut indicies,
-                    &mut low_links,
-                    &mut on_stack,
-                );
-            }
-        }
-
-        sccs
+        let mut tarjan = Tarjan::new(&self.blocks, Some(&in_subgraph), exclude_arcs);
+        tarjan.run(blocks.iter().copied());
+        tarjan.sccs
     }
 }
 
@@ -270,8 +165,8 @@ mod tests {
     use llvm_ir::Name;
     use pretty_assertions::assert_eq;
 
+    use super::SccAnalysis;
     use crate::llvm_parser::block_mapper::{BasicBlockId, BasicBlockMapper};
-    use crate::llvm_parser::strongly_connected_components::SccAnalysis;
 
     fn init(n: usize) -> (BasicBlockMapper, Vec<BasicBlockId>) {
         let mut basic_blocks = BasicBlockMapper::new(n);

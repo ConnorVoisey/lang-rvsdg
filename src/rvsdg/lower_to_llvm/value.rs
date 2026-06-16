@@ -4,9 +4,9 @@ use crate::rvsdg::{
     lower_to_llvm::{LLVMBuilderCtx, ValueMapper},
     types::{TypeRef, VOID},
 };
+use color_eyre::eyre::{bail, eyre};
 use inkwell::{
     FloatPredicate, IntPredicate,
-    builder::BuilderError,
     types::BasicType,
     values::{BasicMetadataValueEnum, BasicValueEnum, ValueKind as LLVMValueKind},
 };
@@ -19,7 +19,7 @@ impl RVSDGMod {
         mapper: &mut ValueMapper<'ctx>,
         rvsdg_func: &Function,
         value_id: ValueId,
-    ) -> Result<Option<BasicValueEnum<'ctx>>, BuilderError> {
+    ) -> color_eyre::Result<Option<BasicValueEnum<'ctx>>> {
         if let Some(val) = mapper.get_val(value_id) {
             return Ok(Some(*val));
         }
@@ -27,21 +27,21 @@ impl RVSDGMod {
         let value = &self.values[value_id.0 as usize];
         let lowered_val = match value.kind {
             ValueKind::Const(const_value) => {
-                Some(self.lower_const_value(llvm_builder, mapper, &const_value, value.ty))
+                Some(self.lower_const_value(llvm_builder, &const_value, value.ty)?)
             }
             ValueKind::ConstPoolRef(const_id) => {
-                Some(self.lower_const_id(llvm_builder, mapper, const_id))
+                Some(self.lower_const_id(llvm_builder, mapper, const_id)?)
             }
             ValueKind::GlobalRef(global_id) => {
                 let glob = mapper
                     .get_global(global_id)
-                    .expect("global should have be lowered to llvm earlier");
+                    .ok_or_else(|| eyre!("global {global_id:?} was not lowered before use"))?;
                 Some(BasicValueEnum::PointerValue(glob.as_pointer_value()))
             }
             ValueKind::FuncAddr(func_id) => {
                 let func = mapper
                     .get_fn(func_id)
-                    .expect("function should have been registered");
+                    .ok_or_else(|| eyre!("function {func_id:?} was not registered before use"))?;
                 Some(BasicValueEnum::PointerValue(
                     func.as_global_value().as_pointer_value(),
                 ))
@@ -145,7 +145,9 @@ impl RVSDGMod {
                         BasicValueEnum::StructValue(sv) => llvm_builder
                             .builder
                             .build_extract_value(sv, idx, "extract")?,
-                        _ => panic!("extractvalue requires an aggregate (array or struct) value"),
+                        other => bail!(
+                            "extractvalue requires an aggregate (array or struct) value, got {other:?}"
+                        ),
                     };
                 }
                 Some(agg)
@@ -163,11 +165,9 @@ impl RVSDGMod {
                 // TODO: support multi-index insertvalue (e.g. insertvalue %s, i32 42, 0, 1)
                 // by extracting nested aggregates, inserting at the leaf, and inserting
                 // modified aggregates back up the chain.
-                assert_eq!(
-                    idx_slice.len(),
-                    1,
-                    "multi-index insertvalue not yet supported"
-                );
+                if idx_slice.len() != 1 {
+                    bail!("multi-index insertvalue is not yet supported");
+                }
 
                 let result = match agg {
                     BasicValueEnum::ArrayValue(av) => {
@@ -176,7 +176,9 @@ impl RVSDGMod {
                     BasicValueEnum::StructValue(sv) => {
                         b.build_insert_value(sv, val, idx_slice[0], "insert")?
                     }
-                    _ => panic!("insertvalue requires an aggregate (array or struct) value"),
+                    other => bail!(
+                        "insertvalue requires an aggregate (array or struct) value, got {other:?}"
+                    ),
                 };
                 // AggregateValueEnum -> BasicValueEnum
                 Some(match result {
@@ -195,16 +197,15 @@ impl RVSDGMod {
                 inbounds,
             } => {
                 let ptr = self.expect_value(llvm_builder, mapper, rvsdg_func, base)?;
-                let pointee_type = self.type_to_basic_type_llvm(llvm_builder.context, base_type);
+                let pointee_type = self.type_to_basic_type_llvm(llvm_builder.context, base_type)?;
                 let idx_ids = self.value_pool.get(indices).to_vec();
                 let idx_vals: Vec<_> = idx_ids
                     .iter()
                     .map(|&id| {
                         self.expect_value(llvm_builder, mapper, rvsdg_func, id)
-                            .expect("failed to lower GEP index")
-                            .into_int_value()
+                            .map(|v| v.into_int_value())
                     })
-                    .collect();
+                    .collect::<color_eyre::Result<_>>()?;
                 let result = if inbounds {
                     unsafe {
                         llvm_builder.builder.build_in_bounds_gep(
@@ -298,8 +299,41 @@ impl RVSDGMod {
                 )?;
                 None
             }
-            ValueKind::Fence { state: _, ordering } => todo!(),
-            ValueKind::Freeze { value } => todo!(),
+            ValueKind::Fence { .. } => todo!(),
+            ValueKind::Freeze { .. } => todo!(),
+            ValueKind::Match {
+                input,
+                arms,
+                default,
+                alternatives: _,
+            } => {
+                // Lower a control/predicate value to its `i32` alternative
+                // index via a select chain: each arm contributes
+                // `input == case ? alt : <rest>`, folded from the default
+                // outward so the first matching arm wins.
+                let input_val = self
+                    .expect_value(llvm_builder, mapper, rvsdg_func, input)?
+                    .into_int_value();
+                let input_ty = input_val.get_type();
+                let out_ty = llvm_builder.context.i32_type();
+                let arm_slice = self.match_arm_pool.get(arms).to_vec();
+                let mut acc = out_ty.const_int(default as u64, false);
+                for arm in arm_slice.iter().rev() {
+                    let case = input_ty.const_int(arm.value as u64, true);
+                    let is_match = llvm_builder.builder.build_int_compare(
+                        IntPredicate::EQ,
+                        input_val,
+                        case,
+                        "match.cmp",
+                    )?;
+                    let alt = out_ty.const_int(arm.alternative as u64, false);
+                    acc = llvm_builder
+                        .builder
+                        .build_select(is_match, alt, acc, "match.sel")?
+                        .into_int_value();
+                }
+                Some(BasicValueEnum::IntValue(acc))
+            }
             ValueKind::Intrinsic { op, state: _, args } => {
                 self.lower_intrinsic(llvm_builder, mapper, rvsdg_func, op, args, value_id)?;
                 None
@@ -336,7 +370,7 @@ impl RVSDGMod {
                 inputs,
                 regions,
             )?,
-            ValueKind::Phi { region, rv_count } => todo!(),
+            ValueKind::Phi { .. } => todo!(),
             ValueKind::Call {
                 state: _,
                 fn_id,
@@ -344,21 +378,20 @@ impl RVSDGMod {
             } => {
                 let func = mapper
                     .get_fn(fn_id)
-                    .expect("called function should have been registered");
+                    .ok_or_else(|| eyre!("called function {fn_id:?} was not registered"))?;
                 let llvm_args: Vec<BasicMetadataValueEnum<'ctx>> = self
                     .value_pool
                     .get(args)
+                    .to_vec()
                     .iter()
                     .map(|&arg_id| {
                         self.expect_value(llvm_builder, mapper, rvsdg_func, arg_id)
-                            .expect("failed to lower call argument")
-                            .into()
+                            .map(|v| v.into())
                     })
-                    .collect();
+                    .collect::<color_eyre::Result<_>>()?;
                 match llvm_builder
                     .builder
-                    .build_call(func, &llvm_args, "call")
-                    .expect("failed to build call")
+                    .build_call(func, &llvm_args, "call")?
                     .try_as_basic_value()
                 {
                     LLVMValueKind::Basic(val) => Some(val),
@@ -377,14 +410,12 @@ impl RVSDGMod {
                         let ptr_type = self.types.get_ptr(ptr_id);
                         match ptr_type.pointee {
                             Some(TypeRef::Func(id)) => id,
-                            _ => {
-                                panic!("indirect call callee must be a pointer to a function type")
-                            }
+                            _ => bail!("indirect call callee must be a pointer to a function type"),
                         }
                     }
                     TypeRef::Func(id) => id,
                     _ => {
-                        panic!("indirect call callee must have a function or function-pointer type")
+                        bail!("indirect call callee must have a function or function-pointer type")
                     }
                 };
                 let func_type_def = self.types.get_fn(func_type_id);
@@ -392,7 +423,7 @@ impl RVSDGMod {
                     .params
                     .iter()
                     .map(|&ty| self.type_to_basic_meta_llvm(llvm_builder.context, ty))
-                    .collect();
+                    .collect::<color_eyre::Result<_>>()?;
                 // A void return is not a BasicType in LLVM, so build the
                 // function type through `void_type()` in that case (mirrors
                 // `register_fn`). Common for `noreturn` callees like abort().
@@ -402,19 +433,19 @@ impl RVSDGMod {
                         .void_type()
                         .fn_type(&param_types, func_type_def.is_var_arg)
                 } else {
-                    self.type_to_basic_type_llvm(llvm_builder.context, func_type_def.ret)
+                    self.type_to_basic_type_llvm(llvm_builder.context, func_type_def.ret)?
                         .fn_type(&param_types, func_type_def.is_var_arg)
                 };
                 let llvm_args: Vec<BasicMetadataValueEnum<'ctx>> = self
                     .value_pool
                     .get(args)
+                    .to_vec()
                     .iter()
                     .map(|&arg_id| {
                         self.expect_value(llvm_builder, mapper, rvsdg_func, arg_id)
-                            .expect("failed to lower indirect call argument")
-                            .into()
+                            .map(|v| v.into())
                     })
-                    .collect();
+                    .collect::<color_eyre::Result<_>>()?;
                 match llvm_builder
                     .builder
                     .build_indirect_call(
@@ -422,8 +453,7 @@ impl RVSDGMod {
                         callee_val.into_pointer_value(),
                         &llvm_args,
                         "callind",
-                    )
-                    .expect("failed to build indirect call")
+                    )?
                     .try_as_basic_value()
                 {
                     LLVMValueKind::Basic(val) => Some(val),
@@ -445,7 +475,7 @@ impl RVSDGMod {
                 }
             }
             ValueKind::RegionParam { index: _, ty: _ } => {
-                unreachable!("RegionParam should have been pre-populated in the mapper")
+                bail!("RegionParam {value_id:?} was not pre-populated in the mapper")
             }
             ValueKind::RegionResult {
                 values: _,
@@ -468,8 +498,8 @@ impl RVSDGMod {
         mapper: &mut ValueMapper<'ctx>,
         rvsdg_func: &Function,
         value_id: ValueId,
-    ) -> Result<BasicValueEnum<'ctx>, BuilderError> {
-        self.lower_value(llvm_builder, mapper, rvsdg_func, value_id)
-            .map(|opt| opt.expect("expected a value-producing node, got a state-only node"))
+    ) -> color_eyre::Result<BasicValueEnum<'ctx>> {
+        self.lower_value(llvm_builder, mapper, rvsdg_func, value_id)?
+            .ok_or_else(|| eyre!("expected a value-producing node, got a state-only node"))
     }
 }

@@ -3,7 +3,7 @@ use crate::rvsdg::{
     func::Function,
     lower_to_llvm::{LLVMBuilderCtx, ValueMapper},
 };
-use inkwell::{builder::BuilderError, values::BasicValueEnum};
+use inkwell::values::BasicValueEnum;
 
 impl RVSDGMod {
     #[inline]
@@ -16,7 +16,7 @@ impl RVSDGMod {
         flags: ArithFlags,
         left: ValueId,
         right: ValueId,
-    ) -> Result<BasicValueEnum<'ctx>, BuilderError> {
+    ) -> color_eyre::Result<BasicValueEnum<'ctx>> {
         let lhs = self.expect_value(llvm_builder, mapper, rvsdg_func, left)?;
         let rhs = self.expect_value(llvm_builder, mapper, rvsdg_func, right)?;
         let lhs_int = || lhs.into_int_value();

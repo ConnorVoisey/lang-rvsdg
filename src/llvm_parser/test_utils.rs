@@ -1,6 +1,7 @@
-//! Shared scaffolding for unit tests across `dominance`, `loop_arcs`, and
-//! `loops`. Three independent copies of `init` existed before this module;
-//! consolidate so future additions don't add a fourth.
+//! Shared scaffolding for the CFG-analysis unit tests (`dominance`, the `scc`
+//! modules, and the `control_flow` analyses). Several independent copies of
+//! `init` existed before this module; consolidate so future additions don't add
+//! another.
 
 #![cfg(test)]
 
@@ -9,7 +10,7 @@ use llvm_ir::Name;
 use crate::llvm_parser::{
     block_mapper::{BasicBlockId, BasicBlockMapper},
     dominance::{ForwardView, ReverseView, compute_dominance},
-    strongly_connected_components::Scc,
+    scc::components::Scc,
 };
 
 /// Build a `BasicBlockMapper` with `n` blocks (named `%0` .. `%n-1`) and no
@@ -24,7 +25,7 @@ pub(crate) fn init(n: usize) -> (BasicBlockMapper, Vec<BasicBlockId>) {
 }
 
 /// Build a non-trivial `Scc` from an explicit block list. Useful for
-/// `loop_arcs` tests that want to bypass Tarjan and assert on a known
+/// `scc::arcs` tests that want to bypass Tarjan and assert on a known
 /// SCC shape directly.
 pub(crate) fn scc_of(blocks: &[BasicBlockId]) -> Scc {
     Scc {

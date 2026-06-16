@@ -3,8 +3,8 @@ use crate::rvsdg::{
     func::Function,
     lower_to_llvm::{LLVMBuilderCtx, ValueMapper},
 };
+use color_eyre::eyre::{bail, eyre};
 use inkwell::{
-    builder::BuilderError,
     intrinsics::Intrinsic,
     types::BasicTypeEnum,
     values::{BasicMetadataValueEnum, BasicValueEnum, ValueKind},
@@ -19,15 +19,12 @@ impl RVSDGMod {
         op: IntrinsicOp,
         args: ValuesSpan,
         value_id: ValueId,
-    ) -> Result<(), BuilderError> {
+    ) -> color_eyre::Result<()> {
         let arg_ids = self.value_pool.get(args).to_vec();
         let arg_vals: Vec<BasicValueEnum<'ctx>> = arg_ids
             .iter()
-            .map(|&id| {
-                self.expect_value(llvm_builder, mapper, rvsdg_func, id)
-                    .expect("failed to lower intrinsic argument")
-            })
-            .collect();
+            .map(|&id| self.expect_value(llvm_builder, mapper, rvsdg_func, id))
+            .collect::<color_eyre::Result<_>>()?;
 
         match op {
             // Void intrinsics (state-only, no Project)
@@ -41,7 +38,7 @@ impl RVSDGMod {
                 self.call_void_intrinsic(llvm_builder, "llvm.memset", &arg_vals)?;
             }
             IntrinsicOp::LifetimeStart | IntrinsicOp::LifetimeEnd => {
-                // Optimizer hints — emit nothing for now
+                // Optimizer hints -- emit nothing for now
             }
             IntrinsicOp::Unreachable => {
                 llvm_builder.builder.build_unreachable()?;
@@ -64,7 +61,7 @@ impl RVSDGMod {
                     &[int_type],
                     &[int_val.into(), is_poison.into()],
                     "abs",
-                );
+                )?;
                 let project_id = ValueId(value_id.0 + 1);
                 mapper.set_val(project_id, result);
             }
@@ -77,7 +74,7 @@ impl RVSDGMod {
                     &[float_type],
                     &[arg_vals[0].into(), arg_vals[1].into(), arg_vals[2].into()],
                     "fma",
-                );
+                )?;
                 let project_id = ValueId(value_id.0 + 1);
                 mapper.set_val(project_id, result);
             }
@@ -90,7 +87,7 @@ impl RVSDGMod {
                     &[float_type],
                     &[arg_vals[0].into(), arg_vals[1].into()],
                     "fmin",
-                );
+                )?;
                 let project_id = ValueId(value_id.0 + 1);
                 mapper.set_val(project_id, result);
             }
@@ -103,7 +100,7 @@ impl RVSDGMod {
                     &[float_type],
                     &[arg_vals[0].into(), arg_vals[1].into()],
                     "fmax",
-                );
+                )?;
                 let project_id = ValueId(value_id.0 + 1);
                 mapper.set_val(project_id, result);
             }
@@ -116,7 +113,7 @@ impl RVSDGMod {
                     &[float_type],
                     &[arg_vals[0].into(), arg_vals[1].into()],
                     "copysign",
-                );
+                )?;
                 let project_id = ValueId(value_id.0 + 1);
                 mapper.set_val(project_id, result);
             }
@@ -128,7 +125,7 @@ impl RVSDGMod {
                     &[int_type],
                     &[arg_vals[0].into(), arg_vals[1].into()],
                     "sadd.sat",
-                );
+                )?;
                 let project_id = ValueId(value_id.0 + 1);
                 mapper.set_val(project_id, result);
             }
@@ -140,7 +137,7 @@ impl RVSDGMod {
                     &[int_type],
                     &[arg_vals[0].into(), arg_vals[1].into()],
                     "uadd.sat",
-                );
+                )?;
                 let project_id = ValueId(value_id.0 + 1);
                 mapper.set_val(project_id, result);
             }
@@ -152,7 +149,7 @@ impl RVSDGMod {
                     &[int_type],
                     &[arg_vals[0].into(), arg_vals[1].into()],
                     "ssub.sat",
-                );
+                )?;
                 let project_id = ValueId(value_id.0 + 1);
                 mapper.set_val(project_id, result);
             }
@@ -164,7 +161,7 @@ impl RVSDGMod {
                     &[int_type],
                     &[arg_vals[0].into(), arg_vals[1].into()],
                     "usub.sat",
-                );
+                )?;
                 let project_id = ValueId(value_id.0 + 1);
                 mapper.set_val(project_id, result);
             }
@@ -176,7 +173,7 @@ impl RVSDGMod {
                     &[int_type],
                     &[arg_vals[0].into(), arg_vals[1].into()],
                     "smin",
-                );
+                )?;
                 let project_id = ValueId(value_id.0 + 1);
                 mapper.set_val(project_id, result);
             }
@@ -188,7 +185,7 @@ impl RVSDGMod {
                     &[int_type],
                     &[arg_vals[0].into(), arg_vals[1].into()],
                     "smax",
-                );
+                )?;
                 let project_id = ValueId(value_id.0 + 1);
                 mapper.set_val(project_id, result);
             }
@@ -200,7 +197,7 @@ impl RVSDGMod {
                     &[int_type],
                     &[arg_vals[0].into(), arg_vals[1].into()],
                     "umin",
-                );
+                )?;
                 let project_id = ValueId(value_id.0 + 1);
                 mapper.set_val(project_id, result);
             }
@@ -212,7 +209,7 @@ impl RVSDGMod {
                     &[int_type],
                     &[arg_vals[0].into(), arg_vals[1].into()],
                     "umax",
-                );
+                )?;
                 let project_id = ValueId(value_id.0 + 1);
                 mapper.set_val(project_id, result);
             }
@@ -225,7 +222,7 @@ impl RVSDGMod {
                     "llvm.sadd.with.overflow",
                     &arg_vals,
                     value_id,
-                );
+                )?;
             }
             IntrinsicOp::UnsignedAddOverflow => {
                 self.lower_overflow_intrinsic(
@@ -234,7 +231,7 @@ impl RVSDGMod {
                     "llvm.uadd.with.overflow",
                     &arg_vals,
                     value_id,
-                );
+                )?;
             }
             IntrinsicOp::SignedSubOverflow => {
                 self.lower_overflow_intrinsic(
@@ -243,7 +240,7 @@ impl RVSDGMod {
                     "llvm.ssub.with.overflow",
                     &arg_vals,
                     value_id,
-                );
+                )?;
             }
             IntrinsicOp::UnsignedSubOverflow => {
                 self.lower_overflow_intrinsic(
@@ -252,7 +249,7 @@ impl RVSDGMod {
                     "llvm.usub.with.overflow",
                     &arg_vals,
                     value_id,
-                );
+                )?;
             }
             IntrinsicOp::SignedMulOverflow => {
                 self.lower_overflow_intrinsic(
@@ -261,7 +258,7 @@ impl RVSDGMod {
                     "llvm.smul.with.overflow",
                     &arg_vals,
                     value_id,
-                );
+                )?;
             }
             IntrinsicOp::UnsignedMulOverflow => {
                 self.lower_overflow_intrinsic(
@@ -270,7 +267,7 @@ impl RVSDGMod {
                     "llvm.umul.with.overflow",
                     &arg_vals,
                     value_id,
-                );
+                )?;
             }
         }
 
@@ -282,18 +279,15 @@ impl RVSDGMod {
         llvm_builder: &LLVMBuilderCtx<'a, 'ctx>,
         name: &str,
         args: &[BasicValueEnum<'ctx>],
-    ) -> Result<(), BuilderError> {
+    ) -> color_eyre::Result<()> {
         let param_types: Vec<BasicTypeEnum<'ctx>> = args.iter().map(|a| a.get_type()).collect();
         let intrinsic =
-            Intrinsic::find(name).unwrap_or_else(|| panic!("intrinsic {name} not found"));
+            Intrinsic::find(name).ok_or_else(|| eyre!("intrinsic `{name}` not found"))?;
         let func = intrinsic
             .get_declaration(llvm_builder.module, &param_types)
-            .unwrap_or_else(|| panic!("failed to get declaration for {name}"));
+            .ok_or_else(|| eyre!("failed to get declaration for intrinsic `{name}`"))?;
         let meta_args: Vec<BasicMetadataValueEnum<'ctx>> = args.iter().map(|&a| a.into()).collect();
-        llvm_builder
-            .builder
-            .build_call(func, &meta_args, name)
-            .expect("failed to build intrinsic call");
+        llvm_builder.builder.build_call(func, &meta_args, name)?;
         Ok(())
     }
 
@@ -304,38 +298,36 @@ impl RVSDGMod {
         name: &str,
         args: &[BasicValueEnum<'ctx>],
         value_id: ValueId,
-    ) {
+    ) -> color_eyre::Result<()> {
         let int_type = BasicTypeEnum::IntType(args[0].into_int_value().get_type());
         let intrinsic =
-            Intrinsic::find(name).unwrap_or_else(|| panic!("intrinsic {name} not found"));
+            Intrinsic::find(name).ok_or_else(|| eyre!("intrinsic `{name}` not found"))?;
         let func = intrinsic
             .get_declaration(llvm_builder.module, &[int_type])
-            .unwrap_or_else(|| panic!("failed to get declaration for {name}"));
+            .ok_or_else(|| eyre!("failed to get declaration for intrinsic `{name}`"))?;
         let meta_args: Vec<BasicMetadataValueEnum<'ctx>> = args.iter().map(|&a| a.into()).collect();
         let call_result = llvm_builder
             .builder
-            .build_call(func, &meta_args, name)
-            .expect("failed to build intrinsic call")
+            .build_call(func, &meta_args, name)?
             .try_as_basic_value();
         match call_result {
             ValueKind::Basic(struct_val) => {
                 // The overflow intrinsic returns {iN, i1}
                 let sv = struct_val.into_struct_value();
-                let result = llvm_builder
-                    .builder
-                    .build_extract_value(sv, 0, "result")
-                    .expect("failed to extract overflow result");
+                let result = llvm_builder.builder.build_extract_value(sv, 0, "result")?;
                 let overflow = llvm_builder
                     .builder
-                    .build_extract_value(sv, 1, "overflow")
-                    .expect("failed to extract overflow flag");
+                    .build_extract_value(sv, 1, "overflow")?;
                 let project_0 = ValueId(value_id.0 + 1);
                 let project_1 = ValueId(value_id.0 + 2);
                 mapper.set_val(project_0, result);
                 mapper.set_val(project_1, overflow);
             }
-            ValueKind::Instruction(_) => panic!("overflow intrinsic returned void"),
+            ValueKind::Instruction(_) => {
+                bail!("overflow intrinsic `{name}` unexpectedly returned void")
+            }
         }
+        Ok(())
     }
 }
 

@@ -1,6 +1,8 @@
 use crate::llvm_parser::block_mapper::{BasicBlockId, BasicBlockInOuts};
+use rustc_hash::FxHashSet;
+use smallvec::SmallVec;
 
-trait CfgView {
+pub(in crate::llvm_parser) trait CfgView {
     fn entry(&self) -> BasicBlockId;
     fn block_count(&self) -> usize;
     fn predecessors(&self, bb_id: BasicBlockId) -> &[BasicBlockId];
@@ -91,7 +93,8 @@ fn get_reverse_post_order<V: CfgView>(view: &V) -> Vec<BasicBlockId> {
 /// loop. Those have no post-dominator, hence `None`. Callers that need a
 /// post-dominator at a branch read it for the branch block, which (because
 /// at least one arm reaches the exit) is itself reachable and so resolves.
-pub fn compute_dominance<V: CfgView>(view: &V) -> Vec<Option<BasicBlockId>> {
+#[tracing::instrument(skip_all)]
+pub(in crate::llvm_parser) fn compute_dominance<V: CfgView>(view: &V) -> Vec<Option<BasicBlockId>> {
     let reverse_post_order = get_reverse_post_order(view);
     compute_dominance_with_order(view, &reverse_post_order)
 }
@@ -206,11 +209,169 @@ pub fn dominates(
     }
 }
 
+/// The **dominator graph of the arc** `(branch_vertex, target)` within the
+/// acyclic region described by `in_region` (Bahmann, Reissmann, Jahre, Meyer
+/// 2015, Def 2.5, lines 193-198): the set of vertices `w` such that *every*
+/// path from the region entry to `w` passes through that arc. In section 4.2 these
+/// are the branch subgraphs `B'j` -- the part of the acyclic CFG that only that
+/// one branch alternative can reach.
+///
+/// Read directly off the precomputed `idoms` (the single per-function
+/// immediate-dominator tree from [`compute_dominance`]); it never re-runs the
+/// dominator solver, which is what keeps branch restructuring near-linear
+/// rather than the paper's worst-case quadratic. `nodes` supplies the CFG
+/// adjacency; `in_region` is the region membership (a boundary-bounded set --
+/// vertices of an enclosing region return `false`, stopping the walk).
+///
+/// Returns empty when the arc does **not** uniquely enter `target` within the
+/// region -- i.e. `target` is reachable by some other in-region path, so it is a
+/// *continuation point* (it belongs in the tail `T`, not in any `Bj`). This is
+/// exactly the switch-fall-through case (Fig. paper section 4.2): a case label reached
+/// both by its own arc and by a fall-through has an empty branch subgraph.
+///
+/// Assumes the region is acyclic (loop bodies already collapsed by the section 4.1
+/// loop step), so a dominated vertex is reachable from `target` only through
+/// other dominated vertices -- the DFS below relies on this.
+#[tracing::instrument(skip_all)]
+pub fn dominator_graph_of_arc(
+    idoms: &[Option<BasicBlockId>],
+    nodes: &[BasicBlockInOuts],
+    in_region: impl Fn(BasicBlockId) -> bool,
+    arc: (BasicBlockId, BasicBlockId),
+) -> SmallVec<[BasicBlockId; 8]> {
+    let (branch_vertex, target) = arc;
+    let mut result: SmallVec<[BasicBlockId; 8]> = SmallVec::new();
+    if !in_region(target) {
+        return result;
+    }
+    // If `target` has any in-region predecessor other than the branch vertex,
+    // it is reachable without this arc (a shared continuation point), so the
+    // arc's dominator graph is empty.
+    for &pred in &nodes[target.0 as usize].inputs {
+        if pred != branch_vertex && in_region(pred) {
+            return result;
+        }
+    }
+    // The arc uniquely enters `target`. Collect `target`'s dominator subtree,
+    // restricted to the region: DFS the successors, keeping only vertices
+    // dominated by `target` (a non-dominated successor is the continuation
+    // point where this branch alternative rejoins the others -- stop there).
+    // `visited` is a set of just the dominated subtree (typically small),
+    // avoiding an O(block_count) zero-fill per arc -- this runs once per
+    // fan-out arm of every branch.
+    let mut visited: FxHashSet<BasicBlockId> = FxHashSet::default();
+    let mut stack: SmallVec<[BasicBlockId; 16]> = SmallVec::new();
+    stack.push(target);
+    while let Some(w) = stack.pop() {
+        if visited.contains(&w) || !in_region(w) || !dominates(target, w, idoms) {
+            continue;
+        }
+        visited.insert(w);
+        result.push(w);
+        for &succ in &nodes[w.0 as usize].outputs {
+            stack.push(succ);
+        }
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::llvm_parser::test_utils::{idoms_of, init, post_idoms_of};
     use pretty_assertions::assert_eq;
+
+    /// `dominator_graph_of_arc` over the whole graph, returning a sorted Vec for
+    /// stable comparison.
+    fn dom_arc(
+        mapper: &crate::llvm_parser::block_mapper::BasicBlockMapper,
+        idoms: &[Option<BasicBlockId>],
+        from: BasicBlockId,
+        to: BasicBlockId,
+    ) -> Vec<BasicBlockId> {
+        let mut v: Vec<BasicBlockId> =
+            dominator_graph_of_arc(idoms, &mapper.blocks, |_| true, (from, to))
+                .into_iter()
+                .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn dominator_graph_of_arc_diamond_arms_are_singletons() {
+        // 0 -> 1 -> 3, 0 -> 2 -> 3. Each arm's branch subgraph is just the arm
+        // vertex; the join 3 is dominated by 0, not by either arm.
+        let (mut mapper, bbs) = init(4);
+        mapper.add_connection(bbs[0], bbs[1]);
+        mapper.add_connection(bbs[0], bbs[2]);
+        mapper.add_connection(bbs[1], bbs[3]);
+        mapper.add_connection(bbs[2], bbs[3]);
+        let idoms = idoms_of(&mapper);
+
+        assert_eq!(vec![bbs[1]], dom_arc(&mapper, &idoms, bbs[0], bbs[1]));
+        assert_eq!(vec![bbs[2]], dom_arc(&mapper, &idoms, bbs[0], bbs[2]));
+    }
+
+    #[test]
+    fn dominator_graph_of_arc_includes_interior_chain() {
+        // 0 -> 1 -> 4 -> 3, 0 -> 2 -> 3. Arm 1's branch subgraph is {1, 4}
+        // (4 is interior to the arm, dominated by 1); 3 is the join.
+        let (mut mapper, bbs) = init(5);
+        mapper.add_connection(bbs[0], bbs[1]);
+        mapper.add_connection(bbs[1], bbs[4]);
+        mapper.add_connection(bbs[4], bbs[3]);
+        mapper.add_connection(bbs[0], bbs[2]);
+        mapper.add_connection(bbs[2], bbs[3]);
+        let idoms = idoms_of(&mapper);
+
+        assert_eq!(
+            vec![bbs[1], bbs[4]],
+            dom_arc(&mapper, &idoms, bbs[0], bbs[1])
+        );
+        assert_eq!(vec![bbs[2]], dom_arc(&mapper, &idoms, bbs[0], bbs[2]));
+    }
+
+    #[test]
+    fn dominator_graph_of_arc_empty_for_shared_fallthrough_target() {
+        // switch entry -> {1, 2, 3(default)}; case 1 (block 1) falls through
+        // into case 2 (block 2); 2 and 3 merge at 4.
+        //   entry(0) -> 1, entry -> 2, entry -> 3
+        //   1 -> 2   (fall-through)
+        //   2 -> 4, 3 -> 4
+        // Block 2 is reached from both the entry arc AND the fall-through, so
+        // the arc (entry, 2) does not uniquely enter it: its branch subgraph is
+        // empty (it is a continuation point). Arc (entry, 1) -> {1}.
+        let (mut mapper, bbs) = init(5);
+        mapper.add_connection(bbs[0], bbs[1]);
+        mapper.add_connection(bbs[0], bbs[2]);
+        mapper.add_connection(bbs[0], bbs[3]);
+        mapper.add_connection(bbs[1], bbs[2]);
+        mapper.add_connection(bbs[2], bbs[4]);
+        mapper.add_connection(bbs[3], bbs[4]);
+        let idoms = idoms_of(&mapper);
+
+        assert_eq!(vec![bbs[1]], dom_arc(&mapper, &idoms, bbs[0], bbs[1]));
+        assert!(dom_arc(&mapper, &idoms, bbs[0], bbs[2]).is_empty());
+        assert_eq!(vec![bbs[3]], dom_arc(&mapper, &idoms, bbs[0], bbs[3]));
+    }
+
+    #[test]
+    fn dominator_graph_of_arc_respects_region_boundary() {
+        // 0 -> 1 -> 2 -> 3. With the region excluding block 2, arm (0,1)'s
+        // subgraph stops at the boundary: {1} only.
+        let (mut mapper, bbs) = init(4);
+        mapper.add_connection(bbs[0], bbs[1]);
+        mapper.add_connection(bbs[1], bbs[2]);
+        mapper.add_connection(bbs[2], bbs[3]);
+        let idoms = idoms_of(&mapper);
+
+        let mut got: Vec<BasicBlockId> =
+            dominator_graph_of_arc(&idoms, &mapper.blocks, |b| b != bbs[2], (bbs[0], bbs[1]))
+                .into_iter()
+                .collect();
+        got.sort();
+        assert_eq!(vec![bbs[1]], got);
+    }
 
     // ------------------------------------------------------------------------
     // Trivial cases
@@ -226,7 +387,7 @@ mod tests {
 
     #[test]
     fn linear_chain() {
-        // 0 → 1 → 2 → 3
+        // 0 -> 1 -> 2 -> 3
         // Each block's idom is its only predecessor.
         let (mut mapper, bbs) = init(4);
         mapper.add_connection(bbs[0], bbs[1]);
@@ -241,7 +402,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------------
-    // Branching (γ-style)
+    // Branching (gamma-style)
     // ------------------------------------------------------------------------
 
     #[test]
@@ -251,7 +412,7 @@ mod tests {
         //   1   2
         //    \ /
         //     3
-        // Join block 3 is dominated by 0 (not 1 or 2 — either could be skipped).
+        // Join block 3 is dominated by 0 (not 1 or 2 -- either could be skipped).
         let (mut mapper, bbs) = init(4);
         mapper.add_connection(bbs[0], bbs[1]);
         mapper.add_connection(bbs[0], bbs[2]);
@@ -272,7 +433,7 @@ mod tests {
         //  1   |
         //   \ /
         //    2
-        // 0 → 1 → 2 AND 0 → 2. Block 2 is dominated by 0, not 1.
+        // 0 -> 1 -> 2 AND 0 -> 2. Block 2 is dominated by 0, not 1.
         let (mut mapper, bbs) = init(3);
         mapper.add_connection(bbs[0], bbs[1]);
         mapper.add_connection(bbs[0], bbs[2]);
@@ -312,11 +473,11 @@ mod tests {
         //      / \
         //     1   2
         //      \ /
-        //       3      ← idom 0
+        //       3      <- idom 0
         //      / \
         //     4   5
         //      \ /
-        //       6      ← idom 3
+        //       6      <- idom 3
         let (mut mapper, bbs) = init(7);
         mapper.add_connection(bbs[0], bbs[1]);
         mapper.add_connection(bbs[0], bbs[2]);
@@ -363,12 +524,12 @@ mod tests {
     }
 
     // ------------------------------------------------------------------------
-    // Loops (θ-style)
+    // Loops (theta-style)
     // ------------------------------------------------------------------------
 
     #[test]
     fn simple_self_loop() {
-        // 0 → 1 → 1 (self), 1 → 2
+        // 0 -> 1 -> 1 (self), 1 -> 2
         let (mut mapper, bbs) = init(3);
         mapper.add_connection(bbs[0], bbs[1]);
         mapper.add_connection(bbs[1], bbs[1]);
@@ -383,9 +544,9 @@ mod tests {
     #[test]
     fn natural_loop() {
         //   0 (preheader)
-        //   ↓
-        //   1 ←─ 2  (header ← latch)
-        //   ↓
+        //   v
+        //   1 <-- 2  (header <- latch)
+        //   v
         //   3 (exit)
         let (mut mapper, bbs) = init(4);
         mapper.add_connection(bbs[0], bbs[1]);
@@ -404,15 +565,15 @@ mod tests {
     fn loop_with_internal_branch() {
         // Shape your 04_while_loop.c.ll produces:
         //   0 (preheader)
-        //   ↓
+        //   v
         //   1 (header, tests cond)
-        //  ↙ ↘
+        //  / \
         // 3   2 (exit)
-        // └→ 1 (back-edge: 3 → 1)
+        // +-> 1 (back-edge: 3 -> 1)
         let (mut mapper, bbs) = init(4);
         mapper.add_connection(bbs[0], bbs[1]);
-        mapper.add_connection(bbs[1], bbs[3]); // header → latch (continue)
-        mapper.add_connection(bbs[1], bbs[2]); // header → exit
+        mapper.add_connection(bbs[1], bbs[3]); // header -> latch (continue)
+        mapper.add_connection(bbs[1], bbs[2]); // header -> exit
         mapper.add_connection(bbs[3], bbs[1]); // back-edge
 
         let idoms = idoms_of(&mapper);
@@ -426,12 +587,12 @@ mod tests {
     fn loop_with_break() {
         // Shape your 05_loop_with_break.c.ll has, simplified:
         //   0 (preheader)
-        //   ↓
-        //   1 (header) ─── exit ─→ 4 (post-loop)
-        //   ↓                       ↑
-        //   2 (body)─── break ──────┘
-        //   ↓
-        //   3 (latch) → 1 (back-edge)
+        //   v
+        //   1 (header) --- exit --> 4 (post-loop)
+        //   v                       ^
+        //   2 (body)--- break ------+
+        //   v
+        //   3 (latch) -> 1 (back-edge)
         let (mut mapper, bbs) = init(5);
         mapper.add_connection(bbs[0], bbs[1]);
         mapper.add_connection(bbs[1], bbs[2]);
@@ -452,15 +613,15 @@ mod tests {
     fn nested_loops() {
         // Outer loop {1, 2, 3, 4, 5}, inner loop {2, 3}.
         //   0 (preheader)
-        //   ↓
-        //   1 (outer header) ←─── 5 (outer latch)
-        //   ↓
-        //   2 (inner header) ←─ 3 (inner latch)
-        //   ↓
+        //   v
+        //   1 (outer header) <---- 5 (outer latch)
+        //   v
+        //   2 (inner header) <-- 3 (inner latch)
+        //   v
         //   4 (after inner)
-        //   ↓
-        //   5 → 1 (outer back-edge)
-        //   plus 1 → 6 (final exit when outer cond is false)
+        //   v
+        //   5 -> 1 (outer back-edge)
+        //   plus 1 -> 6 (final exit when outer cond is false)
         let (mut mapper, bbs) = init(7);
         mapper.add_connection(bbs[0], bbs[1]);
         mapper.add_connection(bbs[1], bbs[2]);
@@ -488,7 +649,7 @@ mod tests {
     #[test]
     fn dom_chain_walks_to_entry() {
         // Verify the IDom chain from a deep block walks all the way to the entry.
-        //   0 → 1 → 2 → 3 → 4
+        //   0 -> 1 -> 2 -> 3 -> 4
         let (mut mapper, bbs) = init(5);
         mapper.add_connection(bbs[0], bbs[1]);
         mapper.add_connection(bbs[1], bbs[2]);
@@ -513,12 +674,12 @@ mod tests {
 
     #[test]
     fn cross_edge_dominance() {
-        // 0 → 1, 0 → 2, 1 → 2 (cross edge from one arm of a branch to the other)
+        // 0 -> 1, 0 -> 2, 1 -> 2 (cross edge from one arm of a branch to the other)
         //   0
         //  / \
         // 1   |
         //  \  v
-        //   → 2
+        //   -> 2
         // Block 2 has two predecessors (0 and 1); dominated by 0.
         let (mut mapper, bbs) = init(3);
         mapper.add_connection(bbs[0], bbs[1]);
@@ -534,7 +695,7 @@ mod tests {
     #[test]
     fn long_chain_then_branch() {
         // Linear chain feeding into a branch.
-        // 0 → 1 → 2 → 3 (branches) → 4, 3 → 5, 4 → 6, 5 → 6
+        // 0 -> 1 -> 2 -> 3 (branches) -> 4, 3 -> 5, 4 -> 6, 5 -> 6
         let (mut mapper, bbs) = init(7);
         mapper.add_connection(bbs[0], bbs[1]);
         mapper.add_connection(bbs[1], bbs[2]);
@@ -572,8 +733,8 @@ mod tests {
 
     #[test]
     fn post_dom_block_that_cannot_reach_exit_is_none() {
-        // 0 → 1 → 3 (exit)
-        // 0 → 2 → 2 (self-loop: block 2 never reaches the exit)
+        // 0 -> 1 -> 3 (exit)
+        // 0 -> 2 -> 2 (self-loop: block 2 never reaches the exit)
         // Block 2 is unreachable in the reverse CFG, so it has no
         // post-dominator (None) rather than tripping a precondition. The
         // branch at 0 still resolves: its only exit-reaching path is via 1.
@@ -585,14 +746,14 @@ mod tests {
 
         let pdoms = post_idoms_of(&mapper, bbs[3]);
         assert_eq!(Some(bbs[3]), pdoms[3]); // exit post-dominates itself
-        assert_eq!(Some(bbs[3]), pdoms[1]); // 1 → 3
-        assert_eq!(Some(bbs[1]), pdoms[0]); // only exit path is 0 → 1 → 3
+        assert_eq!(Some(bbs[3]), pdoms[1]); // 1 -> 3
+        assert_eq!(Some(bbs[1]), pdoms[0]); // only exit path is 0 -> 1 -> 3
         assert_eq!(None, pdoms[2]); // 2 cannot reach the exit
     }
 
     #[test]
     fn post_dom_linear_chain() {
-        // 0 → 1 → 2 → 3 (exit)
+        // 0 -> 1 -> 2 -> 3 (exit)
         // Each block's post-idom is its only successor.
         let (mut mapper, bbs) = init(4);
         mapper.add_connection(bbs[0], bbs[1]);
@@ -601,9 +762,9 @@ mod tests {
 
         let pdoms = post_idoms_of(&mapper, bbs[3]);
         assert_eq!(Some(bbs[3]), pdoms[3]); // exit post-dominates itself
-        assert_eq!(Some(bbs[3]), pdoms[2]); // 2 → 3
-        assert_eq!(Some(bbs[2]), pdoms[1]); // 1 → 2
-        assert_eq!(Some(bbs[1]), pdoms[0]); // 0 → 1
+        assert_eq!(Some(bbs[3]), pdoms[2]); // 2 -> 3
+        assert_eq!(Some(bbs[2]), pdoms[1]); // 1 -> 2
+        assert_eq!(Some(bbs[1]), pdoms[0]); // 0 -> 1
     }
 
     #[test]
@@ -613,7 +774,7 @@ mod tests {
         //   1   2
         //    \ /
         //     3 (exit)
-        // Every path from any block ends at 3 — all post-dominated by 3.
+        // Every path from any block ends at 3 -- all post-dominated by 3.
         let (mut mapper, bbs) = init(4);
         mapper.add_connection(bbs[0], bbs[1]);
         mapper.add_connection(bbs[0], bbs[2]);
@@ -634,7 +795,7 @@ mod tests {
         //  1   |
         //   \ /
         //    2 (exit)
-        // The path 0 → 2 bypasses 1, so 1 does NOT post-dominate 0.
+        // The path 0 -> 2 bypasses 1, so 1 does NOT post-dominate 0.
         // But 2 post-dominates everything.
         let (mut mapper, bbs) = init(3);
         mapper.add_connection(bbs[0], bbs[1]);
@@ -675,11 +836,11 @@ mod tests {
         //      / \
         //     1   2
         //      \ /
-        //       3      ← post-idom of 1 and 2 (and 0)
+        //       3      <- post-idom of 1 and 2 (and 0)
         //      / \
         //     4   5
         //      \ /
-        //       6 (exit)   ← post-idom of 3 (and 4 and 5)
+        //       6 (exit)   <- post-idom of 3 (and 4 and 5)
         let (mut mapper, bbs) = init(7);
         mapper.add_connection(bbs[0], bbs[1]);
         mapper.add_connection(bbs[0], bbs[2]);
@@ -692,11 +853,11 @@ mod tests {
 
         let pdoms = post_idoms_of(&mapper, bbs[6]);
         assert_eq!(Some(bbs[6]), pdoms[6]);
-        assert_eq!(Some(bbs[6]), pdoms[5]); // 5 → 6
-        assert_eq!(Some(bbs[6]), pdoms[4]); // 4 → 6
+        assert_eq!(Some(bbs[6]), pdoms[5]); // 5 -> 6
+        assert_eq!(Some(bbs[6]), pdoms[4]); // 4 -> 6
         assert_eq!(Some(bbs[6]), pdoms[3]); // 3's arms reconverge at 6
-        assert_eq!(Some(bbs[3]), pdoms[2]); // 2 → 3 (only successor)
-        assert_eq!(Some(bbs[3]), pdoms[1]); // 1 → 3 (only successor)
+        assert_eq!(Some(bbs[3]), pdoms[2]); // 2 -> 3 (only successor)
+        assert_eq!(Some(bbs[3]), pdoms[1]); // 1 -> 3 (only successor)
         assert_eq!(Some(bbs[3]), pdoms[0]); // 0's arms reconverge at 3, which precedes the second diamond
     }
 
@@ -719,18 +880,18 @@ mod tests {
 
         let pdoms = post_idoms_of(&mapper, bbs[4]);
         assert_eq!(Some(bbs[4]), pdoms[4]);
-        assert_eq!(Some(bbs[4]), pdoms[3]); // 3 → 4
-        assert_eq!(Some(bbs[4]), pdoms[2]); // 2 → 4
-        assert_eq!(Some(bbs[3]), pdoms[1]); // 1 → 3 (sole succ)
+        assert_eq!(Some(bbs[4]), pdoms[3]); // 3 -> 4
+        assert_eq!(Some(bbs[4]), pdoms[2]); // 2 -> 4
+        assert_eq!(Some(bbs[3]), pdoms[1]); // 1 -> 3 (sole succ)
         assert_eq!(Some(bbs[4]), pdoms[0]); // arms reconverge at 4
     }
 
     #[test]
     fn post_dom_natural_loop() {
         //   0 (preheader)
-        //   ↓
-        //   1 ←─ 2  (header ← latch)
-        //   ↓
+        //   v
+        //   1 <-- 2  (header <- latch)
+        //   v
         //   3 (exit)
         // post-idom[0] = 1 (preheader's only successor is header)
         // post-idom[1] = 3 (header eventually exits to 3)
@@ -752,7 +913,7 @@ mod tests {
     #[test]
     fn post_dom_chain_walks_to_exit() {
         // Verify post-idom chain from block 0 walks to the exit.
-        //   0 → 1 → 2 → 3 → 4 (exit)
+        //   0 -> 1 -> 2 -> 3 -> 4 (exit)
         let (mut mapper, bbs) = init(5);
         mapper.add_connection(bbs[0], bbs[1]);
         mapper.add_connection(bbs[1], bbs[2]);
@@ -776,7 +937,7 @@ mod tests {
 
     #[test]
     fn post_dom_self_loop() {
-        // 0 → 1 → 1 (self), 1 → 2 (exit)
+        // 0 -> 1 -> 1 (self), 1 -> 2 (exit)
         // post-idom[0] = 1 (sole successor)
         // post-idom[1] = 2 (eventually exits to 2)
         // post-idom[2] = 2
@@ -792,14 +953,14 @@ mod tests {
     }
 
     // ========================================================================
-    // Dom/post-dom symmetry — these structural invariants tie the two together.
+    // Dom/post-dom symmetry -- these structural invariants tie the two together.
     // ========================================================================
 
     #[test]
     fn dom_and_post_dom_diamond_symmetry() {
         // In a symmetric diamond, the entry dominates the join, AND the join
         // post-dominates the entry. The "branch point" of dominators is the
-        // "merge point" of post-dominators — they're structurally mirrored.
+        // "merge point" of post-dominators -- they're structurally mirrored.
         let (mut mapper, bbs) = init(4);
         mapper.add_connection(bbs[0], bbs[1]);
         mapper.add_connection(bbs[0], bbs[2]);
@@ -820,7 +981,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------------
-    // dominates() function — regression coverage for the multi-hop bug
+    // dominates() function -- regression coverage for the multi-hop bug
     // (was indexing `b.0` instead of `current.0` and never moved up the chain).
     // ------------------------------------------------------------------------
 

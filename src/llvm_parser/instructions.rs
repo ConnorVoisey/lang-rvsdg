@@ -56,7 +56,7 @@ fn convert_mem_ordering(o: LlvmMemoryOrdering) -> MemoryOrdering {
 /// (callee/base first, then arguments/indices in their LLVM order).
 ///
 /// The explicit `'a` lifetime ties the callback's `&'a Operand` parameter to the
-/// input instruction's lifetime — without it, the callback is inferred as
+/// input instruction's lifetime -- without it, the callback is inferred as
 /// `for<'a> FnMut(&'a Operand)` (HRTB), which makes the closure unable to store
 /// references extracted from operands into outer collections like `HashSet<&Name>`.
 pub(super) fn for_each_operand<'a, F: FnMut(&'a Operand)>(inst: &'a Instruction, mut f: F) {
@@ -217,14 +217,14 @@ pub(super) fn for_each_operand<'a, F: FnMut(&'a Operand)>(inst: &'a Instruction,
             f(&i.false_value);
         }
 
-        // Phi — each [value, predecessor] pair contributes a value operand
+        // Phi -- each [value, predecessor] pair contributes a value operand
         Instruction::Phi(i) => {
             for (op, _pred) in &i.incoming_values {
                 f(op);
             }
         }
 
-        // Call — walk arg operands, plus the callee if it's an indirect call
+        // Call -- walk arg operands, plus the callee if it's an indirect call
         Instruction::Call(i) => {
             if let either::Either::Right(callee) = &i.function {
                 f(callee);
@@ -234,7 +234,7 @@ pub(super) fn for_each_operand<'a, F: FnMut(&'a Operand)>(inst: &'a Instruction,
             }
         }
 
-        // Variadic / EH — not modelled by lower_instruction either.
+        // Variadic / EH -- not modelled by lower_instruction either.
         // Panic on encounter so the failure surfaces at the operand-walk site,
         // not later as a silent missed-live-in.
         Instruction::VAArg(_) => todo!("for_each_operand: VAArg"),
@@ -281,7 +281,7 @@ pub(super) fn for_each_terminator_operand<'a, F: FnMut(&'a Operand)>(
 /// Returns the SSA destination name of an instruction, if it has one.
 ///
 /// Used by live-in analysis to determine what's "defined inside" a region.
-/// Symmetric to `for_each_operand` — that visits uses; this returns the
+/// Symmetric to `for_each_operand` -- that visits uses; this returns the
 /// definition. Variants without a value result (`Store`, `Fence`, etc.)
 /// return `None`.
 pub(super) fn instruction_dest(inst: &Instruction) -> Option<&Name> {
@@ -351,7 +351,7 @@ pub(super) fn instruction_dest(inst: &Instruction) -> Option<&Name> {
         Instruction::Select(i) => Some(i.get_result()),
         Instruction::Phi(i) => Some(&i.dest),
 
-        // Call's dest is optional — `None` when the callee returns void.
+        // Call's dest is optional -- `None` when the callee returns void.
         Instruction::Call(i) => i.dest.as_ref(),
 
         // VAArg has a dest in the IR; the rest of EH support is not modelled
@@ -386,7 +386,7 @@ fn convert_fp_pred(p: FPPredicate) -> FCmpPred {
 
 /// Three lifetimes, each load-bearing:
 ///   - `'rb`: borrow of the surrounding `RegionBuilder` (typically the
-///     shortest — only valid for the duration of one lowering call).
+///     shortest -- only valid for the duration of one lowering call).
 ///   - `'g`:  the graph the `RegionBuilder` writes into (borrowed from the
 ///     enclosing `RVSDGMod`).
 ///   - `'m`:  the LLVM module + derived per-function data inside `FnCtx`.
@@ -395,7 +395,7 @@ fn convert_fp_pred(p: FPPredicate) -> FCmpPred {
 /// `lower_fn_body`, the `RVSDGMod` is borrowed mutably while `FnCtx` borrows
 /// the LLVM module + dom tables shared-immutably. Tying them together
 /// over-constrains the borrow tree and forces `'static`.
-pub struct RegionLowerer<'rb, 'g, 'm> {
+pub(in crate::llvm_parser) struct RegionLowerer<'rb, 'g, 'm> {
     pub rb: &'rb mut RegionBuilder<'g>,
     pub name_to_value: FxHashMap<Name, ValueId>,
     pub fn_ctx: &'m FnCtx<'m>,
@@ -405,7 +405,10 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
     /// Construct a top-level lowerer with an empty SSA-name map. Used at the
     /// function entry; callers populate `name_to_value` themselves with
     /// function parameters before lowering the body.
-    pub fn new(rb: &'rb mut RegionBuilder<'g>, fn_ctx: &'m FnCtx<'m>) -> Self {
+    pub(in crate::llvm_parser) fn new(
+        rb: &'rb mut RegionBuilder<'g>,
+        fn_ctx: &'m FnCtx<'m>,
+    ) -> Self {
         Self {
             rb,
             fn_ctx,
@@ -418,7 +421,7 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
     /// outer-scope SSA names (gamma arm params seeded from live-ins, theta
     /// body params seeded from header phis + live-ins). The caller builds
     /// the map up front, optionally pre-sized for the expected body size.
-    pub fn new_child(
+    pub(in crate::llvm_parser) fn new_child(
         rb: &'rb mut RegionBuilder<'g>,
         fn_ctx: &'m FnCtx<'m>,
         name_to_value: FxHashMap<Name, ValueId>,
@@ -435,7 +438,7 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
     /// Pure ops (arithmetic, casts, comparisons, etc.) leave state unchanged
     /// and return `state` directly. Side-effecting ops (load, store, alloca,
     /// fence, call, atomic ops) consume the state and produce a new one.
-    /// Phi nodes are skipped — they're absorbed into region parameters at
+    /// Phi nodes are skipped -- they're absorbed into region parameters at
     /// region boundaries, not lowered as instructions.
     pub(crate) fn lower_instruction(
         &mut self,
@@ -533,7 +536,7 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
                 state
             }
             Instruction::ShuffleVector(_) => {
-                // Mask is a constant vector — needs per-element decomposition.
+                // Mask is a constant vector -- needs per-element decomposition.
                 // Skipped until vector-constant lowering and undef-element handling are decided.
                 todo!("shufflevector")
             }
@@ -892,10 +895,11 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
 
     pub(super) fn operand(&mut self, op: &Operand) -> color_eyre::Result<ValueId> {
         match op {
-            Operand::LocalOperand { name, .. } => Ok(*self
-                .name_to_value
-                .get(name)
-                .unwrap_or_else(|| panic!("ssa value should already have been defined, {name}"))),
+            Operand::LocalOperand { name, .. } => {
+                self.name_to_value.get(name).copied().ok_or_else(|| {
+                    color_eyre::eyre::eyre!("ssa value {name} used before definition")
+                })
+            }
             Operand::ConstantOperand(constant_ref) => {
                 let const_id = self
                     .rb

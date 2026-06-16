@@ -51,12 +51,15 @@
 //!
 //! Lookups (block to component, component to children, component to
 //! arcs) are all O(1) array indexing.
+//!
+//! TODO: this is more of an mvp than a production version,
+//! there is far too much cloning everywhere.
 
 use smallvec::SmallVec;
 
 use crate::llvm_parser::{
     block_mapper::{BasicBlockId, BasicBlockMapper},
-    loop_arcs::LoopArcs,
+    scc::arcs::LoopArcs,
 };
 
 /// Index into the SCC tree's node arrays. Distinct from the strongly
@@ -93,8 +96,9 @@ impl SccTree {
     /// component's blocks with the repetition arcs removed to discover
     /// inner components. Trivial components (single block with no
     /// self-loop) are dropped at every level; they are not loops.
+    #[tracing::instrument(name = "SccTree::build", skip_all)]
     pub fn build(mapper: &BasicBlockMapper) -> Self {
-        let mut tree = SccTree {
+        let mut tree = Self {
             roots: Vec::new(),
             blocks: Vec::new(),
             children: Vec::new(),
@@ -151,21 +155,25 @@ impl SccTree {
         let blocks = self.blocks[node.0 as usize].clone();
 
         let arcs = LoopArcs::from_scc_blocks(&blocks, mapper);
-        // Filter for inner SCC discovery: removing the repetition arcs
-        // matches the paper's L* construction (section 4.1) without
-        // mutating the control flow graph.
-        let rep_arcs: SmallVec<[(BasicBlockId, BasicBlockId); 4]> = arcs.repetition_arcs.clone();
+        // To find the nested loops, re-run Tarjan over this component's blocks
+        // with the back-edges (repetition arcs) removed: without them the
+        // component is no longer a single cycle, so any cycle that remains is a
+        // genuinely nested loop. (This is the paper's L* construction, section
+        // 4.1, done without mutating the actual control flow graph.)
+        let repetition_arcs: SmallVec<[(BasicBlockId, BasicBlockId); 4]> =
+            arcs.repetition_arcs.clone();
         self.arcs[node.0 as usize] = arcs;
 
-        let inner = mapper.scc_in_subgraph(&blocks, &rep_arcs);
-        for sub in inner {
-            if sub.is_trivial {
+        let inner_sccs = mapper.scc_in_subgraph(&blocks, &repetition_arcs);
+        for inner_scc in inner_sccs {
+            if inner_scc.is_trivial {
                 continue;
             }
-            let sub_blocks: SmallVec<[BasicBlockId; 8]> = sub.blocks.iter().copied().collect();
-            let sub_id = self.alloc_node(sub_blocks, Some(node));
-            self.children[node.0 as usize].push(sub_id);
-            self.populate(sub_id, mapper);
+            let inner_blocks: SmallVec<[BasicBlockId; 8]> =
+                inner_scc.blocks.iter().copied().collect();
+            let inner_id = self.alloc_node(inner_blocks, Some(node));
+            self.children[node.0 as usize].push(inner_id);
+            self.populate(inner_id, mapper);
         }
     }
 
@@ -195,13 +203,13 @@ impl SccTree {
     /// returned table has one entry per block, indexed by `BasicBlockId`.
     pub fn entry_block_to_node(&self, block_count: usize) -> Vec<Option<SccTreeNodeId>> {
         let mut table = vec![None; block_count];
-        for i in 0..self.len() {
-            let id = SccTreeNodeId(i as u32);
-            for &entry in &self.arcs[i].entry_blocks {
+        for (index, arcs) in self.arcs.iter().enumerate() {
+            let node_id = SccTreeNodeId(index as u32);
+            for &entry in &arcs.entry_blocks {
                 // Inner components are populated after their parent, so
                 // a later write here always represents an innermost
                 // component for that entry vertex.
-                table[entry.0 as usize] = Some(id);
+                table[entry.0 as usize] = Some(node_id);
             }
         }
         table

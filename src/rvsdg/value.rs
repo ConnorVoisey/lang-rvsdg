@@ -1,5 +1,5 @@
 use crate::rvsdg::{
-    FuncId, GlobalId, RegionId, RegionsSpan, State, U32Span, ValueId, ValuesSpan,
+    FuncId, GlobalId, MatchArmSpan, RegionId, RegionsSpan, State, U32Span, ValueId, ValuesSpan,
     constant::ConstId,
     ops::{
         ArithFlags, AtomicRMWOp, BinaryOp, CastOp, FCmpPred, ICmpPred, IntrinsicOp, MemoryOrdering,
@@ -17,7 +17,7 @@ pub struct Value {
 
 // Size: 32 bytes. Driven by Load/Store/AtomicLoad variants at 25 bytes payload.
 // Most variants are 4-16 bytes but boxing the large ones would add pointer chases
-// on the most frequently accessed operations — not worth the tradeoff.
+// on the most frequently accessed operations -- not worth the tradeoff.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ValueKind {
     Const(ConstValue),
@@ -48,7 +48,7 @@ pub enum ValueKind {
         right: ValueId,
     },
     /// Branch-free conditional value selection (LLVM's `select`).
-    /// `condition ? true_val : false_val` — no control flow, no state edge.
+    /// `condition ? true_val : false_val` -- no control flow, no state edge.
     Ternary {
         condition: ValueId,
         true_val: ValueId,
@@ -92,12 +92,12 @@ pub enum ValueKind {
         indices: U32Span,
     },
     /// Compute a pointer to a field or element within an aggregate.
-    /// LLVM's `getelementptr` — indices walk through nested structs/arrays.
+    /// LLVM's `getelementptr` -- indices walk through nested structs/arrays.
     PtrOffset {
         base: ValueId,
         /// The type being indexed into (the pointee type of base)
         base_type: TypeRef,
-        /// Index values — struct field indices are constants, array indices are dynamic
+        /// Index values -- struct field indices are constants, array indices are dynamic
         indices: ValuesSpan,
         /// UB if the result is out of bounds (enables pointer arithmetic optimizations)
         inbounds: bool,
@@ -174,9 +174,25 @@ pub enum ValueKind {
         ordering: MemoryOrdering,
     },
     /// Convert poison/undef to an arbitrary but fixed value.
-    /// Pure — no state edge needed.
+    /// Pure -- no state edge needed.
     Freeze {
         value: ValueId,
+    },
+    /// Match an integer `input` into a control/predicate value (Bahmann et al.
+    /// 2015 section 2.2, lines 270-276): the "match" that turns an integer condition
+    /// into a predicate enumerating alternatives. The produced value has type
+    /// `Control(alternatives)`. Each arm in `arms` maps a specific input value
+    /// to a control alternative (0-based); any input value not listed maps to
+    /// `default`. gamma/theta consume the resulting control value -- never the raw
+    /// integer -- which keeps predicates in the single-use form perfect
+    /// reconstruction requires (Def 2.6) and records the original case values
+    /// so the source branch/switch is recoverable.
+    Match {
+        input: ValueId,
+        arms: MatchArmSpan,
+        default: u32,
+        /// Number of control alternatives (matches the `Control(n)` type).
+        alternatives: u32,
     },
     /// Built-in memory/arithmetic intrinsics that don't branch.
     Intrinsic {
@@ -195,7 +211,7 @@ pub enum ValueKind {
         region_id: RegionId,
     },
     /// N-way conditional branch. The condition selects which region to execute:
-    /// 0 → first region, 1 → second, etc. For a 2-way if/else, condition is a bool.
+    /// 0 -> first region, 1 -> second, etc. For a 2-way if/else, condition is a bool.
     Gamma {
         condition: ValueId,
         inputs: ValuesSpan,
@@ -238,15 +254,15 @@ pub enum ValueKind {
 pub enum ConstValue {
     /// Covers i1 through i64. The type on the parent Value determines the width.
     Int(i64),
-    /// IEEE 754 bits — stored as u32 to support Eq/Hash.
+    /// IEEE 754 bits -- stored as u32 to support Eq/Hash.
     F32(u32),
-    /// IEEE 754 bits — stored as u64 to support Eq/Hash.
+    /// IEEE 754 bits -- stored as u64 to support Eq/Hash.
     F64(u64),
     NullPtr,
     /// The result of undefined behavior (e.g. signed overflow with no-wrap flags).
     /// Propagates through operations: `poison + 1 = poison`. Triggers UB if it
     /// reaches a side-effecting operation like a store or branch condition.
-    /// LLVM's `undef` is lowered to poison on import — we don't distinguish the two.
+    /// LLVM's `undef` is lowered to poison on import -- we don't distinguish the two.
     Poison,
 }
 
@@ -257,19 +273,5 @@ impl ConstValue {
 
     pub fn f64_from_native(v: f64) -> Self {
         Self::F64(v.to_bits())
-    }
-
-    pub fn as_f32(&self) -> Option<f32> {
-        match self {
-            Self::F32(bits) => Some(f32::from_bits(*bits)),
-            _ => None,
-        }
-    }
-
-    pub fn as_f64(&self) -> Option<f64> {
-        match self {
-            Self::F64(bits) => Some(f64::from_bits(*bits)),
-            _ => None,
-        }
     }
 }

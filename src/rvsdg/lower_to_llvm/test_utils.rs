@@ -6,7 +6,7 @@ pub mod test_utils {
     macro_rules! define_jit_runner {
         ($name:ident, $ret:ty) => {
             pub fn $name(rvsdg: &RVSDGMod, fn_name: &str) -> $ret {
-                crate::init_llvm_native();
+                crate::init_llvm_native().expect("init native target");
 
                 let context = Context::create();
                 let module = rvsdg

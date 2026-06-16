@@ -3,8 +3,9 @@ use crate::rvsdg::{
     func::Function,
     lower_to_llvm::{LLVMBuilderCtx, ValueMapper},
 };
+use color_eyre::eyre::{bail, eyre};
 use inkwell::{
-    builder::BuilderError,
+    IntPredicate,
     values::{BasicValue, BasicValueEnum},
 };
 
@@ -19,16 +20,22 @@ impl RVSDGMod {
         loop_vars: ValuesSpan,
         condition: ValueId,
         region_id: RegionId,
-    ) -> Result<Option<BasicValueEnum<'ctx>>, BuilderError> {
+    ) -> color_eyre::Result<Option<BasicValueEnum<'ctx>>> {
         let input_ids = self.value_pool.get(loop_vars).to_vec();
         // This lookup is probably isn't required, I could just pass in the function instead,
         // but this requires keeping track of it
-        let func = mapper
-            .get_fn(rvsdg_func.id)
-            .expect("function should have been lowered before regions are created");
+        let func = mapper.get_fn(rvsdg_func.id).ok_or_else(|| {
+            eyre!(
+                "function `{}` was not registered before lowering its theta",
+                rvsdg_func.name
+            )
+        })?;
 
         // Create all basic blocks upfront
-        let entry_bb = llvm_builder.builder.get_insert_block().unwrap();
+        let entry_bb = llvm_builder
+            .builder
+            .get_insert_block()
+            .ok_or_else(|| eyre!("theta lowering started with no current basic block"))?;
         let loop_bb = llvm_builder.context.append_basic_block(func, "theta.loop");
         let exit_bb = llvm_builder.context.append_basic_block(func, "theta.exit");
 
@@ -36,22 +43,15 @@ impl RVSDGMod {
         llvm_builder.builder.position_at_end(loop_bb);
 
         // Build phis at top of loop_bb, add initial incoming from entry
-        let initial_values = input_ids.iter().map(|&id| {
-            self.expect_value(llvm_builder, mapper, rvsdg_func, id)
-                // TODO: replace the unwrap with correct error handling
-                .unwrap()
-        });
-
-        let phis: Vec<_> = initial_values
-            .map(|val| {
-                let phi = llvm_builder
-                    .builder
-                    .build_phi(val.get_type(), "theta.phi")
-                    .unwrap();
-                phi.add_incoming(&[(&val as &dyn BasicValue, entry_bb)]);
-                phi
-            })
-            .collect();
+        let mut phis = Vec::with_capacity(input_ids.len());
+        for &id in &input_ids {
+            let val = self.expect_value(llvm_builder, mapper, rvsdg_func, id)?;
+            let phi = llvm_builder
+                .builder
+                .build_phi(val.get_type(), "theta.phi")?;
+            phi.add_incoming(&[(&val as &dyn BasicValue, entry_bb)]);
+            phis.push(phi);
+        }
 
         // Bind region params to phi outputs (not initial values)
         let region = self.get_region(region_id);
@@ -68,12 +68,43 @@ impl RVSDGMod {
             .filter_map(|&rid| *mapper.get_val(rid))
             .collect();
 
-        // Condition -> branch back to loop or exit
+        // The back-edge wiring below zips phis with results; a mismatch would
+        // silently leave some loop-variable phis with no back-edge incoming,
+        // producing an invalid module. Each loop variable must have exactly one
+        // value-result.
+        if results.len() != phis.len() {
+            bail!(
+                "theta produced {} loop-result values but has {} loop variables",
+                results.len(),
+                phis.len()
+            );
+        }
+
+        // Condition -> branch back to loop or exit. The repetition predicate is
+        // either a bare `i1` (the old driver's raw condition: nonzero = repeat)
+        // or a control/predicate value lowered to a wider int (the paper's
+        // 2-valued `r`: 1 = repeat, 0 = exit). `build_conditional_branch`
+        // requires an `i1`, so reduce a wider predicate with `!= 0` first.
         let cond = self.expect_value(llvm_builder, mapper, rvsdg_func, condition)?;
-        let actual_bb = llvm_builder.builder.get_insert_block().unwrap();
+        let cond_int = cond.into_int_value();
+        let repeat = if cond_int.get_type().get_bit_width() == 1 {
+            cond_int
+        } else {
+            let zero = cond_int.get_type().const_int(0, false);
+            llvm_builder.builder.build_int_compare(
+                IntPredicate::NE,
+                cond_int,
+                zero,
+                "theta.repeat",
+            )?
+        };
+        let actual_bb = llvm_builder
+            .builder
+            .get_insert_block()
+            .ok_or_else(|| eyre!("theta loop body ended with no current basic block"))?;
         llvm_builder
             .builder
-            .build_conditional_branch(cond.into_int_value(), loop_bb, exit_bb)?;
+            .build_conditional_branch(repeat, loop_bb, exit_bb)?;
 
         // Add back-edge incoming to phis
         for (i, (phi, result)) in phis.iter().zip(results.iter()).enumerate() {
@@ -90,13 +121,54 @@ impl RVSDGMod {
 #[cfg(test)]
 mod tests {
     use crate::rvsdg::{
-        ArithFlags, BinaryOp, ICmpPred, Linkage, RVSDGMod,
+        ArithFlags, BinaryOp, ICmpPred, Linkage, MatchArm, RVSDGMod,
         builder::{BranchResult, LoopResult},
         func::FnResult,
         lower_to_llvm::test_utils::test_utils::jit_run_i32,
         types::{BOOL, I32},
         value::ConstValue,
     };
+
+    #[test]
+    fn theta_via_match_repetition_predicate() {
+        // do { x += 1 } while (x < 10), but the repetition predicate is a
+        // 2-valued control produced by `match`: 1 = repeat, 0 = exit. Exercises
+        // the theta backend reducing a control (wider-than-i1) predicate with
+        // `!= 0`. => 10
+        let mut rvsdg = RVSDGMod::new_host(String::from("test"));
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
+        rvsdg.define_fn(func_id, |rb, state| {
+            let x = rb.const_i32(0);
+            let res = rb.theta(state, &[x], |rb| {
+                let loop_x = rb.param(0);
+                let one = rb.const_i32(1);
+                let next_x = rb.binary(BinaryOp::Add, ArithFlags::default(), loop_x, one, I32);
+                let ten = rb.const_i32(10);
+                let still_looping = rb.icmp(ICmpPred::SignedLt, next_x, ten);
+                // true (still looping) -> alternative 1 (repeat); else default 0 (exit).
+                let r = rb.match_op(
+                    still_looping,
+                    &[MatchArm {
+                        value: 1,
+                        alternative: 1,
+                    }],
+                    0,
+                    2,
+                );
+                Ok(LoopResult {
+                    condition: r,
+                    next_state: state,
+                    next_vars: vec![next_x],
+                })
+            })?;
+            Ok(FnResult {
+                state: res.state,
+                values: vec![res.result(0)],
+            })
+        });
+
+        assert_eq!(jit_run_i32(&rvsdg, "test"), 10);
+    }
 
     #[test]
     fn theta_simple() {

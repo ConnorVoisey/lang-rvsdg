@@ -3,9 +3,9 @@ use crate::rvsdg::{
     func::Function,
     lower_to_llvm::{LLVMBuilderCtx, ValueMapper},
 };
+use color_eyre::eyre::{bail, eyre};
 use inkwell::{
     basic_block::BasicBlock,
-    builder::BuilderError,
     values::{BasicValue, BasicValueEnum},
 };
 
@@ -20,13 +20,16 @@ impl RVSDGMod {
         condition: ValueId,
         inputs: ValuesSpan,
         regions: RegionsSpan,
-    ) -> Result<Option<BasicValueEnum<'ctx>>, BuilderError> {
+    ) -> color_eyre::Result<Option<BasicValueEnum<'ctx>>> {
         let cond = self.expect_value(llvm_builder, mapper, rvsdg_func, condition)?;
         let region_ids = self.region_pool.get(regions).to_vec();
         let input_ids = self.value_pool.get(inputs).to_vec();
-        let func = mapper
-            .get_fn(rvsdg_func.id)
-            .expect("function should have been lowered before regions are created");
+        let func = mapper.get_fn(rvsdg_func.id).ok_or_else(|| {
+            eyre!(
+                "function `{}` was not registered before lowering its gamma",
+                rvsdg_func.name
+            )
+        })?;
 
         // Create all basic blocks upfront
         let merge_bb = llvm_builder.context.append_basic_block(func, "gamma.merge");
@@ -45,7 +48,7 @@ impl RVSDGMod {
         // `i1` condition is a two-way predicate (true -> region 0, false ->
         // region 1), while any wider integer is an arm INDEX (value k
         // selects region k, with region 0 as the switch default). Arm count
-        // alone can't disambiguate — a 2-arm gamma can come from a switch
+        // alone can't disambiguate -- a 2-arm gamma can come from a switch
         // with one case plus default, whose selector is an i32 index, not a
         // bool.
         let cond_int = cond.into_int_value();
@@ -106,7 +109,10 @@ impl RVSDGMod {
 
             // lowering the region could insert a new basic block, so get the current basic block
             // here
-            let actual_bb = llvm_builder.builder.get_insert_block().unwrap();
+            let actual_bb = llvm_builder
+                .builder
+                .get_insert_block()
+                .ok_or_else(|| eyre!("gamma arm ended with no current basic block"))?;
             llvm_builder.builder.build_unconditional_branch(merge_bb)?;
             region_results.push((results, actual_bb));
         }
@@ -114,6 +120,18 @@ impl RVSDGMod {
         // Build phi nodes in the merge block and write results to Project slots
         llvm_builder.builder.position_at_end(merge_bb);
         let num_results = region_results.first().map(|(r, _)| r.len()).unwrap_or(0);
+
+        // Every gamma region must produce the same number of value-results; the
+        // phi-per-result wiring below indexes each region by `result_idx` and
+        // would otherwise read out of bounds (or silently mis-wire) if a region
+        // lowered a different count.
+        if let Some((mismatched, _)) = region_results.iter().find(|(r, _)| r.len() != num_results) {
+            bail!(
+                "gamma regions produced mismatched result arities: expected {num_results}, \
+                 found a region with {}",
+                mismatched.len()
+            );
+        }
 
         // Project slots are always directly after the gamma value, so we can write to them by
         // adding 1 to the gamma id and the index
@@ -137,13 +155,122 @@ impl RVSDGMod {
 #[cfg(test)]
 mod tests {
     use crate::rvsdg::{
-        ArithFlags, BinaryOp, ICmpPred, Linkage, RVSDGMod,
+        ArithFlags, BinaryOp, ICmpPred, Linkage, MatchArm, RVSDGMod,
         builder::BranchResult,
         func::FnResult,
         lower_to_llvm::test_utils::test_utils::jit_run_i32,
         types::{BOOL, I32},
         value::ConstValue,
     };
+
+    #[test]
+    fn gamma_via_match_predicate_selects_arm() {
+        // A control predicate produced by `match` drives the gamma. Input 1 is
+        // matched to alternative 1, selecting the second arm: 20.
+        let mut rvsdg = RVSDGMod::new_host(String::from("test"));
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
+        rvsdg.define_fn(func_id, |rb, state| {
+            let input = rb.const_i32(1);
+            let pred = rb.match_op(
+                input,
+                &[
+                    MatchArm {
+                        value: 0,
+                        alternative: 0,
+                    },
+                    MatchArm {
+                        value: 1,
+                        alternative: 1,
+                    },
+                    MatchArm {
+                        value: 2,
+                        alternative: 2,
+                    },
+                ],
+                0,
+                3,
+            );
+            let res = rb.gamma_n(
+                pred,
+                state,
+                &[],
+                &[
+                    &|rb| {
+                        Ok(BranchResult {
+                            state,
+                            values: vec![rb.const_i32(10)],
+                        })
+                    },
+                    &|rb| {
+                        Ok(BranchResult {
+                            state,
+                            values: vec![rb.const_i32(20)],
+                        })
+                    },
+                    &|rb| {
+                        Ok(BranchResult {
+                            state,
+                            values: vec![rb.const_i32(30)],
+                        })
+                    },
+                ],
+            )?;
+            Ok(FnResult {
+                state: res.state,
+                values: vec![res.result(0)],
+            })
+        });
+
+        assert_eq!(jit_run_i32(&rvsdg, "test"), 20);
+    }
+
+    #[test]
+    fn gamma_via_match_two_way_from_bool() {
+        // A 2-alternative control predicate from an i1: `match` maps true(1) to
+        // alternative 0 and everything else to the default 1. The condition
+        // `5 > 3` is true, so alternative 0 (the first arm) is selected: 42.
+        // This exercises the control predicate's switch-path lowering (value k
+        // -> region k), the opposite convention from the raw-i1 gamma path.
+        let mut rvsdg = RVSDGMod::new_host(String::from("test"));
+        let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
+        rvsdg.define_fn(func_id, |rb, state| {
+            let x = rb.const_i32(5);
+            let y = rb.const_i32(3);
+            let cond = rb.icmp(ICmpPred::SignedGt, x, y);
+            let pred = rb.match_op(
+                cond,
+                &[MatchArm {
+                    value: 1,
+                    alternative: 0,
+                }],
+                1,
+                2,
+            );
+            let res = rb.gamma(
+                pred,
+                state,
+                &[],
+                |rb| {
+                    Ok(BranchResult {
+                        state,
+                        values: vec![rb.const_i32(42)],
+                    })
+                },
+                |rb| {
+                    Ok(BranchResult {
+                        state,
+                        values: vec![rb.const_i32(99)],
+                    })
+                },
+            )?;
+            Ok(FnResult {
+                state: res.state,
+                values: vec![res.result(0)],
+            })
+        });
+
+        assert_eq!(jit_run_i32(&rvsdg, "test"), 42);
+    }
 
     #[test]
     fn gamma_true_branch() {

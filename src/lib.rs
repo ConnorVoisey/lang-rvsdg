@@ -7,10 +7,13 @@ use inkwell::context::Context;
 use inkwell::targets::{InitializationConfig, Target};
 use llvm_ir::Module;
 use std::fs::read_to_string;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 use tempfile::NamedTempFile;
+use tracing_chrome::{ChromeLayerBuilder, FlushGuard};
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 use crate::rvsdg::RVSDGMod;
 
@@ -23,22 +26,59 @@ use crate::rvsdg::RVSDGMod;
 /// makes the registry mutation happen a single time regardless of how many
 /// threads race into it - this is the only synchronisation parallel LLVM
 /// compilation actually needs.
-pub(crate) fn init_llvm_native() {
-    static INIT: OnceLock<()> = OnceLock::new();
-    INIT.get_or_init(|| {
-        Target::initialize_native(&InitializationConfig::default())
-            .expect("Failed to initialize native target");
-    });
+pub(crate) fn init_llvm_native() -> color_eyre::Result<()> {
+    // The result of the one-time native-target initialisation is cached so the
+    // (process-global, non-reentrant) registry mutation happens exactly once;
+    // a failure is reported to every caller rather than panicking the process.
+    static INIT: OnceLock<Result<(), String>> = OnceLock::new();
+    INIT.get_or_init(|| Target::initialize_native(&InitializationConfig::default()))
+        .as_ref()
+        .map(|_| ())
+        .map_err(|e| color_eyre::eyre::eyre!("failed to initialize native LLVM target: {e}"))
 }
 
 pub mod llvm_parser;
 pub mod rvsdg;
 
+/// Install a Chrome-trace `tracing` subscriber writing to `path`, returning a
+/// flush guard the caller must hold until the traced work finishes -- dropping
+/// it finalises the trace file. The `#[tracing::instrument]` spans throughout
+/// construction and lowering are recorded; when this is never called those
+/// spans are disabled and effectively free.
+///
+/// View the output at <https://ui.perfetto.dev> or `chrome://tracing`.
+#[must_use]
+pub fn init_chrome_tracing(path: &str) -> color_eyre::Result<FlushGuard> {
+    let (chrome_layer, guard) = ChromeLayerBuilder::new()
+        .file(path)
+        .include_args(true)
+        .build();
+    tracing_subscriber::registry()
+        .with(chrome_layer)
+        .try_init()?;
+    Ok(guard)
+}
+
+#[tracing::instrument(skip_all)]
 fn c_file_to_mod(
     c_file_path: &Path,
     include_dirs: &[String],
+    defines: &[String],
     quiet: bool,
 ) -> color_eyre::Result<Module> {
+    // A `.ll` input is already LLVM IR: skip the clang + opt frontend entirely
+    // and parse it straight through. This is the entry point for a reduced
+    // repro -- `llvm-reduce` minimises the `.ll` our pipeline emits, and the
+    // minimised file is fed back here directly. A `.c` input runs the normal
+    // clang + opt frontend below.
+    if c_file_path.extension().and_then(|e| e.to_str()) == Some("ll") {
+        let _parse_span = tracing::info_span!("llvm_ir_parse").entered();
+        return match Module::from_ir_path(c_file_path) {
+            Ok(v) => Ok(v),
+            Err(e) => Err(color_eyre::eyre::eyre!("failed to parse LLVM IR: {e}")),
+        };
+    }
+
     let ll_file = NamedTempFile::with_suffix(".ll")?;
     let ll_output = ll_file.path();
     // let ll_output: PathBuf = "c_mod_llvm.ll".into();
@@ -60,80 +100,53 @@ fn c_file_to_mod(
     for dir in include_dirs {
         clang.arg("-I").arg(dir);
     }
+    // Preprocessor defines (e.g. PolyBench's `POLYBENCH_TIME`,
+    // `LARGE_DATASET`). Each is passed as `-D<def>`; the value may include an
+    // `=` (`NAME=value`).
+    for def in defines {
+        clang.arg(format!("-D{def}"));
+    }
     clang.arg(c_file_path).args(["-o", "-"]);
     let clang_cmd = clang.stdout(Stdio::piped()).spawn()?;
 
-    // The LLVM opt pass list below contains ONLY structural normalisations
-    // that adapt the C source language into a shape this compiler currently
-    // ingests. We must not list optimisation passes here (no instcombine,
-    // gvn, simplifycfg, etc.): when we later benchmark our own
-    // optimisations against LLVM's, the comparison is only meaningful if
-    // LLVM has not already done its optimisation work on the input. Every
-    // entry below is either a conversion from a C-specific construct into
-    // SSA, or a structural normalisation that stands in for a control flow
-    // restructuring step we have not yet implemented in our own code.
-    //
-    // The pass list is being shrunk to `sroa,mem2reg` once construction
-    // implements Bahmann, Reissmann, Jahre, Meyer (2015) "Perfect
-    // Reconstructability of Control Flow from Demand Dependence Graphs"
-    // sections 4.1 and 4.2 directly. See construction_plan.md for the
-    // phased plan. Per-pass meaning today:
-    //
-    //   sroa            : split allocated aggregates into scalars so that
-    //                     mem2reg can promote them. C-source conversion;
-    //                     stays even after the final pipeline is reached.
-    //   mem2reg         : promote alloca plus load and store sequences into
-    //                     phi nodes and SSA values. C-source conversion;
-    //                     stays after the final pipeline is reached.
-    //   loop-simplify   : force every loop into a canonical shape with a
-    //                     single preheader, a single back-edge source
-    //                     (single latch), and dedicated exit blocks. Stands
-    //                     in for our currently absent paper section 4.1
-    //                     handling of multi-preheader and multi-latch loops
-    //                     via the auxiliary q and r predicates. Dropped in
-    //                     Phase 6 once those predicates are implemented.
-    //   loop-rotate     : transform every test-first while loop into a
-    //                     do-while loop with an outer guard. Stands in for
-    //                     our currently absent gating gamma inside theta
-    //                     body that the paper section 4.1 produces for
-    //                     test-first single-entry loops. Dropped in Phase 1.
-    //   lcssa           : insert trivial phi nodes at every loop exit for
-    //                     every value defined inside the loop and used
-    //                     outside it. Stands in for our currently absent
-    //                     demand analysis that the paper's symbolic
-    //                     translation performs implicitly. Dropped in
-    //                     Phase 5.
-    //
-    // Two passes are NOT in the list but are widely available and would
-    // also be structural normalisations rather than optimisations if added:
-    // `unify-loop-exits` (collapses multi-exit loops into single-exit)
-    // and `fix-irreducible` (rewrites irreducible cycles into reducible
-    // ones via dispatch on an entry predicate). They are deliberately
-    // omitted because the paper section 4.1 handling of multi-exit loops
-    // via r and irreducible loops via q is what we are implementing
-    // directly, in Phases 2 and 3 respectively.
-    Command::new("opt-19")
-        .args([
-            "-passes=sroa,mem2reg,loop-simplify,lcssa",
-            "-S",
-            "-o",
-            ll_output.to_str().unwrap(),
-        ])
-        .stdin(clang_cmd.stdout.unwrap())
-        .stdout(Stdio::piped())
-        .status()?;
+    // Only `mem2reg` runs here: it promotes the allocas clang emits for locals
+    // into SSA values and phi nodes, which the construction needs to read the
+    // gamma/theta signatures off the phi nodes. Everything else -- restructuring
+    // (loop-simplify, loop-rotate, lcssa) and optimisation (sroa, instcombine,
+    // gvn, simplifycfg, ...) -- is deliberately omitted: the RVSDG construction
+    // restructures raw control flow itself (Bahmann, Reissmann, Jahre, Meyer
+    // 2015 sections 4.1/4.2: multi-entry/multi-latch/multi-exit loops and the
+    // branch p-demux), and the mid-level optimisation is the RVSDG's job, so
+    // letting LLVM do it would both pre-empt that work and bias any later
+    // benchmark of our optimisations against LLVM's.
+    let ll_output_str = ll_output
+        .to_str()
+        .ok_or_else(|| color_eyre::eyre::eyre!("temporary .ll path is not valid UTF-8"))?;
+    let clang_stdout = clang_cmd.stdout.ok_or_else(|| {
+        color_eyre::eyre::eyre!("clang-19 produced no stdout to pipe into opt-19")
+    })?;
+    {
+        let _span = tracing::info_span!("frontend_clang_opt").entered();
+        let status = Command::new("opt-19")
+            .args(["-passes=mem2reg", "-S", "-o", ll_output_str])
+            .stdin(clang_stdout)
+            .stdout(Stdio::piped())
+            .status()?;
+        if !status.success() {
+            color_eyre::eyre::bail!("opt-19 failed with status {status}");
+        }
+    }
 
-    let llvm_ir_full_text = read_to_string(&ll_output).unwrap();
     // Diagnostics go to stderr so a compiled program's own stdout (e.g. a
     // csmith checksum) is never mixed with compiler logging.
     if !quiet {
-        eprintln!("Parsed LLVM IR (text): {}", llvm_ir_full_text);
+        let llvm_ir_full_text = read_to_string(&ll_output)?;
+        eprintln!("Parsed LLVM IR (text): {llvm_ir_full_text}");
     }
 
-    let module = match Module::from_ir_path(&ll_output) {
-        Ok(v) => v,
-        Err(e) => panic!("{}", e),
-    };
+    let _parse_span = tracing::info_span!("llvm_ir_parse").entered();
+    let module = Module::from_ir_path(&ll_output)
+        .map_err(|e| color_eyre::eyre::eyre!("failed to parse LLVM IR: {e}"))?;
 
     Ok(module)
 }
@@ -164,6 +177,24 @@ pub struct Cli {
     #[arg(short = 'I', long = "include", value_name = "DIR")]
     pub(crate) include: Vec<String>,
 
+    /// Preprocessor define passed to the clang frontend (repeatable), e.g.
+    /// `-D POLYBENCH_TIME -D LARGE_DATASET`. Accepts `NAME` or `NAME=value`.
+    #[arg(short = 'D', long = "define", value_name = "NAME[=VALUE]")]
+    pub(crate) define: Vec<String>,
+
+    /// Write a Chrome trace of the compile to this file (view at
+    /// <https://ui.perfetto.dev> or `chrome://tracing`). Off when not given.
+    #[arg(long, value_name = "FILE")]
+    pub(crate) trace: Option<String>,
+
+    /// Extra source/object files to compile and link alongside the compiled
+    /// input (repeatable), e.g. `--link utilities/polybench.c` so PolyBench's
+    /// harness (`polybench_alloc_data`, timing) resolves. Passed to the final
+    /// `cc` link step together with the `-I` include paths. Only the primary
+    /// `input` goes through the RVSDG pipeline; these are compiled normally.
+    #[arg(long = "link", value_name = "FILE")]
+    pub(crate) link: Vec<String>,
+
     pub(crate) input: String,
 }
 
@@ -175,33 +206,43 @@ impl Cli {
             optimise: false,
             quiet: true,
             include: Vec::new(),
+            define: Vec::new(),
+            trace: None,
+            link: Vec::new(),
             input,
         }
     }
 }
 
 pub fn run_cli(cli: &Cli) -> color_eyre::Result<Option<u8>> {
+    // Held until `run_cli` returns so the trace covers the whole compile; the
+    // guard flushes the trace file on drop.
+    let _trace_guard = match &cli.trace {
+        Some(path) => Some(init_chrome_tracing(path)?),
+        None => None,
+    };
+
     let c_file_path = Path::new(&cli.input);
-    let module = c_file_to_mod(c_file_path, &cli.include, cli.quiet)?;
+    let module = c_file_to_mod(c_file_path, &cli.include, &cli.define, cli.quiet)?;
 
     let rvsdg = RVSDGMod::from_llvm_mod(module)?;
     if cli.optimise {
-        todo!("run optimisations")
+        color_eyre::eyre::bail!("--optimise is not implemented yet");
     }
 
     if cli.run {
         // Serialised once globally; all per-Context JIT work below runs in parallel.
-        init_llvm_native();
+        init_llvm_native()?;
         let context = Context::create();
         let module = rvsdg.lower_to_llvm_module(&context)?;
         let engine = module
             .create_jit_execution_engine(OptimizationLevel::None)
-            .expect("failed to create JIT engine");
+            .map_err(|e| color_eyre::eyre::eyre!("failed to create JIT engine: {e}"))?;
 
         let func = unsafe {
             engine
                 .get_function::<unsafe extern "C" fn() -> u8>("main")
-                .expect("failed to find main function")
+                .map_err(|e| color_eyre::eyre::eyre!("failed to find `main` to run: {e}"))?
         };
         let res = unsafe { func.call() };
         Ok(Some(res))
@@ -210,7 +251,7 @@ pub fn run_cli(cli: &Cli) -> color_eyre::Result<Option<u8>> {
             Some(v) => &v.to_string(),
             None => &rvsdg.mod_name,
         };
-        rvsdg.output_with_llvm(output).unwrap();
+        rvsdg.output_with_llvm(output, &cli.link, &cli.include)?;
         Ok(None)
     }
 }

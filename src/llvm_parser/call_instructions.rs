@@ -7,7 +7,7 @@ use either::Either;
 use llvm_ir::{Constant, Name, Operand};
 
 /// If the operand is a direct global function reference, return its name.
-/// Anything else (local SSA value, non-function global, expression, …) is an indirect call.
+/// Anything else (local SSA value, non-function global, expression, ...) is an indirect call.
 fn callee_as_global_name(operand: &Operand) -> Option<&Name> {
     match operand {
         Operand::ConstantOperand(cref) => match &**cref {

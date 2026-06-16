@@ -1,5 +1,7 @@
+use color_eyre::eyre::eyre;
+
 use crate::rvsdg::{
-    FuncId, RegionId, State, Value, ValueId, ValueKind,
+    FuncId, MatchArm, RegionId, State, Value, ValueId, ValueKind,
     func::CallResult,
     types::{ScalarType, TypeRef},
 };
@@ -10,7 +12,7 @@ use super::{
 
 impl<'a> RegionBuilder<'a> {
     /// N-way conditional branch. Condition value selects which region executes:
-    /// 0 → first branch, 1 → second, etc. All branches must return the same
+    /// 0 -> first branch, 1 -> second, etc. All branches must return the same
     /// number and types of values.
     // (20-50+ in real programs). Profile real-world code to determine if an
     // incremental builder API (gamma_begin/add_input/build) would be worthwhile.
@@ -49,7 +51,8 @@ impl<'a> RegionBuilder<'a> {
             branch_regions.push(rb.region_id);
         }
 
-        let result_count = result_count.unwrap();
+        let result_count =
+            result_count.ok_or_else(|| eyre!("gamma_n requires at least one branch"))?;
         let regions = self.graph.region_pool.push_slice(&branch_regions);
 
         let gamma_val = self.add_value(Value {
@@ -86,8 +89,8 @@ impl<'a> RegionBuilder<'a> {
         })
     }
 
-    /// Two-way if/else convenience. Condition is a bool: true → first branch,
-    /// false → second branch. See `gamma_n` for the inputs allocation note.
+    /// Two-way if/else convenience. Condition is a bool: true -> first branch,
+    /// false -> second branch. See `gamma_n` for the inputs allocation note.
     #[inline]
     pub fn gamma(
         &mut self,
@@ -98,6 +101,60 @@ impl<'a> RegionBuilder<'a> {
         false_branch: impl Fn(&mut RegionBuilder) -> color_eyre::Result<BranchResult>,
     ) -> color_eyre::Result<GammaResult> {
         self.gamma_n(condition, state, inputs, &[&true_branch, &false_branch])
+    }
+
+    /// Build a `match` node: convert integer `input` into a control/predicate
+    /// value with `alternatives` alternatives (see [`ValueKind::Match`]). Each
+    /// `(value, alternative)` arm maps an input value to a control alternative;
+    /// any input value not listed maps to `default`. The result is a
+    /// control-typed value (`TypeRef::Control(alternatives)`) suitable as a gamma
+    /// decision predicate or a theta repetition predicate -- the typed predicate the
+    /// paper's gamma/theta consume rather than a raw integer (section 2.2 lines 270-276).
+    #[inline]
+    pub fn match_op(
+        &mut self,
+        input: ValueId,
+        arms: &[MatchArm],
+        default: u32,
+        alternatives: u32,
+    ) -> ValueId {
+        let arms_span = self.graph.match_arm_pool.push_slice(arms);
+        self.add_value(Value {
+            ty: TypeRef::Control(alternatives),
+            kind: ValueKind::Match {
+                input,
+                arms: arms_span,
+                default,
+                alternatives,
+            },
+        })
+    }
+
+    /// Control predicate for an LLVM `i1` condition: `true` (1) selects arm 0,
+    /// anything else (the default) selects arm 1 -- matching `CondBr`'s
+    /// `[true_dest, false_dest]` arm order.
+    pub fn bool_predicate(&mut self, condition: ValueId) -> ValueId {
+        self.match_op(
+            condition,
+            &[MatchArm {
+                value: 1,
+                alternative: 0,
+            }],
+            1,
+            2,
+        )
+    }
+
+    /// Control predicate over an already-0-based index `q` for an `n`-way demux:
+    /// value `k` selects arm `k` (the identity mapping), default arm 0.
+    pub fn identity_match(&mut self, q: ValueId, n: u32) -> ValueId {
+        let arms: Vec<MatchArm> = (0..n)
+            .map(|k| MatchArm {
+                value: k as i64,
+                alternative: k,
+            })
+            .collect();
+        self.match_op(q, &arms, 0, n)
     }
 
     #[inline]
@@ -162,7 +219,7 @@ impl<'a> RegionBuilder<'a> {
     ///
     /// `rv_count` is the number of recursion variables (one per mutually recursive function).
     /// The closure receives a `RegionBuilder` whose first `rv_count` params are the recursion
-    /// variables — handles the body can use to refer to the functions being defined.
+    /// variables -- handles the body can use to refer to the functions being defined.
     /// The closure must return `PhiBody` containing the lambda values produced inside.
     #[inline]
     pub fn phi(

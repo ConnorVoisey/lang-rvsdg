@@ -4,7 +4,8 @@ use crate::rvsdg::{
     lower_to_llvm::{LLVMBuilderCtx, ValueMapper},
     types::TypeRef,
 };
-use inkwell::{AtomicOrdering, builder::BuilderError, values::BasicValueEnum};
+use color_eyre::eyre::eyre;
+use inkwell::{AtomicOrdering, values::BasicValueEnum};
 
 impl RVSDGMod {
     #[inline]
@@ -18,26 +19,28 @@ impl RVSDGMod {
         align: Option<u32>,
         volatile: bool,
         value_id: ValueId,
-    ) -> Result<(), BuilderError> {
+    ) -> color_eyre::Result<()> {
         let ptr = self.expect_value(llvm_builder, mapper, rvsdg_func, addr)?;
-        let pointee_type = self.type_to_basic_type_llvm(llvm_builder.context, loaded_type);
+        let pointee_type = self.type_to_basic_type_llvm(llvm_builder.context, loaded_type)?;
         let load =
             llvm_builder
                 .builder
                 .build_load(pointee_type, ptr.into_pointer_value(), "load")?;
-        // this is a gross way of getting the load value as an instruction but I don't know
-        // of a better way.
+        // Recover the load as an instruction so its alignment/volatility can be
+        // set; `build_load` only hands back the value, so take the instruction
+        // just emitted into the current block.
         let inst = llvm_builder
             .builder
             .get_insert_block()
-            .unwrap()
-            .get_last_instruction()
-            .unwrap();
+            .and_then(|bb| bb.get_last_instruction())
+            .ok_or_else(|| eyre!("no load instruction found to set alignment/volatility on"))?;
         if let Some(a) = align {
-            inst.set_alignment(a).unwrap();
+            inst.set_alignment(a)
+                .map_err(|e| eyre!("invalid load alignment {a}: {e}"))?;
         }
         if volatile {
-            inst.set_volatile(true).unwrap();
+            inst.set_volatile(true)
+                .map_err(|e| eyre!("could not mark load volatile: {e}"))?;
         }
         // Load is a multi-output node (state + value). Write value to Project slot.
         let project_id = ValueId(value_id.0 + 1);
@@ -56,7 +59,7 @@ impl RVSDGMod {
         value: ValueId,
         align: Option<u32>,
         volatile: bool,
-    ) -> Result<(), BuilderError> {
+    ) -> color_eyre::Result<()> {
         let ptr = self.expect_value(llvm_builder, mapper, rvsdg_func, addr)?;
         let llvm_val = self.expect_value(llvm_builder, mapper, rvsdg_func, value)?;
         let store = llvm_builder
@@ -64,10 +67,14 @@ impl RVSDGMod {
             .build_store(ptr.into_pointer_value(), llvm_val)?;
 
         if let Some(a) = align {
-            store.set_alignment(a).unwrap();
+            store
+                .set_alignment(a)
+                .map_err(|e| eyre!("invalid store alignment {a}: {e}"))?;
         }
         if volatile {
-            store.set_volatile(true).unwrap();
+            store
+                .set_volatile(true)
+                .map_err(|e| eyre!("could not mark store volatile: {e}"))?;
         }
 
         Ok(())
@@ -81,8 +88,8 @@ impl RVSDGMod {
         value_id: ValueId,
         elem_type: TypeRef,
         count: ValueId,
-    ) -> Result<(), BuilderError> {
-        let llvm_type = self.type_to_basic_type_llvm(llvm_builder.context, elem_type);
+    ) -> color_eyre::Result<()> {
+        let llvm_type = self.type_to_basic_type_llvm(llvm_builder.context, elem_type)?;
         let count_val = self.expect_value(llvm_builder, mapper, rvsdg_func, count)?;
         let alloca = llvm_builder.builder.build_array_alloca(
             llvm_type,
@@ -106,7 +113,7 @@ impl RVSDGMod {
         desired: ValueId,
         success_ordering: MemoryOrdering,
         failure_ordering: MemoryOrdering,
-    ) -> Result<(), BuilderError> {
+    ) -> color_eyre::Result<()> {
         let ptr = self.expect_value(llvm_builder, mapper, rvsdg_func, addr)?;
         let cmp = self.expect_value(llvm_builder, mapper, rvsdg_func, expected)?;
         let new = self.expect_value(llvm_builder, mapper, rvsdg_func, desired)?;
