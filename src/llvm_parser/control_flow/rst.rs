@@ -88,12 +88,26 @@ pub(in crate::llvm_parser) enum ThetaKind {
 }
 
 /// The post-theta exit demux of a multi-exit loop: a gamma on the exit `q`
-/// selects which exit vertex was taken; `tails[i]` lowers `exit_blocks[i]` to the
-/// reconvergence `join`, where the enclosing region resumes.
+/// selects which exit vertex was taken; `tails[i]` lowers `exit_blocks[i]`. How
+/// the tails leave the dispatch is fixed by `merge`.
 #[derive(Debug)]
 pub(in crate::llvm_parser) struct ExitDemux {
-    pub join: BasicBlockId,
+    /// One tail per exit vertex, keyed by exit `q` (index = exit-block index).
     pub tails: Vec<SeqRegion>,
+    pub merge: ExitMerge,
+}
+
+/// How a multi-exit loop's exit tails collectively leave the post-theta dispatch.
+#[derive(Debug)]
+pub(in crate::llvm_parser) enum ExitMerge {
+    /// Every tail reconverges at a single continuation `join`; `tails[i]` lowers
+    /// `exit_blocks[i]` to it and the enclosing region resumes at `join`. The
+    /// theta is a mid-region item.
+    Reconverge { join: BasicBlockId },
+    /// No shared reconvergence: every tail returns or diverges. The dispatch is a
+    /// return gamma on the exit `q` and the enclosing region returns the merged
+    /// value, so the loop is the region's terminal (see [`SeqExit::LoopReturn`]).
+    Return,
 }
 
 /// How a [`SeqRegion`] leaves: reach a continuation, return, diverge, or merge
@@ -119,6 +133,11 @@ pub(in crate::llvm_parser) enum SeqExit {
         head: BasicBlockId,
         arms: Vec<SeqRegion>,
     },
+    /// The region's terminal is a multi-exit loop whose exit tails do not
+    /// reconverge (every one returns or diverges). The `theta` produces the exit
+    /// `q`; a gamma on it dispatches to each tail and the function returns the
+    /// merged value. `theta.exit_demux` is `Some` with [`ExitMerge::Return`].
+    LoopReturn { theta: ThetaNode },
 }
 
 /// How a [`CaptureRegion`] (continuation-demux head arm) leaves.

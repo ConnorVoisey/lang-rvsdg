@@ -22,7 +22,7 @@ use crate::llvm_parser::{
         analysis::branches::{branch_continuation_points, continuation_points},
         rst::{
             CaptureExit, CaptureRegion, DemuxBranchTarget, DemuxSpec, DemuxTail, EntryExit,
-            EntryRegion, ExitDemux, GammaMerge, GammaNode, LoopBodyExit, LoopBodyRegion,
+            EntryRegion, ExitDemux, ExitMerge, GammaMerge, GammaNode, LoopBodyExit, LoopBodyRegion,
             LoopCaptureExit, LoopCaptureRegion, RegionItem, SeqExit, SeqRegion, ThetaKind,
             ThetaNode,
         },
@@ -61,6 +61,25 @@ enum RawTail {
         arm_targets: SmallVec<[BasicBlockId; 4]>,
         continuations: SmallVec<[BasicBlockId; 4]>,
     },
+    /// A multi-exit loop whose exit tails do not reconverge (every one returns or
+    /// diverges): the loop is the region's terminal and the post-theta dispatch
+    /// returns the merged value.
+    LoopReturn { theta: ThetaNode },
+}
+
+/// What [`structure_exit_demux`] decides a loop's exit vertices do after the
+/// theta. The two reconverging shapes keep the theta a mid-region item; the
+/// terminal shape makes the loop the enclosing region's terminal.
+enum ExitOutcome {
+    /// A single exit vertex: no demux, the enclosing region resumes here.
+    Resume { target: BasicBlockId },
+    /// Multiple exits reconverging at `join`: the enclosing region resumes there.
+    Reconverge {
+        demux: ExitDemux,
+        join: BasicBlockId,
+    },
+    /// Multiple exits, every tail returning or diverging: a terminal return demux.
+    Return { demux: ExitDemux },
 }
 
 /// Restructure `func` (described by `fn_ctx`) into its Structured Region Tree.
@@ -119,6 +138,7 @@ fn structure_seq(
             }
             SeqExit::ReturnGamma { head, arms }
         }
+        RawTail::LoopReturn { theta } => SeqExit::LoopReturn { theta },
         RawTail::Route { head, .. } => {
             return Err(eyre!(
                 "router region (every continuation a boundary) at block {} in a sequential context",
@@ -172,6 +192,13 @@ fn structure_capture(
                 head.0
             ));
         }
+        RawTail::LoopReturn { theta } => {
+            return Err(eyre!(
+                "non-reconverging multi-exit loop (exits {:?}) inside a continuation-demux arm is \
+                 not handled",
+                theta.exit_blocks
+            ));
+        }
     };
     Ok(CaptureRegion { items, exit })
 }
@@ -215,6 +242,13 @@ fn structure_entry(
             return Err(eyre!(
                 "mixed demux at block {} inside an irreducible-loop entry region is not handled",
                 head.0
+            ));
+        }
+        RawTail::LoopReturn { theta } => {
+            return Err(eyre!(
+                "non-reconverging multi-exit loop (exits {:?}) inside an irreducible-loop entry \
+                 region is not handled",
+                theta.exit_blocks
             ));
         }
     };
@@ -308,6 +342,12 @@ fn structure_loop_body(
         RawTail::Diverge => {
             return Err(eyre!("divergence inside a loop body is not handled"));
         }
+        RawTail::LoopReturn { theta } => {
+            return Err(eyre!(
+                "non-reconverging multi-exit loop (exits {:?}) inside a loop body is not handled",
+                theta.exit_blocks
+            ));
+        }
     };
     Ok(LoopBodyRegion { items, exit })
 }
@@ -354,6 +394,13 @@ fn structure_loop_capture(
             return Err(eyre!(
                 "nested mixed demux at block {} inside a loop-demux arm is not supported",
                 head.0
+            ));
+        }
+        RawTail::LoopReturn { theta } => {
+            return Err(eyre!(
+                "non-reconverging multi-exit loop (exits {:?}) inside a loop-demux arm is not \
+                 handled",
+                theta.exit_blocks
             ));
         }
     };
@@ -449,7 +496,17 @@ fn walk_items(
                 }
 
                 let (exit_demux, exit_target) =
-                    structure_exit_demux(fn_ctx, &exit_targets, boundary, None)?;
+                    match structure_exit_demux(fn_ctx, &exit_targets, boundary, None)? {
+                        ExitOutcome::Resume { target } => (None, target),
+                        ExitOutcome::Reconverge { demux, join } => (Some(demux), join),
+                        ExitOutcome::Return { .. } => {
+                            return Err(eyre!(
+                                "multi-entry loop at block {} with non-reconverging exits is not \
+                                 yet handled",
+                                current.0
+                            ));
+                        }
+                    };
 
                 items.push(RegionItem::Theta(ThetaNode {
                     scc: scc_id,
@@ -502,18 +559,41 @@ fn walk_items(
                         .find(|&&(_, dest)| dest == exit_block)
                         .map(|&(source, _)| source)
                 };
-                let (exit_demux, exit_target) =
-                    structure_exit_demux(fn_ctx, &exit_blocks, boundary, Some(&arc_source))?;
-
-                items.push(RegionItem::Theta(ThetaNode {
-                    scc: scc_id,
-                    exit_blocks,
-                    exit_demux,
-                    kind: ThetaKind::Reducible { header, body },
-                }));
-                prev = None;
-                current = exit_target;
-                continue;
+                match structure_exit_demux(fn_ctx, &exit_blocks, boundary, Some(&arc_source))? {
+                    ExitOutcome::Resume { target } => {
+                        items.push(RegionItem::Theta(ThetaNode {
+                            scc: scc_id,
+                            exit_blocks,
+                            exit_demux: None,
+                            kind: ThetaKind::Reducible { header, body },
+                        }));
+                        prev = None;
+                        current = target;
+                        continue;
+                    }
+                    ExitOutcome::Reconverge { demux, join } => {
+                        items.push(RegionItem::Theta(ThetaNode {
+                            scc: scc_id,
+                            exit_blocks,
+                            exit_demux: Some(demux),
+                            kind: ThetaKind::Reducible { header, body },
+                        }));
+                        prev = None;
+                        current = join;
+                        continue;
+                    }
+                    ExitOutcome::Return { demux } => {
+                        // Every exit tail returns/diverges: the loop terminates
+                        // the enclosing region (no block to resume at).
+                        let theta = ThetaNode {
+                            scc: scc_id,
+                            exit_blocks,
+                            exit_demux: Some(demux),
+                            kind: ThetaKind::Reducible { header, body },
+                        };
+                        return Ok((items, RawTail::LoopReturn { theta }));
+                    }
+                }
             }
         }
 
@@ -697,46 +777,85 @@ fn walk_items(
     }
 }
 
-/// Build the post-theta exit handling shared by both loop kinds: a single exit
-/// vertex means control resumes there directly (`None` demux); multiple exit
-/// vertices reconverge at one `join` via an exit-`q` demux whose `tails[i]` lower
-/// `exit_blocks[i]` to `join`. `arc_source`, when given, maps an exit vertex to
-/// the exit-arc source the tail is entered from (so the tail resolves the join
-/// phis along that edge). Returns the demux (if any) and the block to resume at.
+/// Decide the post-theta exit handling shared by both loop kinds. A single exit
+/// vertex resumes directly ([`ExitOutcome::Resume`]). Multiple exit vertices that
+/// reconverge at one `join` form an exit-`q` demux whose `tails[i]` lower
+/// `exit_blocks[i]` to `join` ([`ExitOutcome::Reconverge`]). Multiple exit
+/// vertices whose tails all return/diverge form a terminal return demux
+/// ([`ExitOutcome::Return`]) -- the loop ends the enclosing region. `arc_source`,
+/// when given, maps an exit vertex to the exit-arc source the tail is entered
+/// from (so the tail resolves a join's phis along that edge).
 fn structure_exit_demux(
     fn_ctx: &FnCtx,
     exit_blocks: &[BasicBlockId],
     boundary: &[BasicBlockId],
     arc_source: Option<&dyn Fn(BasicBlockId) -> Option<BasicBlockId>>,
-) -> color_eyre::Result<(Option<ExitDemux>, BasicBlockId)> {
+) -> color_eyre::Result<ExitOutcome> {
     if exit_blocks.len() == 1 {
-        return Ok((None, exit_blocks[0]));
+        return Ok(ExitOutcome::Resume {
+            target: exit_blocks[0],
+        });
     }
+    let entry_prev = |exit_block| arc_source.and_then(|lookup| lookup(exit_block));
+
     let continuations = continuation_points(fn_ctx, exit_blocks, boundary);
-    let join = match continuations.as_slice() {
-        [single] => *single,
-        _ => {
-            return Err(eyre!(
-                "multi-exit loop whose {} exit vertices have {} reconvergence points is not \
-                 handled by the restructure transform",
-                exit_blocks.len(),
-                continuations.len()
-            ));
+    if let [join] = continuations.as_slice() {
+        let join = *join;
+        let mut tail_boundary: SmallVec<[BasicBlockId; 8]> = SmallVec::new();
+        tail_boundary.push(join);
+        tail_boundary.extend_from_slice(boundary);
+        let mut tails: Vec<SeqRegion> = Vec::with_capacity(exit_blocks.len());
+        for &exit_block in exit_blocks {
+            tails.push(structure_seq(
+                fn_ctx,
+                exit_block,
+                &tail_boundary,
+                entry_prev(exit_block),
+                None,
+            )?);
         }
-    };
-    let mut tail_boundary: SmallVec<[BasicBlockId; 8]> = SmallVec::new();
-    tail_boundary.push(join);
-    tail_boundary.extend_from_slice(boundary);
+        return Ok(ExitOutcome::Reconverge {
+            demux: ExitDemux {
+                tails,
+                merge: ExitMerge::Reconverge { join },
+            },
+            join,
+        });
+    }
+
+    // No single reconvergence. The tails may still each leave on their own (every
+    // one returning or diverging), in which case the loop is the enclosing
+    // region's terminal: a return gamma on the exit `q`. The tails are structured
+    // against the enclosing boundary, since they share no join.
     let mut tails: Vec<SeqRegion> = Vec::with_capacity(exit_blocks.len());
     for &exit_block in exit_blocks {
-        let entry_prev = arc_source.and_then(|lookup| lookup(exit_block));
         tails.push(structure_seq(
             fn_ctx,
             exit_block,
-            &tail_boundary,
-            entry_prev,
+            boundary,
+            entry_prev(exit_block),
             None,
         )?);
     }
-    Ok((Some(ExitDemux { join, tails }), join))
+    let all_terminal = tails.iter().all(|tail| {
+        matches!(
+            tail.exit,
+            SeqExit::Return { .. } | SeqExit::Diverge | SeqExit::ReturnGamma { .. }
+        )
+    });
+    if all_terminal {
+        Ok(ExitOutcome::Return {
+            demux: ExitDemux {
+                tails,
+                merge: ExitMerge::Return,
+            },
+        })
+    } else {
+        Err(eyre!(
+            "multi-exit loop whose {} exit vertices have {} reconvergence points is not handled \
+             by the restructure transform",
+            exit_blocks.len(),
+            continuations.len()
+        ))
+    }
 }

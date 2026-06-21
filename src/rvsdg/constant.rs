@@ -4,7 +4,7 @@ use crate::rvsdg::{FuncId, GlobalId, types::TypeRef, value::ConstValue};
 
 /// Handle into the constant pool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ConstId(u32);
+pub struct ConstId(pub(crate) u32);
 
 /// Span into the ConstIdPool -- a contiguous slice of ConstIds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -15,7 +15,7 @@ pub struct ConstIdsSpan {
 
 /// Flat storage for aggregate element lists, avoiding per-aggregate Vec allocations.
 #[derive(Debug, Clone, Default)]
-pub struct ConstIdPool(Vec<ConstId>);
+pub struct ConstIdPool(pub(crate) Vec<ConstId>);
 
 impl ConstIdPool {
     pub fn push_slice(&mut self, ids: &[ConstId]) -> ConstIdsSpan {
@@ -74,8 +74,8 @@ pub enum ConstantKind {
 /// Deduplicated storage for all module-level constants.
 #[derive(Debug, Default)]
 pub struct ConstantPool {
-    entries: Vec<ConstantDef>,
-    cache: FxHashMap<ConstantDef, ConstId>,
+    pub(crate) entries: Vec<ConstantDef>,
+    pub(crate) cache: FxHashMap<ConstantDef, ConstId>,
     pub id_pool: ConstIdPool,
 }
 

@@ -229,6 +229,9 @@ pub fn run_cli(cli: &Cli) -> color_eyre::Result<Option<u8>> {
     if cli.optimise {
         color_eyre::eyre::bail!("--optimise is not implemented yet");
     }
+    if !cli.quiet {
+        println!("{rvsdg}");
+    }
 
     if cli.run {
         // Serialised once globally; all per-Context JIT work below runs in parallel.

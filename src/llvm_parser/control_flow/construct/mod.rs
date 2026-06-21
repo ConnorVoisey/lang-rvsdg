@@ -148,6 +148,10 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
                 let (state, values) = self.construct_return_gamma(*head, arms, state, boundary)?;
                 Ok(ConstructExit::Returned { state, values })
             }
+            SeqExit::LoopReturn { theta } => {
+                let (state, values) = self.construct_loop_return(theta, state, boundary)?;
+                Ok(ConstructExit::Returned { state, values })
+            }
         }
     }
 

@@ -1,5 +1,6 @@
 pub mod builder;
 pub mod constant;
+pub mod dump;
 pub mod func;
 pub mod global;
 pub mod lower_to_llvm;

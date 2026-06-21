@@ -13,11 +13,12 @@ use crate::{
             analysis::signature::{
                 collect_walked_blocks, phi_incoming_from, phi_instructions_at, region_live_ins,
             },
-            construct::{TargetCapture, branch_refs, seed_params},
+            construct::{ConstructExit, TargetCapture, branch_refs, seed_params},
             restructure::arm_target_blocks,
             rst::{
-                DemuxBranchTarget, EntryExit, EntryRegion, ExitDemux, LoopBodyExit, LoopBodyRegion,
-                LoopCaptureExit, LoopCaptureRegion, ThetaKind, ThetaNode,
+                DemuxBranchTarget, EntryExit, EntryRegion, ExitDemux, ExitMerge, LoopBodyExit,
+                LoopBodyRegion, LoopCaptureExit, LoopCaptureRegion, SeqRegion, ThetaKind,
+                ThetaNode,
             },
         },
         instructions::{
@@ -26,8 +27,8 @@ use crate::{
     },
     rvsdg::{
         MatchArm, State, ValueId,
-        builder::{BranchResult, LoopResult, RegionBuilder},
-        types::{I32, TypeRef},
+        builder::{BranchResult, LoopResult, RegionBuilder, ThetaResult},
+        types::{I32, TypeRef, VOID},
         value::ConstValue,
     },
 };
@@ -123,6 +124,20 @@ struct LoopDemuxCtx<'a, 'm> {
     loop_ctx: &'a LoopCtx<'m>,
 }
 
+/// The result of building a single-entry loop's theta (without the post-theta
+/// exit dispatch): the theta node and the slot layout the dispatch needs. Shared
+/// by the reconverging path ([`RegionLowerer::construct_reducible_theta`]) and
+/// the terminal path ([`RegionLowerer::construct_loop_return`]).
+struct ReducibleThetaBuild {
+    result: ThetaResult,
+    /// Theta-result slot holding the exit `q` (valid only when the loop has more
+    /// than one exit vertex; otherwise there is no exit dispatch).
+    exit_q_slot: usize,
+    /// Loop-closed exit-phi values bound after the theta, as `(name, value)`, to
+    /// seed exit-dispatch arms that reference them.
+    exit_phi_seeds: Vec<(Name, ValueId)>,
+}
+
 impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
     /// Emit a theta node for `theta`, returning the post-theta state.
     pub(in crate::llvm_parser) fn construct_theta(
@@ -150,8 +165,9 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
         }
     }
 
-    /// Emit a single-entry loop's theta. Exit phis (loop-closed values) are bound
-    /// to the theta outputs in this scope.
+    /// Emit a single-entry loop's theta, then its post-theta exit dispatch (the
+    /// reconvergence demux, if any). Used for a loop that is a mid-region item;
+    /// a loop that terminates its region goes through [`Self::construct_loop_return`].
     fn construct_reducible_theta(
         &mut self,
         theta: &ThetaNode,
@@ -160,6 +176,39 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
         state: State,
         boundary: &[BasicBlockId],
     ) -> color_eyre::Result<State> {
+        let build = self.build_reducible_theta(theta, header, body, state)?;
+        match &theta.exit_demux {
+            None => Ok(build.result.state),
+            Some(exit_demux) => {
+                let exit_q = build.result.result(build.exit_q_slot as u16);
+                let exit_q_ctrl = self
+                    .rb
+                    .identity_match(exit_q, theta.exit_blocks.len() as u32);
+                self.construct_exit_demux(
+                    exit_q_ctrl,
+                    build.result.state,
+                    &theta.exit_blocks,
+                    exit_demux,
+                    &build.exit_phi_seeds,
+                    boundary,
+                )
+            }
+        }
+    }
+
+    /// Build a single-entry loop's theta: lay out the per-iteration leaf (header
+    /// phis, body live-ins, loop-closed values, exit phis, optional exit `q`),
+    /// emit the theta, and bind each loop-closed value to its theta output in this
+    /// scope. Returns the theta result plus the slot layout the post-theta exit
+    /// dispatch reads. Does not emit the dispatch itself (the caller does, since
+    /// it differs between a reconverging and a terminal loop).
+    fn build_reducible_theta(
+        &mut self,
+        theta: &ThetaNode,
+        header: BasicBlockId,
+        body: &LoopBodyRegion,
+        state: State,
+    ) -> color_eyre::Result<ReducibleThetaBuild> {
         let scc_body: FxHashSet<BasicBlockId> = self.fn_ctx.scc_tree.blocks[theta.scc.0 as usize]
             .iter()
             .copied()
@@ -196,8 +245,12 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
 
         // Phis at the demux reconvergence are join phis (resolved by the exit
         // demux), not loop-closed exit phis -- exclude them here so they are not
-        // double-handled when an exit arc targets the join directly.
-        let demux_join = theta.exit_demux.as_ref().map(|d| d.join);
+        // double-handled when an exit arc targets the join directly. Only a
+        // reconverging demux has such a join; a terminal one carries no join.
+        let demux_join = match theta.exit_demux.as_ref().map(|demux| &demux.merge) {
+            Some(ExitMerge::Reconverge { join }) => Some(*join),
+            _ => None,
+        };
         let mut exit_phis: Vec<(BasicBlockId, &Phi, TypeRef)> = Vec::new();
         for &exit_block in &theta.exit_blocks {
             if Some(exit_block) == demux_join {
@@ -334,24 +387,11 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
             exit_phi_seeds.push((phi.dest.clone(), value));
         }
 
-        match &theta.exit_demux {
-            None => Ok(result.state),
-            Some(exit_demux) => {
-                let exit_q_slot = n_header + n_live + n_closed + n_exit_phi;
-                let exit_q = result.result(exit_q_slot as u16);
-                let exit_q_ctrl = self
-                    .rb
-                    .identity_match(exit_q, theta.exit_blocks.len() as u32);
-                self.construct_exit_demux(
-                    exit_q_ctrl,
-                    result.state,
-                    &theta.exit_blocks,
-                    exit_demux,
-                    &exit_phi_seeds,
-                    boundary,
-                )
-            }
-        }
+        Ok(ReducibleThetaBuild {
+            result,
+            exit_q_slot: n_header + n_live + n_closed + n_exit_phi,
+            exit_phi_seeds,
+        })
     }
 
     /// Emit a multi-entry (irreducible) loop's theta. The entry region computes
@@ -661,7 +701,14 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
         exit_phi_seeds: &[(Name, ValueId)],
         boundary: &[BasicBlockId],
     ) -> color_eyre::Result<State> {
-        let join = exit_demux.join;
+        let join = match &exit_demux.merge {
+            ExitMerge::Reconverge { join } => *join,
+            ExitMerge::Return => {
+                return Err(color_eyre::eyre::eyre!(
+                    "construct_exit_demux called on a terminal (return) exit demux"
+                ));
+            }
+        };
         let join_phis = phi_instructions_at(&self.fn_ctx.func.basic_blocks[join.0 as usize]);
 
         let mut arm_boundary: SmallVec<[BasicBlockId; 8]> = SmallVec::new();
@@ -730,6 +777,116 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
                 .insert(phi.dest.clone(), result.result(i as u16));
         }
         Ok(result.state)
+    }
+
+    /// Emit a multi-exit loop whose exit tails do not reconverge: build the theta,
+    /// then dispatch the exit `q` through a return gamma over the tails (every one
+    /// returning or diverging). Returns the post-loop state and the merged return
+    /// values, which become the enclosing region's return.
+    pub(in crate::llvm_parser) fn construct_loop_return(
+        &mut self,
+        theta: &ThetaNode,
+        state: State,
+        boundary: &[BasicBlockId],
+    ) -> color_eyre::Result<(State, Vec<ValueId>)> {
+        let (header, body) = match &theta.kind {
+            ThetaKind::Reducible { header, body } => (*header, body),
+            ThetaKind::MultiEntry { .. } => {
+                return Err(color_eyre::eyre::eyre!(
+                    "terminal exit dispatch for a multi-entry loop is not yet handled"
+                ));
+            }
+        };
+        let exit_demux = theta
+            .exit_demux
+            .as_ref()
+            .ok_or_else(|| color_eyre::eyre::eyre!("loop-return theta has no exit demux"))?;
+
+        let build = self.build_reducible_theta(theta, header, body, state)?;
+        let exit_q = build.result.result(build.exit_q_slot as u16);
+        let exit_q_ctrl = self
+            .rb
+            .identity_match(exit_q, theta.exit_blocks.len() as u32);
+        self.construct_exit_return_gamma(
+            exit_q_ctrl,
+            build.result.state,
+            &theta.exit_blocks,
+            &exit_demux.tails,
+            &build.exit_phi_seeds,
+            boundary,
+        )
+    }
+
+    /// Emit the post-theta return gamma of a non-reconverging multi-exit loop: a
+    /// gamma on the exit `q` whose arm `i` lowers `tails[i]` (each returning or
+    /// diverging) and produces the function return value(s). `exit_phi_seeds` are
+    /// loop-closed values bound after the theta that a tail may reference.
+    fn construct_exit_return_gamma(
+        &mut self,
+        exit_q_ctrl: ValueId,
+        state: State,
+        exit_blocks: &[BasicBlockId],
+        tails: &[SeqRegion],
+        exit_phi_seeds: &[(Name, ValueId)],
+        boundary: &[BasicBlockId],
+    ) -> color_eyre::Result<(State, Vec<ValueId>)> {
+        let ret_ty = self
+            .rb
+            .graph
+            .types
+            .convert_type_ref(&self.fn_ctx.func.return_type, self.fn_ctx.llvm_mod)?;
+        let arity: u16 = if ret_ty == VOID { 0 } else { 1 };
+
+        // Live-ins over the exit tails (bounded by the enclosing boundary), plus
+        // the loop-closed exit-phi values bound after the theta that a tail uses.
+        let (live_in_names, live_ins) = self.live_ins_for_arms(exit_blocks, boundary, &[], None);
+        let mut inputs: Vec<ValueId> = live_ins;
+        let n_live = live_in_names.len();
+        for (_, value) in exit_phi_seeds {
+            inputs.push(*value);
+        }
+        let seed_names: Vec<Name> = exit_phi_seeds
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect();
+
+        let fn_ctx = self.fn_ctx;
+        let live_names_ref: &[Name] = &live_in_names;
+        let seed_names_ref: &[Name] = &seed_names;
+        let boundary_ref: &[BasicBlockId] = boundary;
+
+        let arm_closures: Vec<_> = tails
+            .iter()
+            .map(|tail| {
+                move |rb: &mut RegionBuilder| -> color_eyre::Result<BranchResult> {
+                    let mut ntv = FxHashMap::default();
+                    seed_params(rb, live_names_ref, 0, &mut ntv);
+                    seed_params(rb, seed_names_ref, n_live as u32, &mut ntv);
+                    let mut arm = RegionLowerer::new_child(rb, fn_ctx, ntv);
+                    match arm.construct(tail, state, None, boundary_ref)? {
+                        ConstructExit::Returned { state, values } => {
+                            Ok(BranchResult { state, values })
+                        }
+                        ConstructExit::Diverge { state } => {
+                            let values = if arity == 0 {
+                                Vec::new()
+                            } else {
+                                vec![arm.rb.constant(ret_ty, ConstValue::Poison)]
+                            };
+                            Ok(BranchResult { state, values })
+                        }
+                        ConstructExit::AtBoundary { reached, .. } => Err(color_eyre::eyre::eyre!(
+                            "exit-return tail unexpectedly reached {}",
+                            reached.0
+                        )),
+                    }
+                }
+            })
+            .collect();
+        let refs = branch_refs(&arm_closures);
+        let result = self.rb.gamma_n(exit_q_ctrl, state, &inputs, &refs)?;
+        let values: Vec<ValueId> = (0..arity).map(|i| result.result(i)).collect();
+        Ok((result.state, values))
     }
 
     /// Walk a loop-body region, producing its per-iteration leaf vector. In-body
