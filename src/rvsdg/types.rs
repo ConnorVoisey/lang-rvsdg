@@ -1,17 +1,17 @@
 use rustc_hash::FxHashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct PtrTypeId(u32);
+pub struct PtrTypeId(pub(crate) u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ArrayTypeId(u32);
+pub struct ArrayTypeId(pub(crate) u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct FuncTypeId(u32);
+pub struct FuncTypeId(pub(crate) u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct StructId(u32);
+pub struct StructId(pub(crate) u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct VectorTypeId(u32);
+pub struct VectorTypeId(pub(crate) u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct AliasSetId(u32);
+pub struct AliasSetId(pub(crate) u32);
 
 pub const BOOL: TypeRef = TypeRef::Scalar(ScalarType::Bool);
 pub const I8: TypeRef = TypeRef::Scalar(ScalarType::I8);

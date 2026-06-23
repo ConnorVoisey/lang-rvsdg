@@ -108,3 +108,21 @@ LLVM_SYS_191_PREFIX=$(llvm-config-19 --prefix) cargo t
 - [RVSDG paper](https://arxiv.org/abs/1912.05036) — Reissmann et al., 2020
 - [Cranelift](https://cranelift.dev/) — planned alternative codegen backend
 
+
+## Fuzzing
+
+There is a start of fuzzing using csmith. The difftest binary can be given a seed which will then start fuzzing at that seed. This compiles against clang and compares the binaries outputs.
+Once you've found a mismatch you can convert into llvm ir like this:
+
+```sh
+clang -I /usr/include/csmith-2.3.0 difftest-findings/7015.c -o clang_out
+
+opt-19 -passes=mem2reg -S -o difftest-findings/7015.ll difftest-findings/7015.bc
+```
+
+Then use llvm-reduce to simplify the IR whilst preserving the mismatch
+
+```sh
+llvm-reduce-19 --test interesting_mm.sh difftest-findings/7015.ll -j $(nproc)
+```
+

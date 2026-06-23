@@ -230,7 +230,8 @@ pub fn run_cli(cli: &Cli) -> color_eyre::Result<Option<u8>> {
         color_eyre::eyre::bail!("--optimise is not implemented yet");
     }
     if !cli.quiet {
-        println!("{rvsdg}");
+        eprintln!("RVSDG:");
+        eprintln!("{rvsdg}");
     }
 
     if cli.run {
@@ -238,6 +239,10 @@ pub fn run_cli(cli: &Cli) -> color_eyre::Result<Option<u8>> {
         init_llvm_native()?;
         let context = Context::create();
         let module = rvsdg.lower_to_llvm_module(&context)?;
+        if !cli.quiet {
+            eprintln!("LLVM IR:");
+            eprintln!("{}", module.print_to_string().to_string());
+        }
         let engine = module
             .create_jit_execution_engine(OptimizationLevel::None)
             .map_err(|e| color_eyre::eyre::eyre!("failed to create JIT engine: {e}"))?;
@@ -254,7 +259,7 @@ pub fn run_cli(cli: &Cli) -> color_eyre::Result<Option<u8>> {
             Some(v) => &v.to_string(),
             None => &rvsdg.mod_name,
         };
-        rvsdg.output_with_llvm(output, &cli.link, &cli.include)?;
+        rvsdg.output_with_llvm(output, &cli.link, &cli.include, cli.quiet)?;
         Ok(None)
     }
 }

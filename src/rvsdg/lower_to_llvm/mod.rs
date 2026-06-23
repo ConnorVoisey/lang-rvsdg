@@ -96,6 +96,7 @@ impl RVSDGMod {
         output: &str,
         link_inputs: &[String],
         include_dirs: &[String],
+        quiet: bool,
     ) -> color_eyre::Result<()> {
         // initialise things (guarded so concurrent callers don't race the
         // process-global target registry)
@@ -103,6 +104,10 @@ impl RVSDGMod {
 
         let context = Context::create();
         let module = self.lower_to_llvm_module(&context)?;
+        if !quiet {
+            eprintln!("LLVM IR:");
+            eprintln!("{}", module.print_to_string().to_string());
+        }
 
         // more output things
         let llvm_triple = TargetTriple::create(&self.target.to_string());
