@@ -226,6 +226,16 @@ pub fn run_cli(cli: &Cli) -> color_eyre::Result<Option<u8>> {
     let module = c_file_to_mod(c_file_path, &cli.include, &cli.define, cli.quiet)?;
 
     let rvsdg = RVSDGMod::from_llvm_mod(module)?;
+    #[cfg(debug_assertions)]
+    {
+        let errs = rvsdg.verify();
+        if errs.len() > 1 {
+            eprintln!("RVSDG:");
+            eprintln!("{rvsdg}");
+            dbg!(errs);
+            panic!("Got errors");
+        }
+    }
     if cli.optimise {
         color_eyre::eyre::bail!("--optimise is not implemented yet");
     }

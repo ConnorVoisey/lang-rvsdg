@@ -7,6 +7,7 @@ pub mod lower_to_llvm;
 pub mod ops;
 pub mod types;
 pub mod value;
+pub mod verify;
 
 pub use constant::{ConstId, ConstIdPool, ConstIdsSpan, ConstantDef, ConstantKind, ConstantPool};
 use func::Function;

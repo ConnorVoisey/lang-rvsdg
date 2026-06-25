@@ -387,6 +387,7 @@ dependencies = [
  "smallvec",
  "target-lexicon",
  "tempfile",
+ "thiserror",
  "tracing",
  "tracing-chrome",
  "tracing-subscriber",

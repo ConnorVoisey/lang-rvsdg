@@ -521,6 +521,11 @@ impl Display for BinaryOp {
     }
 }
 
+impl Display for RegionId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "%r{}", self.0)
+    }
+}
 impl Display for ValueId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "%v{}", self.0)
