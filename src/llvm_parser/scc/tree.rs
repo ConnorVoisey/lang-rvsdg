@@ -177,6 +177,26 @@ impl SccTree {
         }
     }
 
+    /// The collapse table of one nesting level: for every block, the
+    /// component among `level` it belongs to (transitively -- an outer
+    /// component's block set includes its children's). Used by the
+    /// restructuring passes and the emitter to present each level's loops
+    /// as single collapsed vertices; sharing one builder keeps the levels
+    /// consistent across all consumers.
+    pub fn collapse_table(
+        &self,
+        level: &[SccTreeNodeId],
+        block_count: usize,
+    ) -> Vec<Option<SccTreeNodeId>> {
+        let mut table = vec![None; block_count];
+        for &scc in level {
+            for &block in &self.blocks[scc.0 as usize] {
+                table[block.0 as usize] = Some(scc);
+            }
+        }
+        table
+    }
+
     /// Number of components in the tree, counting every nesting level.
     pub fn len(&self) -> usize {
         self.blocks.len()

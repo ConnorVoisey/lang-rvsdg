@@ -1,18 +1,14 @@
 use crate::{
     llvm_parser::{
         block_mapper::{BasicBlockId, BasicBlockMapper},
-        control_flow::{
-            analysis::loops::compute_multi_entry_dispatch, construct::ConstructExit,
-            restructure::restructure_fn,
-        },
-        dominance::{ForwardView, ReverseView, compute_dominance},
+        control_flow::scopes::SymbolScopes,
         instructions::RegionLowerer,
-        scc::{SccTree, SccTreeNodeId},
+        scc::SccTree,
     },
     rvsdg::{
         GlobalId, GlobalInit, InlineHint, Linkage, RVSDGMod, Visibility,
         func::{
-            CallingConvention, FnAttrFlags, FnAttrs, FnDecl, FnResult, Param, ParamAttrFlags,
+            CallingConvention, FnAttrFlags, FnAttrs, FnDecl, Param, ParamAttrFlags,
             ParamAttrs,
         },
         types::{
@@ -30,7 +26,6 @@ pub mod block_mapper;
 pub mod call_instructions;
 pub mod const_instructions;
 pub mod control_flow;
-pub mod dominance;
 pub mod instructions;
 pub mod scc;
 #[cfg(test)]
@@ -42,31 +37,10 @@ struct FnCtx<'m> {
     pub func: &'m llvm_ir::Function,
     pub bb_mapper: &'m BasicBlockMapper,
     /// Tree of every non-trivial strongly connected component in the
-    /// function, with parent / child nesting and per-component entry,
-    /// exit, and repetition arc analysis attached. The source of truth
-    /// for loop detection.
+    /// function, with parent / child nesting. The source of truth for loop
+    /// detection. (The synthetic exit block id lives on the overlay, which
+    /// every consumer of it also holds.)
     pub scc_tree: &'m SccTree,
-    /// Per-block lookup: for each block id, the strongly connected
-    /// component whose entry vertex this block is (if any). The
-    /// restructuring transform uses this to dispatch into a theta node
-    /// when it reaches the start of a loop.
-    pub scc_entry_block_to_id: &'m [Option<SccTreeNodeId>],
-    /// Per-block lookup: for each block id, the multi-entry (irreducible)
-    /// strongly connected component whose *dispatch dominator* this block is
-    /// (if any). Precomputed so the restructuring transform detects
-    /// irreducible-loop dispatch in O(1) rather than scanning every component
-    /// per block.
-    pub multi_entry_dispatch: &'m [Option<SccTreeNodeId>],
-    /// Forward immediate dominators, indexed by block id. Used by
-    /// branch-arm collection during gamma construction.
-    pub immediate_dominators: &'m [Option<BasicBlockId>],
-    /// Reverse immediate dominators (post-dominators), indexed by block
-    /// id. Used by region lowering to find the join point of every
-    /// conditional branch.
-    pub post_immediate_dominators: &'m [Option<BasicBlockId>],
-    /// Synthetic function-exit block id appended after the source
-    /// blocks during construction.
-    pub exit_block_id: BasicBlockId,
 }
 
 /// Intern every basic block of `func` to a dense [`BasicBlockId`], append the
@@ -280,61 +254,40 @@ impl RVSDGMod {
             .ok_or_else(|| color_eyre::eyre::eyre!("function `{}` was not declared", func.name))?
             .id;
         let bb_mapper = intern_blocks_and_arcs(func);
-        let exit_block_id = *bb_mapper.get_exit_expect();
-
-        // Compute dominators and post-dominators once per function;
-        // both are borrowed by FnCtx during lowering.
-        let forward_view = ForwardView {
-            nodes: &bb_mapper.blocks,
-            entry: BasicBlockId(0),
-        };
-        let immediate_dominators = compute_dominance(&forward_view);
-        let reverse_view = ReverseView {
-            nodes: &bb_mapper.blocks,
-            exit: exit_block_id,
-        };
-        let post_immediate_dominators = compute_dominance(&reverse_view);
 
         // Build the strongly connected component tree. This performs the
         // whole-function Tarjan pass plus one sub-Tarjan per non-trivial
         // component to recover nested-loop structure. See the `scc` module
         // for the algorithm.
         let scc_tree = SccTree::build(&bb_mapper);
-        let scc_entry_block_to_id = scc_tree.entry_block_to_node(bb_mapper.blocks.len());
-        let multi_entry_dispatch =
-            compute_multi_entry_dispatch(&scc_tree, &immediate_dominators, bb_mapper.blocks.len());
 
         let fn_ctx = FnCtx {
             llvm_mod: module,
             func,
             bb_mapper: &bb_mapper,
             scc_tree: &scc_tree,
-            scc_entry_block_to_id: &scc_entry_block_to_id,
-            multi_entry_dispatch: &multi_entry_dispatch,
-            immediate_dominators: &immediate_dominators,
-            post_immediate_dominators: &post_immediate_dominators,
-            exit_block_id,
         };
 
-        // Two-phase construction: materialize the structured region tree, then
-        // construct the RVSDG from it.
-        let rst = restructure_fn(&fn_ctx)?;
+        // Two-phase construction: restructure the control flow into overlay
+        // records (loop pass then branch pass), then emit the RVSDG by
+        // walking the restructured graph.
+        let diverging: Vec<bool> = func
+            .basic_blocks
+            .iter()
+            .map(|block| matches!(block.term, llvm_ir::Terminator::Unreachable(_)))
+            // The synthetic exit block never diverges.
+            .chain(std::iter::once(false))
+            .collect();
+        let overlay = control_flow::build_overlay(&bb_mapper, &scc_tree, diverging);
         self.define_fn(fn_id, |rb, state| {
-            let mut builder = RegionLowerer::new(rb, &fn_ctx);
-
-            // register function parameters
+            let mut scopes = SymbolScopes::new(rb.region_id());
+            // Register function parameters as root-frame bindings.
             for (i, param) in func.parameters.iter().enumerate() {
-                let value = builder.rb.param(i as u32);
-                builder.name_to_value.insert(param.name.clone(), value);
+                let value = rb.param(i as u32);
+                scopes.bind_name(param.name.clone(), value);
             }
-
-            let exit = builder.construct(&rst, state, None, &[])?;
-            let (state, values) = match exit {
-                ConstructExit::Returned { state, values } => (state, values),
-                ConstructExit::AtBoundary { state, .. } => (state, vec![]),
-                ConstructExit::Diverge { state } => (state, vec![]),
-            };
-            Ok(FnResult { state, values })
+            let mut builder = RegionLowerer::new(rb, &mut scopes, &fn_ctx);
+            control_flow::emit::emit_function_body(&mut builder, &overlay, state)
         })
     }
 }

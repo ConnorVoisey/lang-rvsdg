@@ -55,7 +55,7 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
                     return Err(eyre!("call has dest {dest:?} but callee returns no values"));
                 }
                 1 => {
-                    self.name_to_value.insert(dest.clone(), result.first_result);
+                    self.scopes.bind_name(dest.clone(), result.first_result);
                 }
                 _ => todo!(
                     "multi-return call (LLVM struct return); decomposition into RVSDG return values not yet supported"

@@ -1,6 +1,6 @@
 use rustc_hash::FxHashMap;
 
-use crate::rvsdg::{FuncId, GlobalId, types::TypeRef, value::ConstValue};
+use crate::rvsdg::{FuncId, GlobalId, ops::CastOp, types::TypeRef, value::ConstValue};
 
 /// Handle into the constant pool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -69,6 +69,12 @@ pub enum ConstantKind {
         indices: ConstIdsSpan,
         in_bounds: bool,
     },
+    /// Constant-expression cast (trunc/ptrtoint/inttoptr/bitcast/addrspacecast).
+    /// The result type is on the parent `ConstantDef.ty`. Deferred to LLVM's
+    /// constant cast operations at lowering, so it stays valid inside a global
+    /// initialiser. Common in real C output, e.g. SQLite packs small integers
+    /// into pointer fields with `ptr inttoptr (i64 N to ptr)`.
+    Cast { op: CastOp, operand: ConstId },
 }
 
 /// Deduplicated storage for all module-level constants.

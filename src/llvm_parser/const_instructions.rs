@@ -2,6 +2,7 @@ use crate::{
     llvm_parser::{global_name_string, int_bit_to_scalar, sign_extend_to_i64},
     rvsdg::{
         ConstId, ConstValue, ConstantDef, ConstantKind, RVSDGMod,
+        ops::CastOp,
         types::{ArrayType, PtrType, ScalarType, TypeRef, VOID},
     },
 };
@@ -176,11 +177,26 @@ impl RVSDGMod {
                     },
                 }
             }
-            llvm_ir::Constant::Trunc(_trunc) => todo!(),
-            llvm_ir::Constant::PtrToInt(_ptr_to_int) => todo!(),
-            llvm_ir::Constant::IntToPtr(_int_to_ptr) => todo!(),
-            llvm_ir::Constant::BitCast(_bit_cast) => todo!(),
-            llvm_ir::Constant::AddrSpaceCast(_addr_space_cast) => todo!(),
+            // Constant-expression casts. Like the int binops above these are
+            // not folded to a primitive here -- pointer-valued casts (inttoptr,
+            // a ptrtoint of a global address) have no scalar form -- so the cast
+            // is recorded and resolved by LLVM's constant operations at lowering.
+            // addrspacecast lowers as a bitcast, matching the runtime cast path.
+            llvm_ir::Constant::Trunc(c) => {
+                self.convert_const_cast(CastOp::Truncate, &c.operand, &c.to_type, module)?
+            }
+            llvm_ir::Constant::PtrToInt(c) => {
+                self.convert_const_cast(CastOp::PtrToInt, &c.operand, &c.to_type, module)?
+            }
+            llvm_ir::Constant::IntToPtr(c) => {
+                self.convert_const_cast(CastOp::IntToPtr, &c.operand, &c.to_type, module)?
+            }
+            llvm_ir::Constant::BitCast(c) => {
+                self.convert_const_cast(CastOp::Bitcast, &c.operand, &c.to_type, module)?
+            }
+            llvm_ir::Constant::AddrSpaceCast(c) => {
+                self.convert_const_cast(CastOp::Bitcast, &c.operand, &c.to_type, module)?
+            }
             llvm_ir::Constant::PtrAuth {
                 ptr: _,
                 key: _,
@@ -189,6 +205,24 @@ impl RVSDGMod {
             } => todo!(),
         };
         Ok(self.constants.intern(const_def))
+    }
+
+    /// Build a [`ConstantKind::Cast`]: recover the operand constant and the
+    /// result type (`to_type`), leaving the actual cast to LLVM's constant
+    /// operations at lowering. Used for every constant-expression cast.
+    fn convert_const_cast(
+        &mut self,
+        op: CastOp,
+        operand: &ConstantRef,
+        to_type: &llvm_ir::TypeRef,
+        module: &Module,
+    ) -> color_eyre::Result<ConstantDef> {
+        let operand = self.convert_const_ref(operand.clone(), module)?;
+        let ty = self.types.convert_type_ref(to_type, module)?;
+        Ok(ConstantDef {
+            ty,
+            kind: ConstantKind::Cast { op, operand },
+        })
     }
 
     /// The element type a pointer constant points to -- the *source type* for a

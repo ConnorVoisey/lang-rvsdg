@@ -292,3 +292,21 @@ fn test_36_global_struct() {
 fn test_37_dead_goto_into_loop() {
     test_c_file("tests/fixtures/c/37_dead_goto_into_loop.c");
 }
+
+// Reduced from SQLite: a top-level (non-loop) branch whose continuations are a
+// mix of in-region points and boundaries, which the restructure transform only
+// handles inside a loop body (LoopBodyExit::Demux). Currently fails in
+// structure_seq / structure_capture ("mixed in-region/boundary demux ...").
+#[test]
+fn test_38_mixed_continuation_demux() {
+    test_c_file("tests/fixtures/c/38_mixed_continuation_demux.c");
+}
+
+// Mutually-referencing loop phis (a pure swap): the arc payload must apply
+// phi copies as PARALLEL copies -- resolve every incoming against the scope
+// as it stood before the arc, then write all destinations. Sequential
+// resolve-and-write feeds the second phi the first one's new value.
+#[test]
+fn test_39_swap_phis() {
+    test_c_file("tests/fixtures/c/39_swap_phis.c");
+}

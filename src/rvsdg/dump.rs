@@ -31,7 +31,9 @@ use crate::rvsdg::{
     BinaryOp, ConstId, ConstValue, ConstantKind, FuncId, GlobalId, ICmpPred, RVSDGMod, RegionId,
     State, ValueId, ValueKind,
     func::Function,
-    types::{ArrayTypeId, FuncTypeId, PtrType, ScalarType, StructId, TypeArena, TypeRef, VectorTypeId},
+    types::{
+        ArrayTypeId, FuncTypeId, PtrType, ScalarType, StructId, TypeArena, TypeRef, VectorTypeId,
+    },
 };
 
 /// How a region's body terminates: a top-level function region `return`s, a
@@ -117,6 +119,7 @@ impl RVSDGMod {
                 source_type.fmt(f, &self.types)?;
                 write!(f, ", in_bounds: {in_bounds}")
             }
+            ConstantKind::Cast { op, operand } => write!(f, "cast {op:?} {operand}"),
         }
     }
 }
@@ -147,7 +150,11 @@ impl Function {
                     // A function's lambda_val must be a Lambda; anything else
                     // is a construction bug, so surface it rather than hide it.
                     ref other => {
-                        write!(f, "    <malformed lambda: {other:?}>\n}} fn end {}\n\n", self.id)?;
+                        write!(
+                            f,
+                            "    <malformed lambda: {other:?}>\n}} fn end {}\n\n",
+                            self.id
+                        )?;
                         return Ok(());
                     }
                 };
@@ -189,14 +196,14 @@ fn fmt_region_body(
         write!(f, "state_in {}\n", region.entry_state)?;
     }
 
-    if print_args && region.params.len != 0 {
+    if print_args && !region.params.is_empty() {
         pad(f, indent)?;
         f.write_str("args [ ")?;
-        for i in 0..region.params.len {
+        for (i, &param_id) in region.params.iter().enumerate() {
             if i != 0 {
                 f.write_str(", ")?;
             }
-            let param = m.get(ValueId(region.params.start + i as u32));
+            let param = m.get(param_id);
             write!(f, "a{i}: ")?;
             param.ty.fmt(f, &m.types)?;
         }
@@ -320,7 +327,16 @@ fn fmt_node(
             for (i, &arm_region) in region_ids.iter().enumerate() {
                 pad(f, indent + 4)?;
                 write!(f, "arm{i}:\n")?;
-                fmt_region_body(f, m, arm_region, indent + 8, true, false, None, Terminator::Yield)?;
+                fmt_region_body(
+                    f,
+                    m,
+                    arm_region,
+                    indent + 8,
+                    true,
+                    false,
+                    None,
+                    Terminator::Yield,
+                )?;
             }
 
             // All arms share output arity/types; take them from the first arm.
@@ -401,11 +417,7 @@ fn fmt_value_list(
 
 /// Resolve a value reference to its origin and print it: a region argument as
 /// `aN`, a folded project output as `%vNODE#K`, everything else as `%vN`.
-fn fmt_value_ref(
-    f: &mut std::fmt::Formatter<'_>,
-    m: &RVSDGMod,
-    id: ValueId,
-) -> std::fmt::Result {
+fn fmt_value_ref(f: &mut std::fmt::Formatter<'_>, m: &RVSDGMod, id: ValueId) -> std::fmt::Result {
     match m.get(id).kind {
         ValueKind::RegionParam { index, .. } => write!(f, "a{index}"),
         ValueKind::Project { call, index } => write!(f, "%v{}#{}", call.0, index),

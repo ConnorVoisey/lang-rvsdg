@@ -89,6 +89,103 @@ impl<'a> RegionBuilder<'a> {
         })
     }
 
+    /// Assemble a gamma node from regions that were built incrementally
+    /// (the paper's process-first, assemble-afterwards order: subregions
+    /// are emitted with capture-on-demand parameters, THEN the node is
+    /// created). Every region's parameter list must already be aligned to
+    /// `inputs` positionally, and its results set, all with `result_count`
+    /// entries.
+    pub fn finish_gamma(
+        &mut self,
+        condition: ValueId,
+        state: State,
+        inputs: &[ValueId],
+        branch_regions: &[RegionId],
+        result_count: u16,
+    ) -> GammaResult {
+        debug_assert!(branch_regions.len() >= 2, "gamma requires at least 2 branches");
+        let inputs_span = self.graph.value_pool.push_slice(inputs);
+        let regions = self.graph.region_pool.push_slice(branch_regions);
+
+        let gamma_val = self.add_value(Value {
+            ty: TypeRef::State,
+            kind: ValueKind::Gamma {
+                condition,
+                inputs: inputs_span,
+                state,
+                regions,
+            },
+        });
+        let out_state = State(gamma_val);
+
+        let first_result = ValueId(self.graph.values.len() as u32);
+        let first_region = branch_regions[0];
+        let first_results = self.graph.regions[first_region.0 as usize].results;
+        for i in 0..result_count {
+            let ty = self.graph.values
+                [self.graph.value_pool.get(first_results)[i as usize].0 as usize]
+                .ty;
+            self.add_value(Value {
+                ty,
+                kind: ValueKind::Project {
+                    call: gamma_val,
+                    index: i,
+                },
+            });
+        }
+
+        GammaResult {
+            state: out_state,
+            first_result,
+            result_count,
+        }
+    }
+
+    /// Assemble a theta node from a body region that was built
+    /// incrementally (see `finish_gamma`). The region's parameters must be
+    /// aligned to `loop_vars` positionally and its results (the
+    /// next-iteration values) set; `condition` is the repetition predicate,
+    /// a value inside the body region (alternative 1 repeats).
+    pub fn finish_theta(
+        &mut self,
+        state: State,
+        loop_vars: &[ValueId],
+        body_region: RegionId,
+        condition: ValueId,
+    ) -> ThetaResult {
+        let loop_span = self.graph.value_pool.push_slice(loop_vars);
+        let result_count = loop_vars.len() as u16;
+
+        let theta_val = self.add_value(Value {
+            ty: TypeRef::State,
+            kind: ValueKind::Theta {
+                loop_vars: loop_span,
+                condition,
+                state,
+                region_id: body_region,
+            },
+        });
+        let out_state = State(theta_val);
+
+        let first_result = ValueId(self.graph.values.len() as u32);
+        for i in 0..result_count {
+            let ty = self.graph.values[loop_vars[i as usize].0 as usize].ty;
+            self.add_value(Value {
+                ty,
+                kind: ValueKind::Project {
+                    call: theta_val,
+                    index: i,
+                },
+            });
+        }
+
+        ThetaResult {
+            state: out_state,
+            first_result,
+            result_count,
+        }
+    }
+
     /// Two-way if/else convenience. Condition is a bool: true -> first branch,
     /// false -> second branch. See `gamma_n` for the inputs allocation note.
     #[inline]
@@ -109,7 +206,7 @@ impl<'a> RegionBuilder<'a> {
     /// any input value not listed maps to `default`. The result is a
     /// control-typed value (`TypeRef::Control(alternatives)`) suitable as a gamma
     /// decision predicate or a theta repetition predicate -- the typed predicate the
-    /// paper's gamma/theta consume rather than a raw integer (section 2.2 lines 270-276).
+    /// paper's gamma/theta consume rather than a raw integer (section 2.2).
     #[inline]
     pub fn match_op(
         &mut self,

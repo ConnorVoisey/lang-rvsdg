@@ -15,11 +15,64 @@ pub struct RegionBuilder<'a> {
     pub graph: &'a mut RVSDGMod,
 }
 
+impl RVSDGMod {
+    /// Append a parameter to `region`, returning its value. Used by the
+    /// emitter's capture-on-demand: a region acquires an input the moment
+    /// its body first reads an outer value, so parameter values interleave
+    /// with body values in the global array (which is why `Region::params`
+    /// is an explicit list).
+    pub(crate) fn append_region_param(
+        &mut self,
+        region: RegionId,
+        ty: TypeRef,
+    ) -> ValueId {
+        let index = self.regions[region.0 as usize].params.len() as u32;
+        let id = ValueId(self.values.len() as u32);
+        self.values.push(Value {
+            ty,
+            kind: ValueKind::RegionParam { index, ty },
+        });
+        self.regions[region.0 as usize].params.push(id);
+        id
+    }
+
+    /// Replace `region`'s parameter list with `params` (construct assembly
+    /// aligns every alternative's parameters to one canonical input order),
+    /// fixing each parameter value's index field to its new position.
+    pub(crate) fn set_region_params(&mut self, region: RegionId, params: Vec<ValueId>) {
+        for (position, &param) in params.iter().enumerate() {
+            let Value {
+                kind: ValueKind::RegionParam { index, .. },
+                ..
+            } = &mut self.values[param.0 as usize]
+            else {
+                unreachable!("region parameter lists hold only RegionParam values");
+            };
+            *index = position as u32;
+        }
+        self.regions[region.0 as usize].params = params;
+    }
+
+    /// Set `region`'s results (construct assembly runs after the region's
+    /// body has been emitted).
+    pub(crate) fn set_region_results(&mut self, region: RegionId, results: &[ValueId]) {
+        let span = self.value_pool.push_slice(results);
+        self.regions[region.0 as usize].results = span;
+    }
+}
+
 impl<'a> RegionBuilder<'a> {
+    /// A builder over an already-created region, for incremental construct
+    /// assembly: the region is created first (`add_region`), emitted into,
+    /// and the enclosing gamma/theta node built afterwards.
+    pub fn over(graph: &'a mut RVSDGMod, region_id: RegionId) -> Self {
+        Self { region_id, graph }
+    }
+
     pub fn new_empty(graph: &'a mut RVSDGMod, entry_state: State) -> Self {
         let region = RegionId(graph.regions.len() as u32);
         graph.regions.push(Region {
-            params: ValuesSpan { start: 0, len: 0 },
+            params: Vec::new(),
             results: ValuesSpan { start: 0, len: 0 },
             entry_state,
             nodes: vec![],
@@ -38,8 +91,9 @@ impl<'a> RegionBuilder<'a> {
         let region = RegionId(graph.regions.len() as u32);
 
         let params = {
-            let val_start = graph.values.len() as u32;
+            let mut params = Vec::with_capacity(param_types.len());
             for (i, &ty) in param_types.iter().enumerate() {
+                params.push(ValueId(graph.values.len() as u32));
                 graph.values.push(Value {
                     ty,
                     kind: ValueKind::RegionParam {
@@ -48,10 +102,7 @@ impl<'a> RegionBuilder<'a> {
                     },
                 });
             }
-            ValuesSpan {
-                start: val_start,
-                len: param_types.len() as u16,
-            }
+            params
         };
 
         graph.regions.push(Region {
@@ -70,23 +121,21 @@ impl<'a> RegionBuilder<'a> {
         let region = RegionId(graph.regions.len() as u32);
         let fn_params = &graph.functions[func_id.0 as usize].params;
 
-        let param_count = fn_params.len() as u16;
         let params = {
-            let val_start = graph.values.len() as u32;
-            for (i, param) in fn_params.iter().enumerate() {
+            let fn_param_tys: Vec<TypeRef> =
+                fn_params.iter().map(|param| param.ty).collect();
+            let mut params = Vec::with_capacity(fn_param_tys.len());
+            for (i, &ty) in fn_param_tys.iter().enumerate() {
+                params.push(ValueId(graph.values.len() as u32));
                 graph.values.push(Value {
-                    ty: param.ty,
+                    ty,
                     kind: ValueKind::RegionParam {
                         index: i as u32,
-                        ty: param.ty,
+                        ty,
                     },
                 });
             }
-
-            ValuesSpan {
-                start: val_start,
-                len: param_count,
-            }
+            params
         };
 
         // add state node after all params, this is not recorded in the result ValuesSpan
@@ -118,9 +167,7 @@ impl<'a> RegionBuilder<'a> {
 
     #[inline]
     pub fn param(&self, index: u32) -> ValueId {
-        let span = self.graph.regions[self.region_id.0 as usize].params;
-        debug_assert!(span.len as u32 > index);
-        ValueId(span.start + index)
+        self.graph.regions[self.region_id.0 as usize].params[index as usize]
     }
 
     #[inline]
@@ -128,7 +175,7 @@ impl<'a> RegionBuilder<'a> {
         let id = RegionId(self.graph.regions.len() as u32);
         self.graph.regions.push(Region {
             entry_state: state,
-            params: ValuesSpan { start: 0, len: 0 },
+            params: Vec::new(),
             results: ValuesSpan { start: 0, len: 0 },
             nodes: vec![],
         });

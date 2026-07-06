@@ -56,7 +56,7 @@ impl RVSDGMod {
         // Bind region params to phi outputs (not initial values)
         let region = self.get_region(region_id);
         for (j, phi) in phis.iter().enumerate() {
-            let param_id = ValueId(region.params.start + j as u32);
+            let param_id = region.params[j];
             mapper.set_val(param_id, phi.as_basic_value());
         }
 

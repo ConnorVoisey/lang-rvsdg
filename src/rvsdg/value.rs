@@ -179,7 +179,7 @@ pub enum ValueKind {
         value: ValueId,
     },
     /// Match an integer `input` into a control/predicate value (Bahmann et al.
-    /// 2015 section 2.2, lines 270-276): the "match" that turns an integer condition
+    /// 2015 section 2.2): the "match" that turns an integer condition
     /// into a predicate enumerating alternatives. The produced value has type
     /// `Control(alternatives)`. Each arm in `arms` maps a specific input value
     /// to a control alternative (0-based); any input value not listed maps to

@@ -212,7 +212,13 @@ pub struct State(pub ValueId);
 
 #[derive(Debug, Clone)]
 pub struct Region {
-    pub params: ValuesSpan,
+    /// The region's parameters, in input order. An explicit list (not a
+    /// contiguous span) because construction appends parameters on demand:
+    /// the emitter captures outer values into a region while its body is
+    /// being built, so parameter values interleave with body values in the
+    /// global value array. Consumers identify a parameter by its position
+    /// here, never by value-id arithmetic.
+    pub params: Vec<ValueId>,
     pub entry_state: State,
     pub results: ValuesSpan,
     /// All values in this region (in topo order)

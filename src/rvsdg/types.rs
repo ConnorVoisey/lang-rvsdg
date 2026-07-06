@@ -50,7 +50,7 @@ pub enum TypeRef {
     Vector(VectorTypeId),
     Func(FuncTypeId),
     /// Predicate / control type with `n` alternatives (Bahmann, Reissmann,
-    /// Jahre, Meyer 2015 section 2.2, lines 270-276: "a predicate type that allows
+    /// Jahre, Meyer 2015 section 2.2: "a predicate type that allows
     /// the enumeration of alternatives"). A value of this type is an index in
     /// `0..n` selecting a gamma sub-region (left-to-right) or a theta repetition
     /// outcome (2-valued: 0 = exit, 1 = repeat). It is produced from an

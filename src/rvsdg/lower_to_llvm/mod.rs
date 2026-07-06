@@ -302,9 +302,8 @@ impl RVSDGMod {
                 // register the regions inputs to the llvm functions parameters so that they can be
                 // referenced by project inside the region
                 let region = &self.regions[region_id.0 as usize];
-                for i in 0..region.params.len as u32 {
-                    let param_id = ValueId(region.params.start + i);
-                    let param = func.get_nth_param(i).ok_or_else(|| {
+                for (i, &param_id) in region.params.iter().enumerate() {
+                    let param = func.get_nth_param(i as u32).ok_or_else(|| {
                         eyre!("function `{}` is missing parameter {i}", rvsdg_func.name)
                     })?;
                     mapper.set_val(param_id, param);

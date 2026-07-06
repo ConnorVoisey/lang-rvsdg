@@ -1,16 +1,16 @@
 use crate::{
-    llvm_parser::FnCtx,
+    llvm_parser::{FnCtx, block_mapper::BasicBlockId, control_flow::scopes::SymbolScopes},
     rvsdg::{
-        ArithFlags, BinaryOp, CastOp, FCmpPred, ICmpPred, MemoryOrdering, State, UnaryOp, ValueId,
+        ArithFlags, BinaryOp, CastOp, FCmpPred, ICmpPred, MatchArm, MemoryOrdering, State,
+        UnaryOp, ValueId,
         builder::{AllocaResult, LoadResult, RegionBuilder},
     },
 };
 use llvm_ir::{
-    FPPredicate, Instruction, IntPredicate, Name, Operand,
+    FPPredicate, Instruction, IntPredicate, Operand,
     instruction::{HasResult, MemoryOrdering as LlvmMemoryOrdering},
     types::Typed,
 };
-use rustc_hash::FxHashMap;
 
 fn convert_int_pred(p: IntPredicate) -> ICmpPred {
     match p {
@@ -36,330 +36,6 @@ fn convert_mem_ordering(o: LlvmMemoryOrdering) -> MemoryOrdering {
         LlvmMemoryOrdering::Release => MemoryOrdering::Release,
         LlvmMemoryOrdering::AcquireRelease => MemoryOrdering::AcquireRelease,
         LlvmMemoryOrdering::SequentiallyConsistent => MemoryOrdering::SequentiallyConsistent,
-    }
-}
-
-/// Visits every `Operand` referenced by an instruction.
-///
-/// "Referenced" means: an operand whose value is used as input to the instruction.
-/// Instruction destinations (`HasResult::get_result`) are NOT visited; this is for
-/// scanning use-sites only, call separately for definitions if needed.
-///
-/// Coverage matches `RegionLowerer::lower_instruction`. Variants we don't yet
-/// lower (`VAArg`, EH pads) are also unmodelled here, we panic with a clear
-/// message rather than silently skipping, because missing an operand silently
-/// produces wrong RVSDG (an instruction inside a region referencing an outer
-/// value that wasn't lifted to a region input).
-///
-/// Calling convention: `f` is invoked once per operand position. For multi-operand
-/// instructions like `Call` and `GetElementPtr`, `f` is invoked in stable order
-/// (callee/base first, then arguments/indices in their LLVM order).
-///
-/// The explicit `'a` lifetime ties the callback's `&'a Operand` parameter to the
-/// input instruction's lifetime -- without it, the callback is inferred as
-/// `for<'a> FnMut(&'a Operand)` (HRTB), which makes the closure unable to store
-/// references extracted from operands into outer collections like `HashSet<&Name>`.
-pub(super) fn for_each_operand<'a, F: FnMut(&'a Operand)>(inst: &'a Instruction, mut f: F) {
-    match inst {
-        // Integer binary
-        Instruction::Add(i) => {
-            f(&i.operand0);
-            f(&i.operand1);
-        }
-        Instruction::Sub(i) => {
-            f(&i.operand0);
-            f(&i.operand1);
-        }
-        Instruction::Mul(i) => {
-            f(&i.operand0);
-            f(&i.operand1);
-        }
-        Instruction::UDiv(i) => {
-            f(&i.operand0);
-            f(&i.operand1);
-        }
-        Instruction::SDiv(i) => {
-            f(&i.operand0);
-            f(&i.operand1);
-        }
-        Instruction::URem(i) => {
-            f(&i.operand0);
-            f(&i.operand1);
-        }
-        Instruction::SRem(i) => {
-            f(&i.operand0);
-            f(&i.operand1);
-        }
-        Instruction::And(i) => {
-            f(&i.operand0);
-            f(&i.operand1);
-        }
-        Instruction::Or(i) => {
-            f(&i.operand0);
-            f(&i.operand1);
-        }
-        Instruction::Xor(i) => {
-            f(&i.operand0);
-            f(&i.operand1);
-        }
-        Instruction::Shl(i) => {
-            f(&i.operand0);
-            f(&i.operand1);
-        }
-        Instruction::LShr(i) => {
-            f(&i.operand0);
-            f(&i.operand1);
-        }
-        Instruction::AShr(i) => {
-            f(&i.operand0);
-            f(&i.operand1);
-        }
-
-        // Float binary
-        Instruction::FAdd(i) => {
-            f(&i.operand0);
-            f(&i.operand1);
-        }
-        Instruction::FSub(i) => {
-            f(&i.operand0);
-            f(&i.operand1);
-        }
-        Instruction::FMul(i) => {
-            f(&i.operand0);
-            f(&i.operand1);
-        }
-        Instruction::FDiv(i) => {
-            f(&i.operand0);
-            f(&i.operand1);
-        }
-        Instruction::FRem(i) => {
-            f(&i.operand0);
-            f(&i.operand1);
-        }
-
-        // Unary
-        Instruction::FNeg(i) => f(&i.operand),
-        Instruction::Trunc(i) => f(&i.operand),
-        Instruction::ZExt(i) => f(&i.operand),
-        Instruction::SExt(i) => f(&i.operand),
-        Instruction::FPTrunc(i) => f(&i.operand),
-        Instruction::FPExt(i) => f(&i.operand),
-        Instruction::FPToUI(i) => f(&i.operand),
-        Instruction::FPToSI(i) => f(&i.operand),
-        Instruction::UIToFP(i) => f(&i.operand),
-        Instruction::SIToFP(i) => f(&i.operand),
-        Instruction::PtrToInt(i) => f(&i.operand),
-        Instruction::IntToPtr(i) => f(&i.operand),
-        Instruction::BitCast(i) => f(&i.operand),
-        Instruction::AddrSpaceCast(i) => f(&i.operand),
-        Instruction::Freeze(i) => f(&i.operand),
-
-        // Vector ops
-        Instruction::ExtractElement(i) => {
-            f(&i.vector);
-            f(&i.index);
-        }
-        Instruction::InsertElement(i) => {
-            f(&i.vector);
-            f(&i.element);
-            f(&i.index);
-        }
-        Instruction::ShuffleVector(i) => {
-            f(&i.operand0);
-            f(&i.operand1);
-        }
-
-        // Aggregate ops
-        Instruction::ExtractValue(i) => f(&i.aggregate),
-        Instruction::InsertValue(i) => {
-            f(&i.aggregate);
-            f(&i.element);
-        }
-
-        // Memory
-        Instruction::Alloca(i) => f(&i.num_elements),
-        Instruction::Load(i) => f(&i.address),
-        Instruction::Store(i) => {
-            f(&i.address);
-            f(&i.value);
-        }
-        Instruction::Fence(_) => {} // no value operands
-        Instruction::CmpXchg(i) => {
-            f(&i.address);
-            f(&i.expected);
-            f(&i.replacement);
-        }
-        Instruction::AtomicRMW(i) => {
-            f(&i.address);
-            f(&i.value);
-        }
-        Instruction::GetElementPtr(i) => {
-            f(&i.address);
-            for idx in &i.indices {
-                f(idx);
-            }
-        }
-
-        // Comparisons
-        Instruction::ICmp(i) => {
-            f(&i.operand0);
-            f(&i.operand1);
-        }
-        Instruction::FCmp(i) => {
-            f(&i.operand0);
-            f(&i.operand1);
-        }
-
-        // Select
-        Instruction::Select(i) => {
-            f(&i.condition);
-            f(&i.true_value);
-            f(&i.false_value);
-        }
-
-        // Phi -- each [value, predecessor] pair contributes a value operand
-        Instruction::Phi(i) => {
-            for (op, _pred) in &i.incoming_values {
-                f(op);
-            }
-        }
-
-        // Call -- walk arg operands, plus the callee if it's an indirect call
-        Instruction::Call(i) => {
-            if let either::Either::Right(callee) = &i.function {
-                f(callee);
-            }
-            for (arg, _attrs) in &i.arguments {
-                f(arg);
-            }
-        }
-
-        // Variadic / EH -- not modelled by lower_instruction either.
-        // Panic on encounter so the failure surfaces at the operand-walk site,
-        // not later as a silent missed-live-in.
-        Instruction::VAArg(_) => todo!("for_each_operand: VAArg"),
-        Instruction::LandingPad(_) => todo!("for_each_operand: LandingPad"),
-        Instruction::CatchPad(_) => todo!("for_each_operand: CatchPad"),
-        Instruction::CleanupPad(_) => todo!("for_each_operand: CleanupPad"),
-    }
-}
-
-/// Iterate over every operand referenced by `term`, the terminator of a
-/// basic block. Symmetric to `for_each_operand` for non-terminator
-/// instructions. Needed by the loop live-in scan, since a terminator
-/// can be the sole consumer of an outer-scope value (e.g. `br i1
-/// %arg, ...` with `%arg` a function argument not otherwise used in
-/// the loop body).
-pub(super) fn for_each_terminator_operand<'a, F: FnMut(&'a Operand)>(
-    term: &'a llvm_ir::Terminator,
-    mut f: F,
-) {
-    use llvm_ir::Terminator;
-    match term {
-        Terminator::Br(_) => {}
-        Terminator::CondBr(cb) => f(&cb.condition),
-        Terminator::Switch(sw) => f(&sw.operand),
-        Terminator::IndirectBr(ib) => f(&ib.operand),
-        Terminator::Ret(r) => {
-            if let Some(op) = &r.return_operand {
-                f(op);
-            }
-        }
-        Terminator::Resume(r) => f(&r.operand),
-        Terminator::CleanupRet(c) => f(&c.cleanup_pad),
-        Terminator::CatchRet(c) => f(&c.catch_pad),
-        Terminator::Invoke(_) => {
-            todo!("for_each_terminator_operand: Invoke")
-        }
-        Terminator::CallBr(_) => {
-            todo!("for_each_terminator_operand: CallBr")
-        }
-        Terminator::Unreachable(_) | Terminator::CatchSwitch(_) => {}
-    }
-}
-
-/// Returns the SSA destination name of an instruction, if it has one.
-///
-/// Used by live-in analysis to determine what's "defined inside" a region.
-/// Symmetric to `for_each_operand` -- that visits uses; this returns the
-/// definition. Variants without a value result (`Store`, `Fence`, etc.)
-/// return `None`.
-pub(super) fn instruction_dest(inst: &Instruction) -> Option<&Name> {
-    match inst {
-        // Integer binary
-        Instruction::Add(i) => Some(i.get_result()),
-        Instruction::Sub(i) => Some(i.get_result()),
-        Instruction::Mul(i) => Some(i.get_result()),
-        Instruction::UDiv(i) => Some(i.get_result()),
-        Instruction::SDiv(i) => Some(i.get_result()),
-        Instruction::URem(i) => Some(i.get_result()),
-        Instruction::SRem(i) => Some(i.get_result()),
-        Instruction::And(i) => Some(i.get_result()),
-        Instruction::Or(i) => Some(i.get_result()),
-        Instruction::Xor(i) => Some(i.get_result()),
-        Instruction::Shl(i) => Some(i.get_result()),
-        Instruction::LShr(i) => Some(i.get_result()),
-        Instruction::AShr(i) => Some(i.get_result()),
-
-        // Float binary
-        Instruction::FAdd(i) => Some(i.get_result()),
-        Instruction::FSub(i) => Some(i.get_result()),
-        Instruction::FMul(i) => Some(i.get_result()),
-        Instruction::FDiv(i) => Some(i.get_result()),
-        Instruction::FRem(i) => Some(i.get_result()),
-
-        // Unary
-        Instruction::FNeg(i) => Some(i.get_result()),
-        Instruction::Trunc(i) => Some(i.get_result()),
-        Instruction::ZExt(i) => Some(i.get_result()),
-        Instruction::SExt(i) => Some(i.get_result()),
-        Instruction::FPTrunc(i) => Some(i.get_result()),
-        Instruction::FPExt(i) => Some(i.get_result()),
-        Instruction::FPToUI(i) => Some(i.get_result()),
-        Instruction::FPToSI(i) => Some(i.get_result()),
-        Instruction::UIToFP(i) => Some(i.get_result()),
-        Instruction::SIToFP(i) => Some(i.get_result()),
-        Instruction::PtrToInt(i) => Some(i.get_result()),
-        Instruction::IntToPtr(i) => Some(i.get_result()),
-        Instruction::BitCast(i) => Some(i.get_result()),
-        Instruction::AddrSpaceCast(i) => Some(i.get_result()),
-        Instruction::Freeze(i) => Some(i.get_result()),
-
-        // Vector
-        Instruction::ExtractElement(i) => Some(i.get_result()),
-        Instruction::InsertElement(i) => Some(i.get_result()),
-        Instruction::ShuffleVector(i) => Some(i.get_result()),
-
-        // Aggregate
-        Instruction::ExtractValue(i) => Some(i.get_result()),
-        Instruction::InsertValue(i) => Some(i.get_result()),
-
-        // Memory
-        Instruction::Alloca(i) => Some(i.get_result()),
-        Instruction::Load(i) => Some(i.get_result()),
-        Instruction::Store(_) => None, // void
-        Instruction::Fence(_) => None, // void
-        Instruction::CmpXchg(i) => Some(i.get_result()),
-        Instruction::AtomicRMW(i) => Some(i.get_result()),
-        Instruction::GetElementPtr(i) => Some(i.get_result()),
-
-        // Comparisons
-        Instruction::ICmp(i) => Some(i.get_result()),
-        Instruction::FCmp(i) => Some(i.get_result()),
-
-        // Select / Phi
-        Instruction::Select(i) => Some(i.get_result()),
-        Instruction::Phi(i) => Some(&i.dest),
-
-        // Call's dest is optional -- `None` when the callee returns void.
-        Instruction::Call(i) => i.dest.as_ref(),
-
-        // VAArg has a dest in the IR; the rest of EH support is not modelled
-        // by lower_instruction. Surface as todo for parity with for_each_operand.
-        Instruction::VAArg(_) => todo!("instruction_dest: VAArg"),
-        Instruction::LandingPad(_) => todo!("instruction_dest: LandingPad"),
-        Instruction::CatchPad(_) => todo!("instruction_dest: CatchPad"),
-        Instruction::CleanupPad(_) => todo!("instruction_dest: CleanupPad"),
     }
 }
 
@@ -397,40 +73,23 @@ fn convert_fp_pred(p: FPPredicate) -> FCmpPred {
 /// over-constrains the borrow tree and forces `'static`.
 pub(in crate::llvm_parser) struct RegionLowerer<'rb, 'g, 'm> {
     pub rb: &'rb mut RegionBuilder<'g>,
-    pub name_to_value: FxHashMap<Name, ValueId>,
+    /// The scoped symbol table (one frame per region on the emission
+    /// stack). Reads resolve through it with capture-on-demand; writes land
+    /// in the current frame. Shared by every nesting level of one
+    /// function's emission.
+    pub scopes: &'rb mut SymbolScopes,
     pub fn_ctx: &'m FnCtx<'m>,
 }
 
 impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
-    /// Construct a top-level lowerer with an empty SSA-name map. Used at the
-    /// function entry; callers populate `name_to_value` themselves with
-    /// function parameters before lowering the body.
+    /// A lowerer emitting into `rb`'s region, reading and writing symbols
+    /// through `scopes` (whose current frame must be that same region).
     pub(in crate::llvm_parser) fn new(
         rb: &'rb mut RegionBuilder<'g>,
+        scopes: &'rb mut SymbolScopes,
         fn_ctx: &'m FnCtx<'m>,
     ) -> Self {
-        Self {
-            rb,
-            fn_ctx,
-            name_to_value: FxHashMap::default(),
-        }
-    }
-
-    /// Construct a child-region lowerer with a pre-seeded `name_to_value`.
-    /// Used when building a nested region whose params correspond to known
-    /// outer-scope SSA names (gamma arm params seeded from live-ins, theta
-    /// body params seeded from header phis + live-ins). The caller builds
-    /// the map up front, optionally pre-sized for the expected body size.
-    pub(in crate::llvm_parser) fn new_child(
-        rb: &'rb mut RegionBuilder<'g>,
-        fn_ctx: &'m FnCtx<'m>,
-        name_to_value: FxHashMap<Name, ValueId>,
-    ) -> Self {
-        Self {
-            rb,
-            fn_ctx,
-            name_to_value,
-        }
+        Self { rb, scopes, fn_ctx }
     }
 
     /// Lower one LLVM instruction, threading state through.
@@ -666,7 +325,7 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
             .convert_type_ref(&llvm_ty, self.fn_ctx.llvm_mod)?;
         let dest = inst.get_result().clone();
         let val = self.rb.binary(op, flags, left, right, ty);
-        self.name_to_value.insert(dest, val);
+        self.scopes.bind_name(dest, val);
         Ok(val)
     }
 
@@ -683,7 +342,7 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
             .convert_type_ref(&llvm_ty, self.fn_ctx.llvm_mod)?;
         let dest = inst.get_result().clone();
         let val = self.rb.unary(op, operand, ty);
-        self.name_to_value.insert(dest, val);
+        self.scopes.bind_name(dest, val);
         Ok(val)
     }
 
@@ -700,7 +359,7 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
             .convert_type_ref(&llvm_ty, self.fn_ctx.llvm_mod)?;
         let dest = inst.get_result().clone();
         let val = self.rb.cast(op, operand, ty);
-        self.name_to_value.insert(dest, val);
+        self.scopes.bind_name(dest, val);
         Ok(val)
     }
 
@@ -716,7 +375,7 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
             .types
             .convert_type_ref(&llvm_ty, self.fn_ctx.llvm_mod)?;
         let val = self.rb.extract_field(aggregate, &inst.indices, field_type);
-        self.name_to_value.insert(inst.dest.clone(), val);
+        self.scopes.bind_name(inst.dest.clone(), val);
         Ok(val)
     }
 
@@ -735,7 +394,7 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
         let val = self
             .rb
             .insert_field(aggregate, element, &inst.indices, aggregate_type);
-        self.name_to_value.insert(inst.dest.clone(), val);
+        self.scopes.bind_name(inst.dest.clone(), val);
         Ok(val)
     }
 
@@ -763,7 +422,7 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
         let val = self
             .rb
             .ptr_offset(base, base_type, &indices, result_type, inst.in_bounds);
-        self.name_to_value.insert(inst.dest.clone(), val);
+        self.scopes.bind_name(inst.dest.clone(), val);
         Ok(val)
     }
 
@@ -772,7 +431,7 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
         let right = self.operand(&inst.operand1)?;
         let pred = convert_int_pred(inst.predicate);
         let val = self.rb.icmp(pred, left, right);
-        self.name_to_value.insert(inst.dest.clone(), val);
+        self.scopes.bind_name(inst.dest.clone(), val);
         Ok(val)
     }
 
@@ -781,7 +440,7 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
         let right = self.operand(&inst.operand1)?;
         let pred = convert_fp_pred(inst.predicate);
         let val = self.rb.fcmp(pred, left, right);
-        self.name_to_value.insert(inst.dest.clone(), val);
+        self.scopes.bind_name(inst.dest.clone(), val);
         Ok(val)
     }
 
@@ -808,7 +467,7 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
             ),
             None => self.rb.load(state, addr, loaded_type, align, inst.volatile),
         };
-        self.name_to_value.insert(inst.dest.clone(), result.value);
+        self.scopes.bind_name(inst.dest.clone(), result.value);
         Ok(result)
     }
 
@@ -852,7 +511,7 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
             .convert_type_ref(&llvm_ptr_ty, self.fn_ctx.llvm_mod)?;
 
         let result = self.rb.alloca(state, elem_type, count, ptr_type);
-        self.name_to_value.insert(inst.dest.clone(), result.ptr);
+        self.scopes.bind_name(inst.dest.clone(), result.ptr);
         Ok(result)
     }
 
@@ -872,7 +531,7 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
             .types
             .convert_type_ref(&llvm_ty, self.fn_ctx.llvm_mod)?;
         let val = self.rb.ternary(cond, t, f, ty);
-        self.name_to_value.insert(inst.dest.clone(), val);
+        self.scopes.bind_name(inst.dest.clone(), val);
         Ok(val)
     }
 
@@ -889,17 +548,52 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
             .convert_type_ref(&llvm_ty, self.fn_ctx.llvm_mod)?;
         let dest = inst.get_result().clone();
         let val = self.rb.freeze(operand, ty);
-        self.name_to_value.insert(dest, val);
+        self.scopes.bind_name(dest, val);
         Ok(val)
+    }
+
+    /// Build the control/predicate value for a `switch` and its arm targets:
+    /// arm 0 is the default, arms `1..=N` the cases in declaration order. The
+    /// `match` maps each case value to its arm index; any other value to 0
+    /// (default). Returns the control predicate and the arm-target list.
+    pub(in crate::llvm_parser) fn switch_predicate(
+        &mut self,
+        switch: &llvm_ir::terminator::Switch,
+    ) -> color_eyre::Result<(ValueId, Vec<BasicBlockId>)> {
+        let operand = self.operand(&switch.operand)?;
+        let mut targets = Vec::with_capacity(switch.dests.len() + 1);
+        targets.push(*self.fn_ctx.bb_mapper.get_expect(&switch.default_dest));
+        let mut arms: Vec<MatchArm> = Vec::with_capacity(switch.dests.len());
+        for (case_index, (case_const, dest)) in switch.dests.iter().enumerate() {
+            targets.push(*self.fn_ctx.bb_mapper.get_expect(dest));
+            // Case values are integer constants; read the value to key the match.
+            let value = match case_const.as_ref() {
+                llvm_ir::Constant::Int { value, .. } => *value as i64,
+                other => {
+                    return Err(color_eyre::eyre::eyre!(
+                        "switch case value is not an integer: {other:?}"
+                    ));
+                }
+            };
+            // Arm 0 is the default, so case `k` is arm `k + 1`.
+            arms.push(MatchArm {
+                value,
+                alternative: case_index as u32 + 1,
+            });
+        }
+        let alternatives = targets.len() as u32;
+        let predicate = self.rb.match_op(operand, &arms, 0, alternatives);
+        Ok((predicate, targets))
     }
 
     pub(super) fn operand(&mut self, op: &Operand) -> color_eyre::Result<ValueId> {
         match op {
-            Operand::LocalOperand { name, .. } => {
-                self.name_to_value.get(name).copied().ok_or_else(|| {
+            Operand::LocalOperand { name, .. } => self
+                .scopes
+                .resolve_name(self.rb.graph, name)
+                .ok_or_else(|| {
                     color_eyre::eyre::eyre!("ssa value {name} used before definition")
-                })
-            }
+                }),
             Operand::ConstantOperand(constant_ref) => {
                 let const_id = self
                     .rb

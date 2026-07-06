@@ -1,6 +1,7 @@
 use crate::rvsdg::{
     ConstId, ConstValue, ConstantDef, ConstantKind, RVSDGMod,
     lower_to_llvm::{LLVMBuilderCtx, ValueMapper},
+    ops::CastOp,
     types::TypeRef,
 };
 use color_eyre::eyre::eyre;
@@ -148,8 +149,56 @@ impl RVSDGMod {
                 };
                 result.as_basic_value_enum()
             }
+            ConstantKind::Cast { op, operand } => {
+                let src = self.lower_const_id(llvm_builder, mapper, *operand)?;
+                let dst = self.type_to_basic_type_llvm(llvm_builder.context, constant.ty)?;
+                Self::lower_const_cast(*op, src, dst)?
+            }
         };
         Ok(lowered)
+    }
+
+    /// Lower a [`ConstantKind::Cast`] using LLVM's constant cast operations
+    /// (the `const_*` forms, which need no builder/insertion point and so are
+    /// valid inside a global initialiser). Mirrors the runtime cast lowering in
+    /// `cast.rs`. Only the cast kinds that occur as LLVM constant expressions
+    /// are handled; the others are runtime-only and never reach here.
+    fn lower_const_cast<'ctx>(
+        op: CastOp,
+        src: BasicValueEnum<'ctx>,
+        dst: BasicTypeEnum<'ctx>,
+    ) -> color_eyre::Result<BasicValueEnum<'ctx>> {
+        Ok(match op {
+            CastOp::Truncate => {
+                BasicValueEnum::IntValue(src.into_int_value().const_truncate(dst.into_int_type()))
+            }
+            CastOp::PtrToInt => {
+                BasicValueEnum::IntValue(src.into_pointer_value().const_to_int(dst.into_int_type()))
+            }
+            CastOp::IntToPtr => BasicValueEnum::PointerValue(
+                src.into_int_value()
+                    .const_to_pointer(dst.into_pointer_type()),
+            ),
+            // bitcast (and addrspacecast, mapped to Bitcast): reinterpret. The
+            // realistic constant forms are pointer<->pointer (identity under
+            // opaque pointers) and integer<->integer.
+            CastOp::Bitcast => match dst {
+                BasicTypeEnum::PointerType(pt) => {
+                    BasicValueEnum::PointerValue(src.into_pointer_value().const_cast(pt))
+                }
+                BasicTypeEnum::IntType(it) => {
+                    BasicValueEnum::IntValue(src.into_int_value().const_bit_cast(it))
+                }
+                other => {
+                    return Err(eyre!("unsupported constant bitcast to {other:?}"));
+                }
+            },
+            other => {
+                return Err(eyre!(
+                    "constant cast {other:?} is not an LLVM constant expression"
+                ));
+            }
+        })
     }
 
     #[inline]

@@ -89,11 +89,11 @@ impl RVSDGMod {
             let region = self.get_region(region_id);
 
             // Bind gamma inputs to this region's params
-            for j in 0..region.params.len as u32 {
-                let param_id = ValueId(region.params.start + j);
-                if (j as usize) < input_ids.len() {
+            let params = region.params.clone();
+            for (j, &param_id) in params.iter().enumerate() {
+                if j < input_ids.len() {
                     let input_val =
-                        self.expect_value(llvm_builder, mapper, rvsdg_func, input_ids[j as usize])?;
+                        self.expect_value(llvm_builder, mapper, rvsdg_func, input_ids[j])?;
                     mapper.set_val(param_id, input_val);
                 }
             }
