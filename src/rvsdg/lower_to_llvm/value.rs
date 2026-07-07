@@ -2,7 +2,7 @@ use crate::rvsdg::{
     FCmpPred, ICmpPred, RVSDGMod, ValueId, ValueKind,
     func::Function,
     lower_to_llvm::{LLVMBuilderCtx, ValueMapper},
-    types::{TypeRef, VOID},
+    types::VOID,
 };
 use color_eyre::eyre::{bail, eyre};
 use inkwell::{
@@ -72,14 +72,30 @@ impl RVSDGMod {
                     ICmpPred::SignedLt => IntPredicate::SLT,
                     ICmpPred::SignedLe => IntPredicate::SLE,
                 };
-                Some(BasicValueEnum::IntValue(
+                // LLVM's icmp also accepts pointer operands (`icmp eq ptr
+                // %p, null`); both operands always share one type, so the
+                // left one decides which build variant applies. Vector
+                // compares (int or pointer lanes) are not lowered yet;
+                // fail with a message instead of an inkwell unwrap panic.
+                if lhs.is_vector_value() {
+                    bail!("vector icmp lowering is not implemented");
+                }
+                let result = if lhs.is_pointer_value() {
+                    llvm_builder.builder.build_int_compare(
+                        int_pred,
+                        lhs.into_pointer_value(),
+                        rhs.into_pointer_value(),
+                        "icmp",
+                    )?
+                } else {
                     llvm_builder.builder.build_int_compare(
                         int_pred,
                         lhs.into_int_value(),
                         rhs.into_int_value(),
                         "icmp",
-                    )?,
-                ))
+                    )?
+                };
+                Some(BasicValueEnum::IntValue(result))
             }
             ValueKind::FCmp { pred, left, right } => {
                 let lhs = self.expect_value(llvm_builder, mapper, rvsdg_func, left)?;
@@ -401,24 +417,11 @@ impl RVSDGMod {
             ValueKind::CallIndirect {
                 state: _,
                 callee,
+                fn_ty,
                 args,
             } => {
                 let callee_val = self.expect_value(llvm_builder, mapper, rvsdg_func, callee)?;
-                let callee_value = &self.values[callee.0 as usize];
-                let func_type_id = match callee_value.ty {
-                    TypeRef::Ptr(ptr_id) => {
-                        let ptr_type = self.types.get_ptr(ptr_id);
-                        match ptr_type.pointee {
-                            Some(TypeRef::Func(id)) => id,
-                            _ => bail!("indirect call callee must be a pointer to a function type"),
-                        }
-                    }
-                    TypeRef::Func(id) => id,
-                    _ => {
-                        bail!("indirect call callee must have a function or function-pointer type")
-                    }
-                };
-                let func_type_def = self.types.get_fn(func_type_id);
+                let func_type_def = self.types.get_fn(fn_ty);
                 let param_types: Vec<_> = func_type_def
                     .params
                     .iter()

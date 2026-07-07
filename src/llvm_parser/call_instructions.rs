@@ -1,6 +1,6 @@
 use crate::{
     llvm_parser::instructions::RegionLowerer,
-    rvsdg::{State, ValueId},
+    rvsdg::{State, ValueId, types::TypeRef},
 };
 use color_eyre::eyre::eyre;
 use either::Either;
@@ -43,10 +43,19 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
             self.rb.call(fn_id, state, &args)
         } else {
             let callee_val = self.operand(callee_operand)?;
-            let return_types =
-                call_return_types(&inst.function_ty, self.fn_ctx.llvm_mod, self.rb.graph)?;
-            self.rb
-                .call_indirect(callee_val, state, &args, &return_types)
+            // The call site's function type is the only place the callee's
+            // signature exists (the callee value is an opaque pointer), so
+            // it is interned and stored on the CallIndirect node.
+            let fn_ty = match self
+                .rb
+                .graph
+                .types
+                .convert_type_ref(&inst.function_ty, self.fn_ctx.llvm_mod)?
+            {
+                TypeRef::Func(id) => id,
+                ty => return Err(eyre!("call function_ty is not a function type, got {ty:?}")),
+            };
+            self.rb.call_indirect(callee_val, state, &args, fn_ty)
         };
 
         if let Some(dest) = &inst.dest {
@@ -64,23 +73,4 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
         }
         Ok(result.state)
     }
-}
-
-/// Extract the return-type list for an indirect call from its LLVM function type.
-/// LLVM models a single return type (possibly void or a struct); RVSDG supports
-/// multiple return values, but for the LLVM mapping we only ever produce 0 or 1.
-fn call_return_types(
-    function_ty: &llvm_ir::TypeRef,
-    llvm_mod: &llvm_ir::Module,
-    rvsdg_mod: &mut crate::rvsdg::RVSDGMod,
-) -> color_eyre::Result<Vec<crate::rvsdg::types::TypeRef>> {
-    let result_type = match &**function_ty {
-        llvm_ir::Type::FuncType { result_type, .. } => result_type.clone(),
-        ty => return Err(eyre!("call function_ty is not a FuncType, got {ty:?}")),
-    };
-    if matches!(&*result_type, llvm_ir::Type::VoidType) {
-        return Ok(vec![]);
-    }
-    let ty = rvsdg_mod.types.convert_type_ref(&result_type, llvm_mod)?;
-    Ok(vec![ty])
 }

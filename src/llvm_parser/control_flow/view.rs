@@ -165,7 +165,10 @@ impl<'a> RegionView<'a> {
 
     /// Outgoing arcs of `vertex` in alternative order, rewrites applied and
     /// this loop body's repetition arcs hidden.
-    pub(in crate::llvm_parser) fn arcs_out(&self, vertex: Vertex) -> SmallVec<[TraversedArc<'a>; 4]> {
+    pub(in crate::llvm_parser) fn arcs_out(
+        &self,
+        vertex: Vertex,
+    ) -> SmallVec<[TraversedArc<'a>; 4]> {
         let mut arcs: SmallVec<[TraversedArc<'a>; 4]> = SmallVec::new();
         match vertex {
             Vertex::Block(block) => {
@@ -225,7 +228,10 @@ impl<'a> RegionView<'a> {
     /// collapsed structured loop presents as that loop's successor arc),
     /// plus the arcs the overlay routes here (rewritten redirects and aux
     /// fan-out arcs).
-    pub(in crate::llvm_parser) fn arcs_in(&self, vertex: Vertex) -> SmallVec<[TraversedArc<'a>; 4]> {
+    pub(in crate::llvm_parser) fn arcs_in(
+        &self,
+        vertex: Vertex,
+    ) -> SmallVec<[TraversedArc<'a>; 4]> {
         let mut arcs: SmallVec<[TraversedArc<'a>; 4]> = SmallVec::new();
         if let Vertex::Block(block) = vertex {
             for &(source, index) in self.overlay.original_in_arcs(block) {
@@ -340,11 +346,10 @@ impl<'a> RegionView<'a> {
             }
         };
 
-        let (assignments, target): (&'a [AuxAssign], Vertex) =
-            match self.overlay.rewrite_of(arc) {
-                Some(rewrite) => (&rewrite.assignments, rewrite.redirect),
-                None => (&[], self.present_collapsed(raw_target)),
-            };
+        let (assignments, target): (&'a [AuxAssign], Vertex) = match self.overlay.rewrite_of(arc) {
+            Some(rewrite) => (&rewrite.assignments, rewrite.redirect),
+            None => (&[], self.present_collapsed(raw_target)),
+        };
         TraversedArc {
             arc,
             phi_copies,
@@ -552,8 +557,7 @@ mod tests {
 
         // A later branch demux funnels the same arc: the continuation
         // selector fuses AFTER the loop selector, and the redirect moves.
-        let demux =
-            overlay.add_aux_vertex(AuxVertexKind::BranchDemux, &[Vertex::Loop(scc)], None);
+        let demux = overlay.add_aux_vertex(AuxVertexKind::BranchDemux, &[Vertex::Loop(scc)], None);
         let second = AuxAssign {
             var: AuxVar::ContinuationSelector(demux),
             value: 0,
@@ -709,11 +713,8 @@ mod tests {
         let scc = SccTreeNodeId(0);
         let mut overlay = Overlay::new(&mapper, vec![false; 2], 1);
         // Tail fan-out: alternative 0 exits, alternative 1 repeats.
-        let tail = overlay.add_aux_vertex(
-            AuxVertexKind::LoopTail,
-            &[block(0), block(0)],
-            Some(scc),
-        );
+        let tail =
+            overlay.add_aux_vertex(AuxVertexKind::LoopTail, &[block(0), block(0)], Some(scc));
         overlay.loops[0] = Some(LoopOverlay {
             entries: smallvec![BasicBlockId(0)],
             exit_targets: smallvec![block(0)],

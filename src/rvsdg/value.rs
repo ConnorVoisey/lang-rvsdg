@@ -5,7 +5,7 @@ use crate::rvsdg::{
         ArithFlags, AtomicRMWOp, BinaryOp, CastOp, FCmpPred, ICmpPred, IntrinsicOp, MemoryOrdering,
         UnaryOp,
     },
-    types::TypeRef,
+    types::{FuncTypeId, TypeRef},
 };
 
 /// The data associated with a Value in the pool.
@@ -230,10 +230,15 @@ pub enum ValueKind {
         fn_id: FuncId,
         args: ValuesSpan,
     },
-    /// Indirect call through a function pointer.
+    /// Indirect call through a function pointer. The callee's signature is
+    /// stored here rather than derived from the callee value: pointers are
+    /// opaque (no pointee type), so the call site is the only place the
+    /// signature exists -- the same reason LLVM call instructions carry
+    /// their own function type.
     CallIndirect {
         state: State,
         callee: ValueId,
+        fn_ty: FuncTypeId,
         args: ValuesSpan,
     },
     Project {

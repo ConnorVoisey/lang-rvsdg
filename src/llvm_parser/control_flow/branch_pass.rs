@@ -205,9 +205,10 @@ impl BranchPass<'_> {
 
         // The body's nesting level: this component's direct children are
         // collapsed; their blocks are not body members.
-        let child_collapse = self
-            .tree
-            .collapse_table(&self.tree.children[scc.0 as usize], self.mapper.blocks.len());
+        let child_collapse = self.tree.collapse_table(
+            &self.tree.children[scc.0 as usize],
+            self.mapper.blocks.len(),
+        );
 
         let body_depth = depth + 1;
         self.ensure_pool(body_depth);
@@ -291,9 +292,9 @@ impl BranchPass<'_> {
 
         // The demux, and the selector rewrites funneling every arm-boundary
         // arc (and every empty alternative's fan-out arc) through it.
-        let demux = self
-            .overlay
-            .add_aux_vertex(AuxVertexKind::BranchDemux, &continuations, scope.body_of);
+        let demux =
+            self.overlay
+                .add_aux_vertex(AuxVertexKind::BranchDemux, &continuations, scope.body_of);
         self.add_region_member(Vertex::Aux(demux), scope);
         let selector = AuxVar::ContinuationSelector(demux);
         let selector_value = |target: Vertex| {

@@ -140,7 +140,9 @@ impl ConstantPool {
         })
     }
 
-    /// Convenience: intern a reference to a global's address.
+    /// Convenience: intern a reference to a global's address. `ty` is the
+    /// constant's VALUE type -- a pointer -- not the global's own type,
+    /// which lives in the globals table.
     pub fn global_addr(&mut self, ty: TypeRef, global: GlobalId) -> ConstId {
         self.intern(ConstantDef {
             ty,

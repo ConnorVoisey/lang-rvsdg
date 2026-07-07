@@ -21,11 +21,7 @@ impl RVSDGMod {
     /// its body first reads an outer value, so parameter values interleave
     /// with body values in the global array (which is why `Region::params`
     /// is an explicit list).
-    pub(crate) fn append_region_param(
-        &mut self,
-        region: RegionId,
-        ty: TypeRef,
-    ) -> ValueId {
+    pub(crate) fn append_region_param(&mut self, region: RegionId, ty: TypeRef) -> ValueId {
         let index = self.regions[region.0 as usize].params.len() as u32;
         let id = ValueId(self.values.len() as u32);
         self.values.push(Value {
@@ -122,8 +118,7 @@ impl<'a> RegionBuilder<'a> {
         let fn_params = &graph.functions[func_id.0 as usize].params;
 
         let params = {
-            let fn_param_tys: Vec<TypeRef> =
-                fn_params.iter().map(|param| param.ty).collect();
+            let fn_param_tys: Vec<TypeRef> = fn_params.iter().map(|param| param.ty).collect();
             let mut params = Vec::with_capacity(fn_param_tys.len());
             for (i, &ty) in fn_param_tys.iter().enumerate() {
                 params.push(ValueId(graph.values.len() as u32));

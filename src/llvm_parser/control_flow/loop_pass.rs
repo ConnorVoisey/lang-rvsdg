@@ -136,10 +136,7 @@ impl LoopPass<'_> {
     /// another comes first. Distinct components cannot feed each other both
     /// ways (they would be one component), so the order exists; ties are
     /// broken by ascending component id for determinism.
-    fn sibling_topological_order(
-        &self,
-        sccs: &[SccTreeNodeId],
-    ) -> SmallVec<[SccTreeNodeId; 4]> {
+    fn sibling_topological_order(&self, sccs: &[SccTreeNodeId]) -> SmallVec<[SccTreeNodeId; 4]> {
         let count = sccs.len();
         if count == 1 {
             return SmallVec::from_slice(sccs);
@@ -172,9 +169,8 @@ impl LoopPass<'_> {
         }
         // Kahn's algorithm, taking ready components in ascending id order.
         let mut order: SmallVec<[SccTreeNodeId; 4]> = SmallVec::new();
-        let mut ready: SmallVec<[usize; 4]> = (0..count)
-            .filter(|&local| indegree[local] == 0)
-            .collect();
+        let mut ready: SmallVec<[usize; 4]> =
+            (0..count).filter(|&local| indegree[local] == 0).collect();
         while !ready.is_empty() {
             ready.sort_unstable_by_key(|&local| sccs[local].0);
             let local = ready.remove(0);
@@ -200,8 +196,7 @@ impl LoopPass<'_> {
     ) {
         self.generation += 1;
         let generation = self.generation;
-        let mut blocks: SmallVec<[BasicBlockId; 8]> =
-            self.tree.blocks[scc.0 as usize].clone();
+        let mut blocks: SmallVec<[BasicBlockId; 8]> = self.tree.blocks[scc.0 as usize].clone();
         blocks.sort_unstable();
         for &block in &blocks {
             self.in_component[block.0 as usize] = generation;
@@ -247,8 +242,11 @@ impl LoopPass<'_> {
                 .add_aux_vertex(AuxVertexKind::LoopEntryDemux { scc }, &targets, Some(scc))
         });
         let exit_demux = (exit_targets.len() > 1).then(|| {
-            self.overlay
-                .add_aux_vertex(AuxVertexKind::LoopExitDemux { scc }, &exit_targets, body_of)
+            self.overlay.add_aux_vertex(
+                AuxVertexKind::LoopExitDemux { scc },
+                &exit_targets,
+                body_of,
+            )
         });
         // The loop tail: alternative 0 leaves, alternative 1 repeats. An
         // endless loop (no exit arcs) gets an empty fan-out: its repeat is
@@ -287,8 +285,7 @@ impl LoopPass<'_> {
             entries
                 .iter()
                 .position(|&e| e == entry)
-                .expect("repetition/entry arc targets a classified entry vertex")
-                as u32
+                .expect("repetition/entry arc targets a classified entry vertex") as u32
         };
 
         for entry_arc in &classification.entry_arcs {

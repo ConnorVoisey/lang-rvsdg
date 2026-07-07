@@ -212,6 +212,7 @@ impl RVSDGMod {
                 ValueKind::CallIndirect {
                     state,
                     callee,
+                    fn_ty: _,
                     args,
                 } => {
                     self.valid_val(errs, state.0);

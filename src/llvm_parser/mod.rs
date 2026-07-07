@@ -8,8 +8,7 @@ use crate::{
     rvsdg::{
         GlobalId, GlobalInit, InlineHint, Linkage, RVSDGMod, Visibility,
         func::{
-            CallingConvention, FnAttrFlags, FnAttrs, FnDecl, Param, ParamAttrFlags,
-            ParamAttrs,
+            CallingConvention, FnAttrFlags, FnAttrs, FnDecl, Param, ParamAttrFlags, ParamAttrs,
         },
         types::{
             ArrayType, FuncType, PtrType, ScalarType, StructDef, StructField, TypeArena, TypeRef,

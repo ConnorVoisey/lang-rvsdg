@@ -48,10 +48,8 @@ use crate::{
         scc::SccTreeNodeId,
     },
     rvsdg::{
-        ConstValue, MatchArm, RVSDGMod, RegionId, State, ValueId,
-        builder::RegionBuilder,
-        func::FnResult,
-        types::TypeRef,
+        ConstValue, MatchArm, RVSDGMod, RegionId, State, ValueId, builder::RegionBuilder,
+        func::FnResult, types::TypeRef,
     },
 };
 
@@ -86,10 +84,7 @@ pub(in crate::llvm_parser) fn emit_function_body(
     let emitter = Emitter {
         fn_ctx,
         overlay,
-        partitioner: RefCell::new(Partitioner::new(
-            fn_ctx.bb_mapper.blocks.len(),
-            tree.len(),
-        )),
+        partitioner: RefCell::new(Partitioner::new(fn_ctx.bb_mapper.blocks.len(), tree.len())),
     };
 
     let root_collapse = tree.collapse_table(&tree.roots, fn_ctx.bb_mapper.blocks.len());
@@ -274,7 +269,10 @@ impl<'m> Emitter<'m> {
                 })
                 .collect();
             let payloads: Vec<OwnedPayload> = arcs.iter().map(OwnedPayload::of).collect();
-            let partition = self.partitioner.borrow_mut().partition(&view, branch, &seeds);
+            let partition = self
+                .partitioner
+                .borrow_mut()
+                .partition(&view, branch, &seeds);
             (partition, payloads)
         };
         // Zero continuations: every alternative ends the region within
@@ -433,21 +431,19 @@ impl<'m> Emitter<'m> {
         alternatives: usize,
     ) -> color_eyre::Result<ValueId> {
         match branch {
-            Vertex::Block(block) => {
-                match &self.fn_ctx.func.basic_blocks[block.0 as usize].term {
-                    llvm_ir::Terminator::CondBr(cond_br) => {
-                        let condition = lowerer.operand(&cond_br.condition)?;
-                        Ok(lowerer.rb.bool_predicate(condition))
-                    }
-                    llvm_ir::Terminator::Switch(switch) => {
-                        let (predicate, _targets) = lowerer.switch_predicate(switch)?;
-                        Ok(predicate)
-                    }
-                    other => Err(color_eyre::eyre::eyre!(
-                        "branching block with terminator {other:?}"
-                    )),
+            Vertex::Block(block) => match &self.fn_ctx.func.basic_blocks[block.0 as usize].term {
+                llvm_ir::Terminator::CondBr(cond_br) => {
+                    let condition = lowerer.operand(&cond_br.condition)?;
+                    Ok(lowerer.rb.bool_predicate(condition))
                 }
-            }
+                llvm_ir::Terminator::Switch(switch) => {
+                    let (predicate, _targets) = lowerer.switch_predicate(switch)?;
+                    Ok(predicate)
+                }
+                other => Err(color_eyre::eyre::eyre!(
+                    "branching block with terminator {other:?}"
+                )),
+            },
             Vertex::Aux(aux_id) => {
                 let var = match &self.overlay.aux_vertices[aux_id.0 as usize].kind {
                     AuxVertexKind::BranchDemux => AuxVar::ContinuationSelector(aux_id),
@@ -561,17 +557,16 @@ impl<'m> Emitter<'m> {
                 let Vertex::Block(tail_block) = back_edge.source else {
                     unreachable!("a structured back edge starts at a block");
                 };
-                let condition =
-                    match &self.fn_ctx.func.basic_blocks[tail_block.0 as usize].term {
-                        llvm_ir::Terminator::CondBr(cond_br) => {
-                            body_lowerer.operand(&cond_br.condition)?
-                        }
-                        other => {
-                            return Err(color_eyre::eyre::eyre!(
-                                "structured loop tail with terminator {other:?}"
-                            ));
-                        }
-                    };
+                let condition = match &self.fn_ctx.func.basic_blocks[tail_block.0 as usize].term {
+                    llvm_ir::Terminator::CondBr(cond_br) => {
+                        body_lowerer.operand(&cond_br.condition)?
+                    }
+                    other => {
+                        return Err(color_eyre::eyre::eyre!(
+                            "structured loop tail with terminator {other:?}"
+                        ));
+                    }
+                };
                 // CondBr arc 0 is the true alternative. If the back edge is
                 // arc 0, condition true means repeat; otherwise false does.
                 let repeat_when = i64::from(back_edge.index == 0);

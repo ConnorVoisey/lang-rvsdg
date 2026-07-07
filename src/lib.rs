@@ -195,6 +195,13 @@ pub struct Cli {
     #[arg(long = "link", value_name = "FILE")]
     pub(crate) link: Vec<String>,
 
+    /// Extra argument passed verbatim to the final `cc` link step
+    /// (repeatable), e.g. `--link-arg -lm` to link against the math
+    /// library. Placed after the object files so library flags resolve
+    /// the symbols those objects reference.
+    #[arg(long = "link-arg", value_name = "ARG", allow_hyphen_values = true)]
+    pub(crate) link_arg: Vec<String>,
+
     pub(crate) input: String,
 }
 
@@ -209,6 +216,7 @@ impl Cli {
             define: Vec::new(),
             trace: None,
             link: Vec::new(),
+            link_arg: Vec::new(),
             input,
         }
     }
@@ -229,7 +237,7 @@ pub fn run_cli(cli: &Cli) -> color_eyre::Result<Option<u8>> {
     #[cfg(debug_assertions)]
     {
         let errs = rvsdg.verify();
-        if errs.len() > 1 {
+        if !errs.is_empty() {
             eprintln!("RVSDG:");
             eprintln!("{rvsdg}");
             dbg!(errs);
@@ -269,7 +277,17 @@ pub fn run_cli(cli: &Cli) -> color_eyre::Result<Option<u8>> {
             Some(v) => &v.to_string(),
             None => &rvsdg.mod_name,
         };
-        rvsdg.output_with_llvm(output, &cli.link, &cli.include, cli.quiet)?;
+        // Without -o the default output is the module name, which for a
+        // .ll input is the input path itself -- a successful link would
+        // overwrite the input file with the executable. Refuse instead.
+        if Path::new(output).exists()
+            && std::fs::canonicalize(output)? == std::fs::canonicalize(c_file_path)?
+        {
+            color_eyre::eyre::bail!(
+                "output path {output} is the input file; pass -o to choose a different output"
+            );
+        }
+        rvsdg.output_with_llvm(output, &cli.link, &cli.link_arg, &cli.include, cli.quiet)?;
         Ok(None)
     }
 }

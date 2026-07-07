@@ -95,6 +95,7 @@ impl RVSDGMod {
         &self,
         output: &str,
         link_inputs: &[String],
+        link_args: &[String],
         include_dirs: &[String],
         quiet: bool,
     ) -> color_eyre::Result<()> {
@@ -150,11 +151,16 @@ impl RVSDGMod {
         // Link the compiled object together with any extra inputs (e.g. a
         // benchmark harness like PolyBench's `utilities/polybench.c`). `cc`
         // compiles any `.c` inputs and links everything; the `-I` paths are
-        // passed so those sources can find their headers.
+        // passed so those sources can find their headers. The extra link
+        // arguments (e.g. `-lm`) go after every object so library flags
+        // resolve the symbols those objects reference.
         let mut link = Command::new("cc");
         link.arg(obj_arg);
         for input in link_inputs {
             link.arg(input);
+        }
+        for arg in link_args {
+            link.arg(arg);
         }
         for dir in include_dirs {
             link.arg("-I").arg(dir);
@@ -181,10 +187,15 @@ impl RVSDGMod {
         // without using predicates.
         // TODO: replace this implemenation with this https://static.googleusercontent.com/media/research.google.com/en//pubs/archive/43246.pdf
 
-        self.lower_globals(llvm_builder, mapper)?;
+        // Function declarations must precede global initializers: an
+        // initializer can take a function's address (a function-pointer
+        // table), and that FuncAddr resolves through the mapper, which only
+        // has the function once register_fn has declared it. Globals must in
+        // turn precede function bodies, which reference them freely.
         for func in self.functions.iter() {
             self.register_fn(llvm_builder, mapper, func)?;
         }
+        self.lower_globals(llvm_builder, mapper)?;
         for func in self.functions.iter() {
             if func.lambda_val.is_none() {
                 continue; // declaration only, no body to lower

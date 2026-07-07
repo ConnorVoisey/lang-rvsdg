@@ -310,3 +310,37 @@ fn test_38_mixed_continuation_demux() {
 fn test_39_swap_phis() {
     test_c_file("tests/fixtures/c/39_swap_phis.c");
 }
+
+// Reduced from SQLite: a global struct initializer taking a function's
+// address. Globals are lowered before function bodies, so the FuncAddr
+// constant requires every function to be DECLARED (register_fn) before any
+// global initializer is lowered.
+#[test]
+fn test_40_global_fn_ptr() {
+    test_c_file("tests/fixtures/c/40_global_fn_ptr.c");
+}
+
+// Reduced from SQLite: LLVM's icmp accepts pointer operands
+// (`icmp eq ptr %p, null`); the compare lowering must build a pointer
+// compare rather than unwrap the operands as integers.
+#[test]
+fn test_41_ptr_compare() {
+    test_c_file("tests/fixtures/c/41_ptr_compare.c");
+}
+
+// Reduced from SQLite: a function pointer crossing branch joins and a loop
+// header (phi over function addresses). A global/function reference
+// constant's value type must be a pointer, not the referent's type -- a
+// function-typed loop slot has no LLVM value representation.
+#[test]
+fn test_42_fn_ptr_phi() {
+    test_c_file("tests/fixtures/c/42_fn_ptr_phi.c");
+}
+
+// A plain global's address through branch joins and a loop header: the
+// pointer-typed sibling of fixture 42. Guards the value type of GlobalAddr
+// constants (a pointer, never the referent's type).
+#[test]
+fn test_43_global_addr_phi() {
+    test_c_file("tests/fixtures/c/43_global_addr_phi.c");
+}

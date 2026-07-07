@@ -17,6 +17,7 @@ pub mod analysis;
 pub mod branch_pass;
 pub mod emit;
 pub mod loop_pass;
+pub mod oracle;
 pub mod overlay;
 pub mod partition;
 pub mod scopes;

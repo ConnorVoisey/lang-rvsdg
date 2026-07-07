@@ -15,7 +15,12 @@
 //!   - MISMATCH     -- different stdout/exit (the real correctness bug)
 //!   - ICE          -- the RVSDG compiler exited nonzero (unsupported feature / crash)
 //!   - COMPILE-SLOW -- the RVSDG compile exceeded the timeout (possible hang)
-//!   - RUN-TIMEOUT  -- the RVSDG-produced binary hung
+//!   - RUN-TIMEOUT  -- the RVSDG-produced binary hung while clang's finished
+//!   - CLANG-RUN-TIMEOUT -- clang's binary hung while ours finished: a
+//!     behavioral divergence (likely a wrong-path early exit, or a program
+//!     straddling the run timeout)
+//!   - (both-timeout) -- neither binary finished; csmith does not guarantee
+//!     termination, so the program tells us nothing and is skipped
 //!   - (clang-fail) -- the reference didn't compile; the input is skipped
 
 use std::fs;
@@ -128,12 +133,24 @@ enum Outcome {
         elapsed: Duration,
     },
     RunTimeout,
+    /// clang's binary hung while ours exited. Both binaries are unoptimized
+    /// (the reference is compiled at -O0 for an apples-to-apples baseline),
+    /// so this is a behavioral divergence worth triage -- likely an early
+    /// exit down a wrong path, though a program straddling the run timeout
+    /// can also land here through ordinary timing variance.
+    ClangRunTimeout,
+    /// Neither binary finished within the run timeout. The program itself
+    /// (not our codegen) doesn't terminate in time -- not a finding.
+    BothTimeout,
     ClangCompileFail,
 }
 
 impl Outcome {
     fn is_failure(&self) -> bool {
-        !matches!(self, Outcome::Pass { .. } | Outcome::ClangCompileFail)
+        !matches!(
+            self,
+            Outcome::Pass { .. } | Outcome::ClangCompileFail | Outcome::BothTimeout
+        )
     }
     fn label(&self) -> &'static str {
         match self {
@@ -142,6 +159,8 @@ impl Outcome {
             Outcome::Ice { .. } => "ICE",
             Outcome::CompileSlow { .. } => "COMPILE-SLOW",
             Outcome::RunTimeout => "RUN-TIMEOUT",
+            Outcome::ClangRunTimeout => "CLANG-RUN-TIMEOUT",
+            Outcome::BothTimeout => "both-timeout",
             Outcome::ClangCompileFail => "clang-fail",
         }
     }
@@ -263,16 +282,27 @@ fn differential_test(
     }
     let clang_compile = clang_start.elapsed();
 
+    // Run BOTH binaries before classifying a timeout: csmith does not
+    // guarantee termination, so a program that hangs under our codegen AND
+    // under clang's is the program's fault, not ours. Only a one-sided
+    // timeout is a finding.
     let run_timeout = Duration::from_secs(args.run_timeout);
     let (r_run, r_dur) = run_binary(&rvsdg_bin, run_timeout, tmp)?;
-    let r = match r_run {
-        Run::Timeout => return Ok(Outcome::RunTimeout),
-        Run::Ok { stdout, code } => (stdout, code),
-    };
     let (c_run, c_dur) = run_binary(&clang_bin, run_timeout, tmp)?;
-    let c = match c_run {
-        Run::Timeout => return Ok(Outcome::RunTimeout),
-        Run::Ok { stdout, code } => (stdout, code),
+    let (r, c) = match (r_run, c_run) {
+        (Run::Timeout, Run::Timeout) => return Ok(Outcome::BothTimeout),
+        (Run::Timeout, Run::Ok { .. }) => return Ok(Outcome::RunTimeout),
+        (Run::Ok { .. }, Run::Timeout) => return Ok(Outcome::ClangRunTimeout),
+        (
+            Run::Ok {
+                stdout: r_out,
+                code: r_code,
+            },
+            Run::Ok {
+                stdout: c_out,
+                code: c_code,
+            },
+        ) => ((r_out, r_code), (c_out, c_code)),
     };
 
     if r == c {
@@ -397,6 +427,8 @@ struct Stats {
     ice: u64,
     compile_slow: u64,
     run_timeout: u64,
+    clang_run_timeout: u64,
+    both_timeout: u64,
     clang_fail: u64,
     /// Summed over passing programs, so the aggregate compares rvsdg vs clang
     /// on the same corpus (the per-program ratio is reported by `report_single`).
@@ -435,6 +467,8 @@ impl Stats {
                 self.note_compile(*elapsed, tag);
             }
             Outcome::RunTimeout => self.run_timeout += 1,
+            Outcome::ClangRunTimeout => self.clang_run_timeout += 1,
+            Outcome::BothTimeout => self.both_timeout += 1,
             Outcome::ClangCompileFail => self.clang_fail += 1,
         }
     }
@@ -450,6 +484,8 @@ impl Stats {
         println!("  ICE:           {}", self.ice);
         println!("  compile-slow:  {}", self.compile_slow);
         println!("  run-timeout:   {}", self.run_timeout);
+        println!("  clang-run-timeout: {}", self.clang_run_timeout);
+        println!("  both-timeout:  {}", self.both_timeout);
         println!("  clang-fail:    {}", self.clang_fail);
         if self.pass > 0 {
             let n = self.pass as f64;
@@ -582,7 +618,9 @@ fn fuzz(cc: &Path, args: &Args) -> std::io::Result<()> {
         stats.record(tag, outcome);
     }
     stats.print();
-    if stats.mismatch + stats.ice + stats.compile_slow + stats.run_timeout > 0 {
+    // Driven by the same predicate that gates save_finding, so a new
+    // failing outcome can never save files without announcing them.
+    if results.iter().any(|(_, outcome)| outcome.is_failure()) {
         println!("findings saved in {}", args.findings.display());
     }
     Ok(())
@@ -630,6 +668,11 @@ fn report_single(input: &Path, outcome: &Outcome) {
             )
         }
         Outcome::RunTimeout => println!("RUN-TIMEOUT  {}", input.display()),
+        Outcome::ClangRunTimeout => println!("CLANG-RUN-TIMEOUT  {}", input.display()),
+        Outcome::BothTimeout => println!(
+            "both-timeout  {} (program doesn't terminate under either compiler; skipped)",
+            input.display()
+        ),
         Outcome::ClangCompileFail => println!("clang-fail  {} (skipped)", input.display()),
     }
 }

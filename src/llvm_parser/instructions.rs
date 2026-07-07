@@ -1,8 +1,8 @@
 use crate::{
     llvm_parser::{FnCtx, block_mapper::BasicBlockId, control_flow::scopes::SymbolScopes},
     rvsdg::{
-        ArithFlags, BinaryOp, CastOp, FCmpPred, ICmpPred, MatchArm, MemoryOrdering, State,
-        UnaryOp, ValueId,
+        ArithFlags, BinaryOp, CastOp, FCmpPred, ICmpPred, MatchArm, MemoryOrdering, State, UnaryOp,
+        ValueId,
         builder::{AllocaResult, LoadResult, RegionBuilder},
     },
 };
@@ -591,9 +591,7 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
             Operand::LocalOperand { name, .. } => self
                 .scopes
                 .resolve_name(self.rb.graph, name)
-                .ok_or_else(|| {
-                    color_eyre::eyre::eyre!("ssa value {name} used before definition")
-                }),
+                .ok_or_else(|| color_eyre::eyre::eyre!("ssa value {name} used before definition")),
             Operand::ConstantOperand(constant_ref) => {
                 let const_id = self
                     .rb

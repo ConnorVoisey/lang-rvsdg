@@ -300,9 +300,10 @@ fn fmt_node(
         ValueKind::CallIndirect {
             state,
             callee,
+            fn_ty,
             args,
         } => {
-            f.write_str("call_indirect callee ")?;
+            write!(f, "call_indirect {fn_ty} callee ")?;
             fmt_value_ref(f, m, *callee)?;
             f.write_str(" args ")?;
             fmt_value_list(f, m, *args)?;

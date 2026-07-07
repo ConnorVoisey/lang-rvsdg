@@ -3,7 +3,7 @@ use color_eyre::eyre::eyre;
 use crate::rvsdg::{
     FuncId, MatchArm, RegionId, State, Value, ValueId, ValueKind,
     func::CallResult,
-    types::{ScalarType, TypeRef},
+    types::{FuncTypeId, ScalarType, TypeRef, VOID},
 };
 
 use super::{
@@ -103,7 +103,10 @@ impl<'a> RegionBuilder<'a> {
         branch_regions: &[RegionId],
         result_count: u16,
     ) -> GammaResult {
-        debug_assert!(branch_regions.len() >= 2, "gamma requires at least 2 branches");
+        debug_assert!(
+            branch_regions.len() >= 2,
+            "gamma requires at least 2 branches"
+        );
         let inputs_span = self.graph.value_pool.push_slice(inputs);
         let regions = self.graph.region_pool.push_slice(branch_regions);
 
@@ -412,15 +415,18 @@ impl<'a> RegionBuilder<'a> {
         }
     }
 
-    /// Call through a function pointer. The caller must provide the return types
-    /// since they can't be looked up from the function table.
+    /// Call through a function pointer. The caller must provide the callee's
+    /// full signature (interned in the type arena): it can't be looked up
+    /// from the function table, and the callee value's type is an opaque
+    /// pointer. The result projections come from the signature's return
+    /// type.
     #[inline]
     pub fn call_indirect(
         &mut self,
         callee: ValueId,
         state: State,
         args: &[ValueId],
-        return_types: &[TypeRef],
+        fn_ty: FuncTypeId,
     ) -> CallResult {
         let args_span = self.graph.value_pool.push_slice(args);
 
@@ -429,16 +435,18 @@ impl<'a> RegionBuilder<'a> {
             kind: ValueKind::CallIndirect {
                 state,
                 callee,
+                fn_ty,
                 args: args_span,
             },
         });
         let out_state = State(call_val);
 
         let first_res = ValueId(self.graph.values.len() as u32);
-        let result_count = return_types.len() as u16;
+        let ret = self.graph.types.get_fn(fn_ty).ret;
+        let result_count = u16::from(ret != VOID);
         for i in 0..result_count {
             self.add_value(Value {
-                ty: return_types[i as usize],
+                ty: ret,
                 kind: ValueKind::Project {
                     call: call_val,
                     index: i,

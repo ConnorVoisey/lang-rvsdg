@@ -102,9 +102,21 @@ impl RVSDGMod {
                 }
             }
             llvm_ir::Constant::BlockAddress => todo!(),
-            llvm_ir::Constant::GlobalReference { name, ty } => {
+            llvm_ir::Constant::GlobalReference { name, ty: _ } => {
                 let name_str = global_name_string(name);
-                let ty = self.types.convert_type_ref(ty, module)?;
+                // The VALUE of a global reference is always a pointer.
+                // llvm-ir's `ty` field is the referent's type (the pointee
+                // for a global, the signature for a function), which is not
+                // a value type -- stamping it on the constant leaks it into
+                // value positions (e.g. a function pointer crossing a loop
+                // boundary types the slot as a function). The referent type
+                // lives in the globals/functions tables; typed-GEP recovery
+                // reads it from there (const_pointee_type).
+                let ty = TypeRef::Ptr(self.types.intern_ptr(PtrType {
+                    pointee: None,
+                    alias_set: None,
+                    no_escape: false,
+                }));
                 if let Some(&global_id) = self.global_map.get(&name_str) {
                     ConstantDef {
                         ty,

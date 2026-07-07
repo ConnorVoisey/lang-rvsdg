@@ -3,6 +3,7 @@ use thiserror::Error;
 use crate::rvsdg::{ConstId, FuncId, GlobalId, RVSDGMod, RegionId, ValueId};
 
 pub mod ids;
+pub mod predicate_form;
 pub mod scope;
 
 impl RVSDGMod {
@@ -10,6 +11,7 @@ impl RVSDGMod {
         let mut errs = vec![];
         self.verify_ids(&mut errs);
         self.verify_scope(&mut errs);
+        self.verify_predicate_form(&mut errs);
         errs
     }
 }
@@ -40,4 +42,16 @@ pub enum RVSDGVerificationError {
         input_count: usize,
         output_count: usize,
     },
+
+    #[error(
+        "predicate {0} flows into an ordinary operand slot; predicates may only feed a gamma \
+         decision, a theta repetition predicate, or a region result (predicate continuation form)"
+    )]
+    PredicateNonConditionUse(ValueId),
+
+    #[error(
+        "predicate {0} has {1} uses; predicate continuation form allows at most one, so that \
+         control flow reconstruction can trace each predicate to its single consumer"
+    )]
+    PredicateUsedMoreThanOnce(ValueId, u32),
 }

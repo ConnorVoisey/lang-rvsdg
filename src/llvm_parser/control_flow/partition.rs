@@ -96,10 +96,24 @@ impl Partitioner {
             let mut members: Vec<Vertex> = Vec::new();
             let mut worklist: SmallVec<[Vertex; 8]> = SmallVec::new();
 
-            self.count_arc(view, branch, generation, seed.target, &mut worklist, &mut members);
+            self.count_arc(
+                view,
+                branch,
+                generation,
+                seed.target,
+                &mut worklist,
+                &mut members,
+            );
             while let Some(vertex) = worklist.pop() {
                 for out in view.arcs_out(vertex) {
-                    self.count_arc(view, branch, generation, out.target, &mut worklist, &mut members);
+                    self.count_arc(
+                        view,
+                        branch,
+                        generation,
+                        out.target,
+                        &mut worklist,
+                        &mut members,
+                    );
                 }
             }
             arm_members.extend(members.iter().copied());

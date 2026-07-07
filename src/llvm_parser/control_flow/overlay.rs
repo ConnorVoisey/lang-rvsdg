@@ -508,8 +508,7 @@ impl Overlay {
         let rewrite_id = self
             .rewrite_id_of(arc)
             .expect("only assignment-carrying (rewritten) arcs are promoted");
-        let assignments =
-            std::mem::take(&mut self.rewrites[rewrite_id.0 as usize].assignments);
+        let assignments = std::mem::take(&mut self.rewrites[rewrite_id.0 as usize].assignments);
         debug_assert!(!assignments.is_empty(), "promotion of an empty cluster");
         let continuation = self.rewrites[rewrite_id.0 as usize].redirect;
         let promoted = self.add_aux_vertex(
