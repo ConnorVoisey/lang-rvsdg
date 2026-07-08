@@ -48,6 +48,7 @@ use crate::llvm_parser::{
 /// `overlay`. After this, every loop presents as a collapsed vertex with
 /// (at most) a single successor arc, and every loop body is acyclic under
 /// the body view's repetition-arc hiding.
+#[tracing::instrument(name = "loop_pass", skip_all, fields(blocks = mapper.blocks.len(), components = tree.len()))]
 pub(in crate::llvm_parser) fn run_loop_pass(
     mapper: &BasicBlockMapper,
     tree: &SccTree,

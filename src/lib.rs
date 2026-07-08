@@ -6,12 +6,12 @@ use inkwell::OptimizationLevel;
 use inkwell::context::Context;
 use inkwell::targets::{InitializationConfig, Target};
 use llvm_ir::Module;
-use std::fs::read_to_string;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 use tempfile::NamedTempFile;
 use tracing_chrome::{ChromeLayerBuilder, FlushGuard};
+use tracing_subscriber::Layer;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
@@ -53,9 +53,24 @@ pub fn init_chrome_tracing(path: &str) -> color_eyre::Result<FlushGuard> {
         .file(path)
         .include_args(true)
         .build();
+    // Spans only: the chrome trace exists for our #[tracing::instrument]
+    // spans, not for events.
     tracing_subscriber::registry()
-        .with(chrome_layer)
+        .with(
+            chrome_layer.with_filter(tracing_subscriber::filter::filter_fn(|metadata| {
+                metadata.is_span()
+            })),
+        )
         .try_init()?;
+    // `try_init` also installs the log-to-tracing bridge (the tracing-log
+    // feature is forced on by other dependencies through feature
+    // unification). The llvm-ir parser logs per-value records at trace
+    // level, and the bridge pays dynamic-metadata dispatch for every call
+    // even when the record is filtered out -- measured on sqlite3, that
+    // turned a 1-second parse into 19 seconds whenever --trace was active
+    // and made the profile lie about where time goes. Turning the log side
+    // off makes each of those calls a single atomic load.
+    log::set_max_level(log::LevelFilter::Off);
     Ok(guard)
 }
 
@@ -66,22 +81,29 @@ fn c_file_to_mod(
     defines: &[String],
     quiet: bool,
 ) -> color_eyre::Result<Module> {
-    // A `.ll` input is already LLVM IR: skip the clang + opt frontend entirely
-    // and parse it straight through. This is the entry point for a reduced
-    // repro -- `llvm-reduce` minimises the `.ll` our pipeline emits, and the
-    // minimised file is fed back here directly. A `.c` input runs the normal
+    // A `.ll` or `.bc` input is already LLVM IR: skip the clang + opt
+    // frontend entirely and parse it straight through. Text `.ll` is the
+    // entry point for a reduced repro -- `llvm-reduce` minimises the IR our
+    // pipeline emits, and the minimised file is fed back here directly.
+    // Bitcode skips LLVM's text lexer, a modest win (sqlite3, 12MB of
+    // text: 1.2s -> 1.0s whole-compile). A `.c` input runs the normal
     // clang + opt frontend below.
-    if c_file_path.extension().and_then(|e| e.to_str()) == Some("ll") {
-        let _parse_span = tracing::info_span!("llvm_ir_parse").entered();
-        return match Module::from_ir_path(c_file_path) {
-            Ok(v) => Ok(v),
-            Err(e) => Err(color_eyre::eyre::eyre!("failed to parse LLVM IR: {e}")),
-        };
+    match c_file_path.extension().and_then(|e| e.to_str()) {
+        Some("ll") => {
+            let _parse_span = tracing::info_span!("llvm_ir_parse").entered();
+            return Module::from_ir_path(c_file_path)
+                .map_err(|e| color_eyre::eyre::eyre!("failed to parse LLVM IR: {e}"));
+        }
+        Some("bc") => {
+            let _parse_span = tracing::info_span!("llvm_ir_parse").entered();
+            return Module::from_bc_path(c_file_path)
+                .map_err(|e| color_eyre::eyre::eyre!("failed to parse LLVM bitcode: {e}"));
+        }
+        _ => {}
     }
 
-    let ll_file = NamedTempFile::with_suffix(".ll")?;
-    let ll_output = ll_file.path();
-    // let ll_output: PathBuf = "c_mod_llvm.ll".into();
+    let bc_file = NamedTempFile::with_suffix(".bc")?;
+    let bc_output = bc_file.path();
 
     let mut clang = Command::new("clang-19");
     // `-w`: we don't care about clang's warnings on the input here (it's
@@ -119,16 +141,19 @@ fn c_file_to_mod(
     // branch p-demux), and the mid-level optimisation is the RVSDG's job, so
     // letting LLVM do it would both pre-empt that work and bias any later
     // benchmark of our optimisations against LLVM's.
-    let ll_output_str = ll_output
+    let bc_output_str = bc_output
         .to_str()
-        .ok_or_else(|| color_eyre::eyre::eyre!("temporary .ll path is not valid UTF-8"))?;
+        .ok_or_else(|| color_eyre::eyre::eyre!("temporary .bc path is not valid UTF-8"))?;
     let clang_stdout = clang_cmd.stdout.ok_or_else(|| {
         color_eyre::eyre::eyre!("clang-19 produced no stdout to pipe into opt-19")
     })?;
     {
         let _span = tracing::info_span!("frontend_clang_opt").entered();
+        // Bitcode out (no `-S`): the file exists only to hand the module
+        // to the parser, and bitcode skips LLVM's text lexer on the way
+        // back in.
         let status = Command::new("opt-19")
-            .args(["-passes=mem2reg", "-S", "-o", ll_output_str])
+            .args(["-passes=mem2reg", "-o", bc_output_str])
             .stdin(clang_stdout)
             .stdout(Stdio::piped())
             .status()?;
@@ -138,15 +163,21 @@ fn c_file_to_mod(
     }
 
     // Diagnostics go to stderr so a compiled program's own stdout (e.g. a
-    // csmith checksum) is never mixed with compiler logging.
+    // csmith checksum) is never mixed with compiler logging. The bitcode is
+    // disassembled on demand; this path is for humans, not the pipeline.
     if !quiet {
-        let llvm_ir_full_text = read_to_string(&ll_output)?;
-        eprintln!("Parsed LLVM IR (text): {llvm_ir_full_text}");
+        let dis = Command::new("llvm-dis-19")
+            .args([bc_output_str, "-o", "-"])
+            .output()?;
+        eprintln!(
+            "Parsed LLVM IR (text): {}",
+            String::from_utf8_lossy(&dis.stdout)
+        );
     }
 
     let _parse_span = tracing::info_span!("llvm_ir_parse").entered();
-    let module = Module::from_ir_path(&ll_output)
-        .map_err(|e| color_eyre::eyre::eyre!("failed to parse LLVM IR: {e}"))?;
+    let module = Module::from_bc_path(bc_output)
+        .map_err(|e| color_eyre::eyre::eyre!("failed to parse LLVM bitcode: {e}"))?;
 
     Ok(module)
 }

@@ -41,7 +41,7 @@ use crate::{
             analysis::signature::{phi_incoming_from, phi_instructions_at},
             overlay::{AuxAssign, AuxVar, AuxVertexKind, Overlay, Vertex},
             partition::{Partitioner, SeedArc},
-            scopes::{Frame, Symbol},
+            scopes::{Frame, RET_VAL, SymbolId},
             view::{Membership, PhiCopies, RegionView, TraversedArc},
         },
         instructions::RegionLowerer,
@@ -74,6 +74,7 @@ impl EmitRegion<'_> {
 
 /// Emit one function's body from its restructuring overlay. The caller has
 /// seeded the root frame with the function parameters.
+#[tracing::instrument(name = "emit", skip_all, fields(blocks = lowerer.fn_ctx.bb_mapper.blocks.len()))]
 pub(in crate::llvm_parser) fn emit_function_body(
     lowerer: &mut RegionLowerer<'_, '_, '_>,
     overlay: &Overlay,
@@ -85,6 +86,7 @@ pub(in crate::llvm_parser) fn emit_function_body(
         fn_ctx,
         overlay,
         partitioner: RefCell::new(Partitioner::new(fn_ctx.bb_mapper.blocks.len(), tree.len())),
+        scratch: RefCell::new(EmitScratch::default()),
     };
 
     let root_collapse = tree.collapse_table(&tree.roots, fn_ctx.bb_mapper.blocks.len());
@@ -98,7 +100,7 @@ pub(in crate::llvm_parser) fn emit_function_body(
     let values = if matches!(fn_ctx.func.return_type.as_ref(), llvm_ir::Type::VoidType) {
         Vec::new()
     } else {
-        let value = match lowerer.scopes.resolve(lowerer.rb.graph, &Symbol::RetVal) {
+        let value = match lowerer.scopes.resolve_id(lowerer.rb.graph, RET_VAL) {
             Some(value) => value,
             None => {
                 // Every path diverges: the function result is unreachable.
@@ -123,6 +125,28 @@ struct Emitter<'m> {
     /// before any nested emission starts, so the borrow is never held
     /// across recursion.
     partitioner: RefCell<Partitioner>,
+    /// Reused assembly buffers (see [`EmitScratch`]). Borrowed only during
+    /// a gamma's or theta's assembly phase, which never nests: an inner
+    /// construct's assembly completes during the outer construct's arm or
+    /// body EMISSION, before the outer assembly begins.
+    scratch: RefCell<EmitScratch>,
+}
+
+/// Assembly-phase buffers reused across every gamma and theta of a
+/// function, so steady-state assembly allocates nothing: the symbol-union
+/// containers keep their capacity across `clear()`.
+#[derive(Default)]
+struct EmitScratch {
+    /// Dedupe set for the output/slot union.
+    seen: FxHashSet<SymbolId>,
+    /// Union of written symbols (gamma outputs / theta slots), in order.
+    symbols: Vec<SymbolId>,
+    /// Gamma input symbol -> index into `input_values`.
+    input_index: FxHashMap<SymbolId, u32>,
+    input_symbols: Vec<SymbolId>,
+    input_values: Vec<ValueId>,
+    output_types: Vec<TypeRef>,
+    results: Vec<ValueId>,
 }
 
 impl<'m> Emitter<'m> {
@@ -167,7 +191,7 @@ impl<'m> Emitter<'m> {
                     {
                         for assign in assignments {
                             let value = lowerer.rb.const_i32(assign.value as i32);
-                            lowerer.scopes.bind(Symbol::Aux(assign.var), value);
+                            lowerer.scopes.bind_aux(assign.var, value);
                         }
                     }
                     // Demux kinds carry no computation; their branch is
@@ -236,7 +260,7 @@ impl<'m> Emitter<'m> {
             llvm_ir::Terminator::Ret(ret) => {
                 if let Some(operand) = &ret.return_operand {
                     let value = lowerer.operand(operand)?;
-                    lowerer.scopes.bind(Symbol::RetVal, value);
+                    lowerer.scopes.bind_id(RET_VAL, value);
                 }
                 Ok(())
             }
@@ -323,55 +347,66 @@ impl<'m> Emitter<'m> {
         // Assembly, afterwards. Outputs: the union of written symbols in
         // arm order (deterministic). Inputs: the union of captured symbols,
         // plus outputs already bound in the enclosing scope (so alternatives
-        // that did not write one pass the enclosing value through).
-        let mut outputs: Vec<Symbol> = Vec::new();
-        let mut output_seen: FxHashSet<Symbol> = FxHashSet::default();
+        // that did not write one pass the enclosing value through). The
+        // buffers are the emitter's reused scratch; assembly never nests,
+        // so the borrow is never held across another construct's assembly.
+        let mut scratch = self.scratch.borrow_mut();
+        let EmitScratch {
+            seen: output_seen,
+            symbols: outputs,
+            input_index,
+            input_symbols,
+            input_values,
+            output_types,
+            results,
+        } = &mut *scratch;
+        output_seen.clear();
+        outputs.clear();
+        input_index.clear();
+        input_symbols.clear();
+        input_values.clear();
+        output_types.clear();
+
         for frame in &arm_frames {
-            for symbol in &frame.write_order {
-                if output_seen.insert(symbol.clone()) {
-                    outputs.push(symbol.clone());
+            for &symbol in &frame.write_order {
+                if output_seen.insert(symbol) {
+                    outputs.push(symbol);
                 }
             }
         }
 
-        let mut input_symbols: Vec<Symbol> = Vec::new();
-        let mut input_values: Vec<ValueId> = Vec::new();
-        let mut input_index: FxHashMap<Symbol, usize> = FxHashMap::default();
         for frame in &arm_frames {
             for capture in &frame.captures {
                 if !input_index.contains_key(&capture.symbol) {
-                    input_index.insert(capture.symbol.clone(), input_symbols.len());
-                    input_symbols.push(capture.symbol.clone());
+                    input_index.insert(capture.symbol, input_symbols.len() as u32);
+                    input_symbols.push(capture.symbol);
                     input_values.push(capture.outer);
                 }
             }
         }
-        for symbol in &outputs {
-            if input_index.contains_key(symbol) {
+        for &symbol in outputs.iter() {
+            if input_index.contains_key(&symbol) {
                 continue;
             }
-            if let Some(value) = lowerer.scopes.resolve(lowerer.rb.graph, symbol) {
-                input_index.insert(symbol.clone(), input_symbols.len());
-                input_symbols.push(symbol.clone());
+            if let Some(value) = lowerer.scopes.resolve_id(lowerer.rb.graph, symbol) {
+                input_index.insert(symbol, input_symbols.len() as u32);
+                input_symbols.push(symbol);
                 input_values.push(value);
             }
         }
 
         // The poison type for an output an alternative never binds: taken
         // from a sibling's written value.
-        let output_types: Vec<TypeRef> = outputs
-            .iter()
-            .map(|symbol| {
-                let written = arm_frames.iter().find_map(|frame| {
-                    frame
-                        .final_value(symbol)
-                        .filter(|binding| binding.written)
-                        .map(|binding| binding.value)
-                });
-                let value = written.expect("every output symbol comes from a write");
-                lowerer.rb.graph.values[value.0 as usize].ty
-            })
-            .collect();
+        for &symbol in outputs.iter() {
+            let written = arm_frames.iter().find_map(|frame| {
+                frame
+                    .final_value(symbol)
+                    .filter(|binding| binding.written)
+                    .map(|binding| binding.value)
+            });
+            let value = written.expect("every output symbol comes from a write");
+            output_types.push(lowerer.rb.graph.values[value.0 as usize].ty);
+        }
 
         // Align every region's parameters to the canonical input order and
         // set its results.
@@ -379,11 +414,11 @@ impl<'m> Emitter<'m> {
             let region_id = arm_regions[index];
             let graph: &mut RVSDGMod = lowerer.rb.graph;
             let mut params: Vec<ValueId> = Vec::with_capacity(input_symbols.len());
-            for (i, symbol) in input_symbols.iter().enumerate() {
+            for (i, &symbol) in input_symbols.iter().enumerate() {
                 let existing = frame
                     .captures
                     .iter()
-                    .find(|capture| &capture.symbol == symbol)
+                    .find(|capture| capture.symbol == symbol)
                     .map(|capture| capture.param);
                 let param = existing.unwrap_or_else(|| {
                     let ty = graph.values[input_values[i].0 as usize].ty;
@@ -393,30 +428,33 @@ impl<'m> Emitter<'m> {
             }
             graph.set_region_params(region_id, params.clone());
 
-            let mut results: Vec<ValueId> = Vec::with_capacity(outputs.len());
-            for (o, symbol) in outputs.iter().enumerate() {
+            results.clear();
+            for (o, &symbol) in outputs.iter().enumerate() {
                 let value = if let Some(binding) = frame.final_value(symbol) {
                     binding.value
-                } else if let Some(&i) = input_index.get(symbol) {
-                    params[i]
+                } else if let Some(&i) = input_index.get(&symbol) {
+                    params[i as usize]
                 } else {
                     RegionBuilder::over(graph, region_id)
                         .constant(output_types[o], ConstValue::Poison)
                 };
                 results.push(value);
             }
-            graph.set_region_results(region_id, &results);
+            graph.set_region_results(region_id, results);
         }
 
         let result = lowerer.rb.finish_gamma(
             predicate,
             state,
-            &input_values,
+            input_values,
             &arm_regions,
             outputs.len() as u16,
         );
-        for (o, symbol) in outputs.iter().enumerate() {
-            lowerer.scopes.bind(symbol.clone(), result.result(o as u16));
+        for (o, &symbol) in outputs.iter().enumerate() {
+            lowerer.scopes.bind_id(symbol, result.result(o as u16));
+        }
+        for frame in arm_frames {
+            lowerer.scopes.recycle_frame(frame);
         }
         Ok((result.state, join))
     }
@@ -457,7 +495,7 @@ impl<'m> Emitter<'m> {
                 };
                 let selector = lowerer
                     .scopes
-                    .resolve(lowerer.rb.graph, &Symbol::Aux(var))
+                    .resolve_aux(lowerer.rb.graph, var)
                     .ok_or_else(|| {
                         color_eyre::eyre::eyre!("demux selector {var:?} read before assignment")
                     })?;
@@ -536,7 +574,7 @@ impl<'m> Emitter<'m> {
             if is_restructured {
                 let repeat = body_lowerer
                     .scopes
-                    .resolve(body_lowerer.rb.graph, &Symbol::Aux(repeat_var))
+                    .resolve_aux(body_lowerer.rb.graph, repeat_var)
                     .ok_or_else(|| {
                         color_eyre::eyre::eyre!("loop repeat flag unbound at body end")
                     })?;
@@ -584,28 +622,38 @@ impl<'m> Emitter<'m> {
         let frame = lowerer.scopes.pop_frame();
 
         // Assembly, afterwards. Slots: the frame's captures in capture
-        // order, then written-only symbols in first-write order.
-        let mut slots: Vec<Symbol> = Vec::new();
-        let mut slot_seen: FxHashSet<Symbol> = FxHashSet::default();
+        // order, then written-only symbols in first-write order. Buffers
+        // come from the emitter's reused scratch (assembly never nests).
+        let mut scratch = self.scratch.borrow_mut();
+        let EmitScratch {
+            seen: slot_seen,
+            symbols: slots,
+            input_values: loop_var_inputs,
+            results: next_values,
+            ..
+        } = &mut *scratch;
+        slot_seen.clear();
+        slots.clear();
+        loop_var_inputs.clear();
+        next_values.clear();
+
         for capture in &frame.captures {
-            if slot_seen.insert(capture.symbol.clone()) {
-                slots.push(capture.symbol.clone());
+            if slot_seen.insert(capture.symbol) {
+                slots.push(capture.symbol);
             }
         }
-        for symbol in &frame.write_order {
-            if slot_seen.insert(symbol.clone()) {
-                slots.push(symbol.clone());
+        for &symbol in &frame.write_order {
+            if slot_seen.insert(symbol) {
+                slots.push(symbol);
             }
         }
 
-        let mut loop_var_inputs: Vec<ValueId> = Vec::with_capacity(slots.len());
         let mut params: Vec<ValueId> = Vec::with_capacity(slots.len());
-        let mut next_values: Vec<ValueId> = Vec::with_capacity(slots.len());
-        for symbol in &slots {
+        for &symbol in slots.iter() {
             let existing_capture = frame
                 .captures
                 .iter()
-                .find(|capture| &capture.symbol == symbol);
+                .find(|capture| capture.symbol == symbol);
             let final_value = frame
                 .final_value(symbol)
                 .expect("every slot symbol is bound in the body frame")
@@ -622,7 +670,7 @@ impl<'m> Emitter<'m> {
                     // loop), or poison when there is none (for example
                     // another entry vertex's phis on the entering path).
                     let ty = lowerer.rb.graph.values[final_value.0 as usize].ty;
-                    let init = match lowerer.scopes.resolve(lowerer.rb.graph, symbol) {
+                    let init = match lowerer.scopes.resolve_id(lowerer.rb.graph, symbol) {
                         Some(value) => value,
                         None => lowerer.rb.constant(ty, ConstValue::Poison),
                     };
@@ -635,24 +683,23 @@ impl<'m> Emitter<'m> {
         lowerer
             .rb
             .graph
-            .set_region_results(body_region_id, &next_values);
+            .set_region_results(body_region_id, next_values);
 
         let result = lowerer
             .rb
-            .finish_theta(state, &loop_var_inputs, body_region_id, condition);
+            .finish_theta(state, loop_var_inputs, body_region_id, condition);
 
         // Only written symbols rebind (a capture that was never written
         // just passed through; its enclosing binding is still the value).
-        for (index, symbol) in slots.iter().enumerate() {
+        for (index, &symbol) in slots.iter().enumerate() {
             let written = frame
                 .final_value(symbol)
                 .is_some_and(|binding| binding.written);
             if written {
-                lowerer
-                    .scopes
-                    .bind(symbol.clone(), result.result(index as u16));
+                lowerer.scopes.bind_id(symbol, result.result(index as u16));
             }
         }
+        lowerer.scopes.recycle_frame(frame);
         Ok(result.state)
     }
 }
@@ -685,12 +732,13 @@ impl OwnedPayload {
                 emitter.bind_return_value(lowerer, copies.from)?;
             } else {
                 let bb = &emitter.fn_ctx.func.basic_blocks[copies.block.0 as usize];
-                let mut resolved: SmallVec<[(Name, ValueId); 4]> = SmallVec::new();
-                for phi in &phi_instructions_at(bb) {
+                let phis = phi_instructions_at(bb);
+                let mut resolved: SmallVec<[(&Name, ValueId); 4]> = SmallVec::new();
+                for phi in &phis {
                     if let Some((operand, _)) =
                         phi_incoming_from(phi, emitter.fn_ctx.bb_mapper, |p| p == copies.from)
                     {
-                        resolved.push((phi.dest.clone(), lowerer.operand(operand)?));
+                        resolved.push((&phi.dest, lowerer.operand(operand)?));
                     }
                 }
                 for (name, value) in resolved {
@@ -700,7 +748,7 @@ impl OwnedPayload {
         }
         for assign in &self.assignments {
             let value = lowerer.rb.const_i32(assign.value as i32);
-            lowerer.scopes.bind(Symbol::Aux(assign.var), value);
+            lowerer.scopes.bind_aux(assign.var, value);
         }
         Ok(())
     }

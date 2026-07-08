@@ -58,6 +58,7 @@ struct FnCtx<'m> {
 /// dropping its arcs is sound and keeps the loop analysis honest. Unreachable
 /// blocks stay interned (ids must keep matching `func.basic_blocks` indices) but
 /// end up arc-isolated, so the construction walk never reaches them.
+#[tracing::instrument(name = "intern_blocks", skip_all, fields(blocks = func.basic_blocks.len()))]
 fn intern_blocks_and_arcs(func: &llvm_ir::Function) -> BasicBlockMapper {
     let mut bb_mapper = BasicBlockMapper::new(func.basic_blocks.len());
     for block in &func.basic_blocks {
@@ -283,7 +284,7 @@ impl RVSDGMod {
             // Register function parameters as root-frame bindings.
             for (i, param) in func.parameters.iter().enumerate() {
                 let value = rb.param(i as u32);
-                scopes.bind_name(param.name.clone(), value);
+                scopes.bind_name(&param.name, value);
             }
             let mut builder = RegionLowerer::new(rb, &mut scopes, &fn_ctx);
             control_flow::emit::emit_function_body(&mut builder, &overlay, state)

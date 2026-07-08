@@ -15,7 +15,7 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
             .types
             .convert_type_ref(&llvm_ty, self.fn_ctx.llvm_mod)?;
         let val = self.rb.extract_lane(vector, index, element_type);
-        self.scopes.bind_name(inst.dest.clone(), val);
+        self.scopes.bind_name(&inst.dest, val);
         Ok(val)
     }
 
@@ -33,7 +33,7 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
             .types
             .convert_type_ref(&llvm_ty, self.fn_ctx.llvm_mod)?;
         let val = self.rb.insert_lane(vector, index, element, vector_type);
-        self.scopes.bind_name(inst.dest.clone(), val);
+        self.scopes.bind_name(&inst.dest, val);
         Ok(val)
     }
 }

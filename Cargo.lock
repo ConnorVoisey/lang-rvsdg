@@ -381,6 +381,7 @@ dependencies = [
  "either",
  "inkwell",
  "llvm-ir",
+ "log",
  "pretty_assertions",
  "rayon",
  "rustc-hash",

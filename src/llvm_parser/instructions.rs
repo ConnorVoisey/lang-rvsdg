@@ -323,7 +323,7 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
             .graph
             .types
             .convert_type_ref(&llvm_ty, self.fn_ctx.llvm_mod)?;
-        let dest = inst.get_result().clone();
+        let dest = inst.get_result();
         let val = self.rb.binary(op, flags, left, right, ty);
         self.scopes.bind_name(dest, val);
         Ok(val)
@@ -340,7 +340,7 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
             .graph
             .types
             .convert_type_ref(&llvm_ty, self.fn_ctx.llvm_mod)?;
-        let dest = inst.get_result().clone();
+        let dest = inst.get_result();
         let val = self.rb.unary(op, operand, ty);
         self.scopes.bind_name(dest, val);
         Ok(val)
@@ -357,7 +357,7 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
             .graph
             .types
             .convert_type_ref(&llvm_ty, self.fn_ctx.llvm_mod)?;
-        let dest = inst.get_result().clone();
+        let dest = inst.get_result();
         let val = self.rb.cast(op, operand, ty);
         self.scopes.bind_name(dest, val);
         Ok(val)
@@ -375,7 +375,7 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
             .types
             .convert_type_ref(&llvm_ty, self.fn_ctx.llvm_mod)?;
         let val = self.rb.extract_field(aggregate, &inst.indices, field_type);
-        self.scopes.bind_name(inst.dest.clone(), val);
+        self.scopes.bind_name(&inst.dest, val);
         Ok(val)
     }
 
@@ -394,7 +394,7 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
         let val = self
             .rb
             .insert_field(aggregate, element, &inst.indices, aggregate_type);
-        self.scopes.bind_name(inst.dest.clone(), val);
+        self.scopes.bind_name(&inst.dest, val);
         Ok(val)
     }
 
@@ -422,7 +422,7 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
         let val = self
             .rb
             .ptr_offset(base, base_type, &indices, result_type, inst.in_bounds);
-        self.scopes.bind_name(inst.dest.clone(), val);
+        self.scopes.bind_name(&inst.dest, val);
         Ok(val)
     }
 
@@ -431,7 +431,7 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
         let right = self.operand(&inst.operand1)?;
         let pred = convert_int_pred(inst.predicate);
         let val = self.rb.icmp(pred, left, right);
-        self.scopes.bind_name(inst.dest.clone(), val);
+        self.scopes.bind_name(&inst.dest, val);
         Ok(val)
     }
 
@@ -440,7 +440,7 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
         let right = self.operand(&inst.operand1)?;
         let pred = convert_fp_pred(inst.predicate);
         let val = self.rb.fcmp(pred, left, right);
-        self.scopes.bind_name(inst.dest.clone(), val);
+        self.scopes.bind_name(&inst.dest, val);
         Ok(val)
     }
 
@@ -467,7 +467,7 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
             ),
             None => self.rb.load(state, addr, loaded_type, align, inst.volatile),
         };
-        self.scopes.bind_name(inst.dest.clone(), result.value);
+        self.scopes.bind_name(&inst.dest, result.value);
         Ok(result)
     }
 
@@ -511,7 +511,7 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
             .convert_type_ref(&llvm_ptr_ty, self.fn_ctx.llvm_mod)?;
 
         let result = self.rb.alloca(state, elem_type, count, ptr_type);
-        self.scopes.bind_name(inst.dest.clone(), result.ptr);
+        self.scopes.bind_name(&inst.dest, result.ptr);
         Ok(result)
     }
 
@@ -531,7 +531,7 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
             .types
             .convert_type_ref(&llvm_ty, self.fn_ctx.llvm_mod)?;
         let val = self.rb.ternary(cond, t, f, ty);
-        self.scopes.bind_name(inst.dest.clone(), val);
+        self.scopes.bind_name(&inst.dest, val);
         Ok(val)
     }
 
@@ -546,7 +546,7 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
             .graph
             .types
             .convert_type_ref(&llvm_ty, self.fn_ctx.llvm_mod)?;
-        let dest = inst.get_result().clone();
+        let dest = inst.get_result();
         let val = self.rb.freeze(operand, ty);
         self.scopes.bind_name(dest, val);
         Ok(val)

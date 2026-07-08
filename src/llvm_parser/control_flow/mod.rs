@@ -29,6 +29,7 @@ pub mod view;
 /// one continuation point). The result is a full description of the
 /// restructured control flow graph; emission is then a mechanical walk.
 /// `diverging[b]` marks blocks whose terminator has no successors.
+#[tracing::instrument(name = "build_overlay", skip_all)]
 pub(in crate::llvm_parser) fn build_overlay(
     mapper: &crate::llvm_parser::block_mapper::BasicBlockMapper,
     tree: &crate::llvm_parser::scc::SccTree,

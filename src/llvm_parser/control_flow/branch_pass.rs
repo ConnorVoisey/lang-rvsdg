@@ -71,6 +71,7 @@ fn make_view<'v>(
 /// Run the branch pass over the function root and, recursively, every loop
 /// body and branch alternative. Requires the loop pass to have run (every
 /// region is acyclic under the views this pass builds).
+#[tracing::instrument(name = "branch_pass", skip_all, fields(blocks = mapper.blocks.len()))]
 pub(in crate::llvm_parser) fn run_branch_pass(
     mapper: &BasicBlockMapper,
     tree: &SccTree,
