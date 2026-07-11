@@ -109,7 +109,7 @@ impl RVSDGMod {
         // Add back-edge incoming to phis
         for (i, (phi, result)) in phis.iter().zip(results.iter()).enumerate() {
             phi.add_incoming(&[(result as &dyn BasicValue, actual_bb)]);
-            let project_id = ValueId(theta_id.0 + 1 + i as u32);
+            let project_id = self.projection_of(theta_id, i as u16);
             mapper.set_val(project_id, *result);
         }
         llvm_builder.builder.position_at_end(exit_bb);
@@ -137,35 +137,37 @@ mod tests {
         // `!= 0`. => 10
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
-        rvsdg.define_fn(func_id, |rb, state| {
-            let x = rb.const_i32(0);
-            let res = rb.theta(state, &[x], |rb| {
-                let loop_x = rb.param(0);
-                let one = rb.const_i32(1);
-                let next_x = rb.binary(BinaryOp::Add, ArithFlags::default(), loop_x, one, I32);
-                let ten = rb.const_i32(10);
-                let still_looping = rb.icmp(ICmpPred::SignedLt, next_x, ten);
-                // true (still looping) -> alternative 1 (repeat); else default 0 (exit).
-                let r = rb.match_op(
-                    still_looping,
-                    &[MatchArm {
-                        value: 1,
-                        alternative: 1,
-                    }],
-                    0,
-                    2,
-                );
-                Ok(LoopResult {
-                    condition: r,
-                    next_state: state,
-                    next_vars: vec![next_x],
+        rvsdg
+            .define_fn(func_id, |rb, state| {
+                let x = rb.const_i32(0);
+                let res = rb.theta(state, &[x], |rb| {
+                    let loop_x = rb.param(0);
+                    let one = rb.const_i32(1);
+                    let next_x = rb.binary(BinaryOp::Add, ArithFlags::default(), loop_x, one, I32);
+                    let ten = rb.const_i32(10);
+                    let still_looping = rb.icmp(ICmpPred::SignedLt, next_x, ten);
+                    // true (still looping) -> alternative 1 (repeat); else default 0 (exit).
+                    let r = rb.match_op(
+                        still_looping,
+                        &[MatchArm {
+                            value: 1,
+                            alternative: 1,
+                        }],
+                        0,
+                        2,
+                    );
+                    Ok(LoopResult {
+                        condition: r,
+                        next_state: state,
+                        next_vars: vec![next_x],
+                    })
+                })?;
+                Ok(FnResult {
+                    state: res.state,
+                    values: vec![res.result(0)],
                 })
-            })?;
-            Ok(FnResult {
-                state: res.state,
-                values: vec![res.result(0)],
             })
-        });
+            .unwrap();
 
         assert_eq!(jit_run_i32(&rvsdg, "test"), 10);
     }
@@ -177,25 +179,27 @@ mod tests {
         // => 10
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
-        rvsdg.define_fn(func_id, |rb, state| {
-            let x = rb.const_i32(0);
-            let res = rb.theta(state, &[x], |rb| {
-                let loop_x = rb.param(0);
-                let one = rb.const_i32(1);
-                let next_x = rb.binary(BinaryOp::Add, ArithFlags::default(), loop_x, one, I32);
-                let ten = rb.const_i32(10);
-                let condition = rb.icmp(ICmpPred::SignedLt, next_x, ten);
-                Ok(LoopResult {
-                    condition,
-                    next_state: state,
-                    next_vars: vec![next_x],
+        rvsdg
+            .define_fn(func_id, |rb, state| {
+                let x = rb.const_i32(0);
+                let res = rb.theta(state, &[x], |rb| {
+                    let loop_x = rb.param(0);
+                    let one = rb.const_i32(1);
+                    let next_x = rb.binary(BinaryOp::Add, ArithFlags::default(), loop_x, one, I32);
+                    let ten = rb.const_i32(10);
+                    let condition = rb.icmp(ICmpPred::SignedLt, next_x, ten);
+                    Ok(LoopResult {
+                        condition,
+                        next_state: state,
+                        next_vars: vec![next_x],
+                    })
+                })?;
+                Ok(FnResult {
+                    state: res.state,
+                    values: vec![res.result(0)],
                 })
-            })?;
-            Ok(FnResult {
-                state: res.state,
-                values: vec![res.result(0)],
             })
-        });
+            .unwrap();
 
         assert_eq!(jit_run_i32(&rvsdg, "test"), 10);
     }
@@ -207,24 +211,26 @@ mod tests {
         // => 5
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
-        rvsdg.define_fn(func_id, |rb, state| {
-            let x = rb.const_i32(0);
-            let res = rb.theta(state, &[x], |rb| {
-                let loop_x = rb.param(0);
-                let five = rb.const_i32(5);
-                let next_x = rb.binary(BinaryOp::Add, ArithFlags::default(), loop_x, five, I32);
-                let condition = rb.constant(BOOL, ConstValue::Int(0));
-                Ok(LoopResult {
-                    condition,
-                    next_state: state,
-                    next_vars: vec![next_x],
+        rvsdg
+            .define_fn(func_id, |rb, state| {
+                let x = rb.const_i32(0);
+                let res = rb.theta(state, &[x], |rb| {
+                    let loop_x = rb.param(0);
+                    let five = rb.const_i32(5);
+                    let next_x = rb.binary(BinaryOp::Add, ArithFlags::default(), loop_x, five, I32);
+                    let condition = rb.constant(BOOL, ConstValue::Int(0));
+                    Ok(LoopResult {
+                        condition,
+                        next_state: state,
+                        next_vars: vec![next_x],
+                    })
+                })?;
+                Ok(FnResult {
+                    state: res.state,
+                    values: vec![res.result(0)],
                 })
-            })?;
-            Ok(FnResult {
-                state: res.state,
-                values: vec![res.result(0)],
             })
-        });
+            .unwrap();
 
         assert_eq!(jit_run_i32(&rvsdg, "test"), 5);
     }
@@ -237,39 +243,41 @@ mod tests {
         // returns x * y = 250
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
-        rvsdg.define_fn(func_id, |rb, state| {
-            let x = rb.const_i32(0);
-            let y = rb.const_i32(100);
-            let res = rb.theta(state, &[x, y], |rb| {
-                let loop_x = rb.param(0);
-                let loop_y = rb.param(1);
-                let one = rb.const_i32(1);
-                let ten = rb.const_i32(10);
-                let next_x = rb.binary(BinaryOp::Add, ArithFlags::default(), loop_x, one, I32);
-                let next_y = rb.binary(BinaryOp::Sub, ArithFlags::default(), loop_y, ten, I32);
-                let five = rb.const_i32(5);
-                let condition = rb.icmp(ICmpPred::SignedLt, next_x, five);
-                Ok(LoopResult {
-                    condition,
-                    next_state: state,
-                    next_vars: vec![next_x, next_y],
+        rvsdg
+            .define_fn(func_id, |rb, state| {
+                let x = rb.const_i32(0);
+                let y = rb.const_i32(100);
+                let res = rb.theta(state, &[x, y], |rb| {
+                    let loop_x = rb.param(0);
+                    let loop_y = rb.param(1);
+                    let one = rb.const_i32(1);
+                    let ten = rb.const_i32(10);
+                    let next_x = rb.binary(BinaryOp::Add, ArithFlags::default(), loop_x, one, I32);
+                    let next_y = rb.binary(BinaryOp::Sub, ArithFlags::default(), loop_y, ten, I32);
+                    let five = rb.const_i32(5);
+                    let condition = rb.icmp(ICmpPred::SignedLt, next_x, five);
+                    Ok(LoopResult {
+                        condition,
+                        next_state: state,
+                        next_vars: vec![next_x, next_y],
+                    })
+                })?;
+                // x * y = 5 * 50 = 250
+                let result_x = res.result(0);
+                let result_y = res.result(1);
+                let product = rb.binary(
+                    BinaryOp::Mul,
+                    ArithFlags::default(),
+                    result_x,
+                    result_y,
+                    I32,
+                );
+                Ok(FnResult {
+                    state: res.state,
+                    values: vec![product],
                 })
-            })?;
-            // x * y = 5 * 50 = 250
-            let result_x = res.result(0);
-            let result_y = res.result(1);
-            let product = rb.binary(
-                BinaryOp::Mul,
-                ArithFlags::default(),
-                result_x,
-                result_y,
-                I32,
-            );
-            Ok(FnResult {
-                state: res.state,
-                values: vec![product],
             })
-        });
+            .unwrap();
 
         assert_eq!(jit_run_i32(&rvsdg, "test"), 250);
     }
@@ -281,25 +289,27 @@ mod tests {
         // => 0
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
-        rvsdg.define_fn(func_id, |rb, state| {
-            let x = rb.const_i32(10);
-            let res = rb.theta(state, &[x], |rb| {
-                let loop_x = rb.param(0);
-                let one = rb.const_i32(1);
-                let next_x = rb.binary(BinaryOp::Sub, ArithFlags::default(), loop_x, one, I32);
-                let zero = rb.const_i32(0);
-                let condition = rb.icmp(ICmpPred::SignedGt, next_x, zero);
-                Ok(LoopResult {
-                    condition,
-                    next_state: state,
-                    next_vars: vec![next_x],
+        rvsdg
+            .define_fn(func_id, |rb, state| {
+                let x = rb.const_i32(10);
+                let res = rb.theta(state, &[x], |rb| {
+                    let loop_x = rb.param(0);
+                    let one = rb.const_i32(1);
+                    let next_x = rb.binary(BinaryOp::Sub, ArithFlags::default(), loop_x, one, I32);
+                    let zero = rb.const_i32(0);
+                    let condition = rb.icmp(ICmpPred::SignedGt, next_x, zero);
+                    Ok(LoopResult {
+                        condition,
+                        next_state: state,
+                        next_vars: vec![next_x],
+                    })
+                })?;
+                Ok(FnResult {
+                    state: res.state,
+                    values: vec![res.result(0)],
                 })
-            })?;
-            Ok(FnResult {
-                state: res.state,
-                values: vec![res.result(0)],
             })
-        });
+            .unwrap();
 
         assert_eq!(jit_run_i32(&rvsdg, "test"), 0);
     }
@@ -311,29 +321,31 @@ mod tests {
         // => sum = 1+2+...+10 = 55
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
-        rvsdg.define_fn(func_id, |rb, state| {
-            let sum = rb.const_i32(0);
-            let i = rb.const_i32(1);
-            let res = rb.theta(state, &[sum, i], |rb| {
-                let loop_sum = rb.param(0);
-                let loop_i = rb.param(1);
-                let next_sum =
-                    rb.binary(BinaryOp::Add, ArithFlags::default(), loop_sum, loop_i, I32);
-                let one = rb.const_i32(1);
-                let next_i = rb.binary(BinaryOp::Add, ArithFlags::default(), loop_i, one, I32);
-                let ten = rb.const_i32(10);
-                let condition = rb.icmp(ICmpPred::SignedLe, next_i, ten);
-                Ok(LoopResult {
-                    condition,
-                    next_state: state,
-                    next_vars: vec![next_sum, next_i],
+        rvsdg
+            .define_fn(func_id, |rb, state| {
+                let sum = rb.const_i32(0);
+                let i = rb.const_i32(1);
+                let res = rb.theta(state, &[sum, i], |rb| {
+                    let loop_sum = rb.param(0);
+                    let loop_i = rb.param(1);
+                    let next_sum =
+                        rb.binary(BinaryOp::Add, ArithFlags::default(), loop_sum, loop_i, I32);
+                    let one = rb.const_i32(1);
+                    let next_i = rb.binary(BinaryOp::Add, ArithFlags::default(), loop_i, one, I32);
+                    let ten = rb.const_i32(10);
+                    let condition = rb.icmp(ICmpPred::SignedLe, next_i, ten);
+                    Ok(LoopResult {
+                        condition,
+                        next_state: state,
+                        next_vars: vec![next_sum, next_i],
+                    })
+                })?;
+                Ok(FnResult {
+                    state: res.state,
+                    values: vec![res.result(0)],
                 })
-            })?;
-            Ok(FnResult {
-                state: res.state,
-                values: vec![res.result(0)],
             })
-        });
+            .unwrap();
 
         assert_eq!(jit_run_i32(&rvsdg, "test"), 55);
     }
@@ -345,29 +357,31 @@ mod tests {
         // do { x = x * 2; i = i + 1 } while(i < 10)
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
-        rvsdg.define_fn(func_id, |rb, state| {
-            let x = rb.const_i32(1);
-            let i = rb.const_i32(0);
-            let res = rb.theta(state, &[x, i], |rb| {
-                let loop_x = rb.param(0);
-                let loop_i = rb.param(1);
-                let two = rb.const_i32(2);
-                let next_x = rb.binary(BinaryOp::Mul, ArithFlags::default(), loop_x, two, I32);
-                let one = rb.const_i32(1);
-                let next_i = rb.binary(BinaryOp::Add, ArithFlags::default(), loop_i, one, I32);
-                let ten = rb.const_i32(10);
-                let condition = rb.icmp(ICmpPred::SignedLt, next_i, ten);
-                Ok(LoopResult {
-                    condition,
-                    next_state: state,
-                    next_vars: vec![next_x, next_i],
+        rvsdg
+            .define_fn(func_id, |rb, state| {
+                let x = rb.const_i32(1);
+                let i = rb.const_i32(0);
+                let res = rb.theta(state, &[x, i], |rb| {
+                    let loop_x = rb.param(0);
+                    let loop_i = rb.param(1);
+                    let two = rb.const_i32(2);
+                    let next_x = rb.binary(BinaryOp::Mul, ArithFlags::default(), loop_x, two, I32);
+                    let one = rb.const_i32(1);
+                    let next_i = rb.binary(BinaryOp::Add, ArithFlags::default(), loop_i, one, I32);
+                    let ten = rb.const_i32(10);
+                    let condition = rb.icmp(ICmpPred::SignedLt, next_i, ten);
+                    Ok(LoopResult {
+                        condition,
+                        next_state: state,
+                        next_vars: vec![next_x, next_i],
+                    })
+                })?;
+                Ok(FnResult {
+                    state: res.state,
+                    values: vec![res.result(0)],
                 })
-            })?;
-            Ok(FnResult {
-                state: res.state,
-                values: vec![res.result(0)],
             })
-        });
+            .unwrap();
 
         assert_eq!(jit_run_i32(&rvsdg, "test"), 1024);
     }
@@ -378,44 +392,46 @@ mod tests {
         // => 7
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
-        rvsdg.define_fn(func_id, |rb, state| {
-            let cond = rb.constant(BOOL, ConstValue::Int(1));
-            let res = rb.gamma(
-                cond,
-                state,
-                &[],
-                |rb| {
-                    let x = rb.const_i32(0);
-                    let loop_res = rb.theta(state, &[x], |rb| {
-                        let loop_x = rb.param(0);
-                        let one = rb.const_i32(1);
-                        let next_x =
-                            rb.binary(BinaryOp::Add, ArithFlags::default(), loop_x, one, I32);
-                        let seven = rb.const_i32(7);
-                        let condition = rb.icmp(ICmpPred::SignedLt, next_x, seven);
-                        Ok(LoopResult {
-                            condition,
-                            next_state: state,
-                            next_vars: vec![next_x],
+        rvsdg
+            .define_fn(func_id, |rb, state| {
+                let cond = rb.constant(BOOL, ConstValue::Int(1));
+                let res = rb.gamma(
+                    cond,
+                    state,
+                    &[],
+                    |rb| {
+                        let x = rb.const_i32(0);
+                        let loop_res = rb.theta(state, &[x], |rb| {
+                            let loop_x = rb.param(0);
+                            let one = rb.const_i32(1);
+                            let next_x =
+                                rb.binary(BinaryOp::Add, ArithFlags::default(), loop_x, one, I32);
+                            let seven = rb.const_i32(7);
+                            let condition = rb.icmp(ICmpPred::SignedLt, next_x, seven);
+                            Ok(LoopResult {
+                                condition,
+                                next_state: state,
+                                next_vars: vec![next_x],
+                            })
+                        })?;
+                        Ok(BranchResult {
+                            state,
+                            values: vec![loop_res.result(0)],
                         })
-                    })?;
-                    Ok(BranchResult {
-                        state,
-                        values: vec![loop_res.result(0)],
-                    })
-                },
-                |rb| {
-                    Ok(BranchResult {
-                        state,
-                        values: vec![rb.const_i32(99)],
-                    })
-                },
-            )?;
-            Ok(FnResult {
-                state: res.state,
-                values: vec![res.result(0)],
+                    },
+                    |rb| {
+                        Ok(BranchResult {
+                            state,
+                            values: vec![rb.const_i32(99)],
+                        })
+                    },
+                )?;
+                Ok(FnResult {
+                    state: res.state,
+                    values: vec![res.result(0)],
+                })
             })
-        });
+            .unwrap();
 
         assert_eq!(jit_run_i32(&rvsdg, "test"), 7);
     }
@@ -430,60 +446,62 @@ mod tests {
         // sum of even numbers 2 + 4 + 6 = 12
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
-        rvsdg.define_fn(func_id, |rb, state| {
-            let x = rb.const_i32(0);
-            let sum = rb.const_i32(0);
-            let res = rb.theta(state, &[x, sum], |rb| {
-                let loop_x = rb.param(0);
-                let loop_sum = rb.param(1);
-                let one = rb.const_i32(1);
-                let next_x = rb.binary(BinaryOp::Add, ArithFlags::default(), loop_x, one, I32);
+        rvsdg
+            .define_fn(func_id, |rb, state| {
+                let x = rb.const_i32(0);
+                let sum = rb.const_i32(0);
+                let res = rb.theta(state, &[x, sum], |rb| {
+                    let loop_x = rb.param(0);
+                    let loop_sum = rb.param(1);
+                    let one = rb.const_i32(1);
+                    let next_x = rb.binary(BinaryOp::Add, ArithFlags::default(), loop_x, one, I32);
 
-                // if next_x % 2 == 0 { next_x } else { 0 }
-                let two = rb.const_i32(2);
-                let rem = rb.binary(
-                    BinaryOp::UnsignedRem,
-                    ArithFlags::default(),
-                    next_x,
-                    two,
-                    I32,
-                );
-                let zero = rb.const_i32(0);
-                let is_even = rb.icmp(ICmpPred::Eq, rem, zero);
-                let branch_res = rb.gamma(
-                    is_even,
-                    state,
-                    &[next_x],
-                    |rb| {
-                        Ok(BranchResult {
-                            state,
-                            values: vec![rb.param(0)],
-                        })
-                    },
-                    |rb| {
-                        Ok(BranchResult {
-                            state,
-                            values: vec![rb.const_i32(0)],
-                        })
-                    },
-                )?;
-                let to_add = branch_res.result(0);
-                let next_sum =
-                    rb.binary(BinaryOp::Add, ArithFlags::default(), loop_sum, to_add, I32);
+                    // if next_x % 2 == 0 { next_x } else { 0 }
+                    let two = rb.const_i32(2);
+                    let rem = rb.binary(
+                        BinaryOp::UnsignedRem,
+                        ArithFlags::default(),
+                        next_x,
+                        two,
+                        I32,
+                    );
+                    let zero = rb.const_i32(0);
+                    let is_even = rb.icmp(ICmpPred::Eq, rem, zero);
+                    let branch_res = rb.gamma(
+                        is_even,
+                        state,
+                        &[next_x],
+                        |rb| {
+                            Ok(BranchResult {
+                                state,
+                                values: vec![rb.param(0)],
+                            })
+                        },
+                        |rb| {
+                            Ok(BranchResult {
+                                state,
+                                values: vec![rb.const_i32(0)],
+                            })
+                        },
+                    )?;
+                    let to_add = branch_res.result(0);
+                    let next_sum =
+                        rb.binary(BinaryOp::Add, ArithFlags::default(), loop_sum, to_add, I32);
 
-                let six = rb.const_i32(6);
-                let condition = rb.icmp(ICmpPred::SignedLt, next_x, six);
-                Ok(LoopResult {
-                    condition,
-                    next_state: state,
-                    next_vars: vec![next_x, next_sum],
+                    let six = rb.const_i32(6);
+                    let condition = rb.icmp(ICmpPred::SignedLt, next_x, six);
+                    Ok(LoopResult {
+                        condition,
+                        next_state: state,
+                        next_vars: vec![next_x, next_sum],
+                    })
+                })?;
+                Ok(FnResult {
+                    state: res.state,
+                    values: vec![res.result(1)],
                 })
-            })?;
-            Ok(FnResult {
-                state: res.state,
-                values: vec![res.result(1)],
             })
-        });
+            .unwrap();
 
         assert_eq!(jit_run_i32(&rvsdg, "test"), 12);
     }
@@ -497,48 +515,55 @@ mod tests {
         let build_while_loop = |init_x: i32| -> RVSDGMod {
             let mut rvsdg = RVSDGMod::new_host(String::from("test"));
             let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
-            rvsdg.define_fn(func_id, |rb, state| {
-                let x = rb.const_i32(init_x);
-                let five = rb.const_i32(5);
-                let enter_loop = rb.icmp(ICmpPred::SignedLt, x, five);
-                let res = rb.gamma(
-                    enter_loop,
-                    state,
-                    &[x],
-                    |rb| {
-                        // true branch: do { x++ } while (x < 5)
-                        let init = rb.param(0);
-                        let loop_res = rb.theta(state, &[init], |rb| {
-                            let loop_x = rb.param(0);
-                            let one = rb.const_i32(1);
-                            let next_x =
-                                rb.binary(BinaryOp::Add, ArithFlags::default(), loop_x, one, I32);
-                            let five = rb.const_i32(5);
-                            let condition = rb.icmp(ICmpPred::SignedLt, next_x, five);
-                            Ok(LoopResult {
-                                condition,
-                                next_state: state,
-                                next_vars: vec![next_x],
+            rvsdg
+                .define_fn(func_id, |rb, state| {
+                    let x = rb.const_i32(init_x);
+                    let five = rb.const_i32(5);
+                    let enter_loop = rb.icmp(ICmpPred::SignedLt, x, five);
+                    let res = rb.gamma(
+                        enter_loop,
+                        state,
+                        &[x],
+                        |rb| {
+                            // true branch: do { x++ } while (x < 5)
+                            let init = rb.param(0);
+                            let loop_res = rb.theta(state, &[init], |rb| {
+                                let loop_x = rb.param(0);
+                                let one = rb.const_i32(1);
+                                let next_x = rb.binary(
+                                    BinaryOp::Add,
+                                    ArithFlags::default(),
+                                    loop_x,
+                                    one,
+                                    I32,
+                                );
+                                let five = rb.const_i32(5);
+                                let condition = rb.icmp(ICmpPred::SignedLt, next_x, five);
+                                Ok(LoopResult {
+                                    condition,
+                                    next_state: state,
+                                    next_vars: vec![next_x],
+                                })
+                            })?;
+                            Ok(BranchResult {
+                                state,
+                                values: vec![loop_res.result(0)],
                             })
-                        })?;
-                        Ok(BranchResult {
-                            state,
-                            values: vec![loop_res.result(0)],
-                        })
-                    },
-                    |rb| {
-                        // false branch: condition already false, pass through
-                        Ok(BranchResult {
-                            state,
-                            values: vec![rb.param(0)],
-                        })
-                    },
-                )?;
-                Ok(FnResult {
-                    state: res.state,
-                    values: vec![res.result(0)],
+                        },
+                        |rb| {
+                            // false branch: condition already false, pass through
+                            Ok(BranchResult {
+                                state,
+                                values: vec![rb.param(0)],
+                            })
+                        },
+                    )?;
+                    Ok(FnResult {
+                        state: res.state,
+                        values: vec![res.result(0)],
+                    })
                 })
-            });
+                .unwrap();
             rvsdg
         };
 

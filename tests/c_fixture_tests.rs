@@ -17,6 +17,59 @@ fn run_example_rvsdg(input: &str) -> u8 {
     run_cli(&cli).unwrap().unwrap()
 }
 
+/// Two-translation-unit ABI differential: `our_file` goes through the
+/// RVSDG pipeline, `clang_file` is compiled by clang, and the two are
+/// linked into one binary; the reference build compiles both with clang.
+/// An ABI mismatch (byval/sret/extension attributes or calling convention
+/// dropped on either side) shows up as a differing exit code.
+fn test_c_pair(our_file: &str, clang_file: &str) {
+    let tmp_dir = TempDir::new().expect("failed to create temp dir").keep();
+    let path_of = |name: &str| {
+        tmp_dir
+            .join(name)
+            .to_str()
+            .expect("failed to construct path")
+            .to_string()
+    };
+
+    // The clang-owned half, as an object file our link step consumes.
+    let helper_obj = path_of("helper.o");
+    let status = Command::new("clang")
+        .args(["-O1", "-w", "-c", clang_file, "-o", &helper_obj])
+        .status()
+        .expect("failed to start clang");
+    assert!(status.success(), "clang failed to compile {clang_file}");
+
+    // Our half, linked against the clang object.
+    let ours_bin = path_of("ours");
+    let cli = Cli::get_output_integration(
+        our_file.to_string(),
+        ours_bin.clone(),
+        vec![helper_obj.clone()],
+    );
+    run_cli(&cli).unwrap();
+    let ours_code = Command::new(&ours_bin)
+        .status()
+        .expect("failed to run our binary")
+        .code()
+        .expect("our binary was killed by a signal");
+
+    // The reference: both halves compiled by clang.
+    let ref_bin = path_of("reference");
+    let status = Command::new("clang")
+        .args(["-O1", "-w", our_file, clang_file, "-o", &ref_bin])
+        .status()
+        .expect("failed to start clang");
+    assert!(status.success(), "clang failed to build the reference");
+    let ref_code = Command::new(&ref_bin)
+        .status()
+        .expect("failed to run reference binary")
+        .code()
+        .expect("reference binary was killed by a signal");
+
+    assert_eq!(ours_code, ref_code);
+}
+
 fn run_example_clang(input: &str) -> i32 {
     let tmp_dir = TempDir::new().expect("failed to create temp dir").keep();
     let path_str = {
@@ -343,4 +396,75 @@ fn test_42_fn_ptr_phi() {
 #[test]
 fn test_43_global_addr_phi() {
     test_c_file("tests/fixtures/c/43_global_addr_phi.c");
+}
+
+// Atomic loads, stores, and a fence with explicit orderings; single
+// threaded, so the differential checks the value flow while the orderings
+// exercise the instruction attributes.
+#[test]
+fn test_44_atomic_load_store() {
+    test_c_file("tests/fixtures/c/44_atomic_load_store.c");
+}
+
+// Atomic read-modify-write (fetch_add, exchange) and strong
+// compare-and-swap, including a failing swap that writes the observed
+// value back through `expected`. The pair result flows through
+// extractvalue to the node's projections.
+#[test]
+fn test_45_atomic_rmw_cas() {
+    test_c_file("tests/fixtures/c/45_atomic_rmw_cas.c");
+}
+
+// A thread-local global: the thread_local mode must survive re-emission
+// (accesses go through llvm.threadlocal.address, whose operand LLVM
+// requires to be thread-local).
+#[test]
+fn test_46_thread_local() {
+    test_c_file("tests/fixtures/c/46_thread_local.c");
+}
+
+// Module-level inline assembly defining a real symbol; must be preserved
+// verbatim or the symbol vanishes and linking fails.
+#[test]
+fn test_47_module_asm() {
+    test_c_file("tests/fixtures/c/47_module_asm.c");
+}
+
+// Two-TU ABI differential, caller side: our main passes a 32-byte struct
+// by value to a clang-compiled callee; the call site must carry byval.
+#[test]
+fn test_48_byval_call() {
+    test_c_pair(
+        "tests/fixtures/c/48_byval_call.c",
+        "tests/fixtures/c/48_byval_call_helper.c",
+    );
+}
+
+// Two-TU ABI differential, callee side: clang's main calls our function
+// taking a 32-byte struct by value; our definition must carry byval.
+#[test]
+fn test_49_byval_callee() {
+    test_c_pair(
+        "tests/fixtures/c/49_byval_callee.c",
+        "tests/fixtures/c/49_byval_callee_main.c",
+    );
+}
+
+// Two-TU ABI differential, variadic caller side: our main passes a
+// 32-byte struct through `...`; the call site is the only place that
+// argument's byval attribute exists, so dropping call-site attributes on
+// direct calls makes the clang-compiled callee's va_arg read garbage.
+#[test]
+fn test_53_variadic_byval() {
+    test_c_pair(
+        "tests/fixtures/c/53_variadic_byval.c",
+        "tests/fixtures/c/53_variadic_byval_helper.c",
+    );
+}
+
+// An alignas(64) global: the alignment attribute must survive re-emission
+// (checked through the global's runtime address).
+#[test]
+fn test_50_global_alignment() {
+    test_c_file("tests/fixtures/c/50_global_alignment.c");
 }

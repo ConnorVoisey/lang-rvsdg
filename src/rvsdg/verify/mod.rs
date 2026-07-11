@@ -5,12 +5,15 @@ use crate::rvsdg::{ConstId, FuncId, GlobalId, RVSDGMod, RegionId, ValueId};
 pub mod ids;
 pub mod predicate_form;
 pub mod scope;
+pub mod state;
 
 impl RVSDGMod {
     pub fn verify(&self) -> Vec<RVSDGVerificationError> {
         let mut errs = vec![];
         self.verify_ids(&mut errs);
-        self.verify_scope(&mut errs);
+        let ownership = self.build_value_ownership(&mut errs);
+        self.verify_scope(&ownership, &mut errs);
+        self.verify_state(&ownership, &mut errs);
         self.verify_predicate_form(&mut errs);
         errs
     }
@@ -33,8 +36,40 @@ pub enum RVSDGVerificationError {
     #[error("invalid region id {0}")]
     InvalidRegionId(RegionId),
 
-    #[error("Value {0}, is used in region {1}, but it isn't declared within this region")]
-    ValueUsedOutOfScope(ValueId, RegionId),
+    #[error(
+        "value {operand} is used by {user} in region {region}, but is neither a node of that \
+         region, one of its parameters, nor a region-free constant"
+    )]
+    ValueUsedOutOfScope {
+        user: ValueId,
+        operand: ValueId,
+        region: RegionId,
+    },
+
+    #[error("value {operand} is used by {user} before its definition in the region")]
+    ValueUsedBeforeDefinition { user: ValueId, operand: ValueId },
+
+    #[error("value {0} appears in the node list of more than one region")]
+    ValueInMultipleRegions(ValueId),
+
+    #[error("result {operand} of region {region} is not visible inside that region")]
+    ResultNotInRegion { region: RegionId, operand: ValueId },
+
+    #[error(
+        "state edge into {user}: operand {operand} is neither region {region}'s entry state nor \
+         an earlier state-producing node of that region"
+    )]
+    StateEdgeOutOfScope {
+        user: ValueId,
+        operand: ValueId,
+        region: RegionId,
+    },
+
+    #[error("state edge into {user}: operand {operand} is not a state-producing node")]
+    StateEdgeFromNonStateNode { user: ValueId, operand: ValueId },
+
+    #[error("state edge into {user}: operand {operand} is defined later in the same region")]
+    StateEdgeUsedBeforeDefinition { user: ValueId, operand: ValueId },
 
     #[error("Region {region_id} takes in {input_count} params yet returns {output_count} params")]
     RegionInvalidArgReturnCount {

@@ -108,30 +108,34 @@ mod tests {
     fn build_binary_i32(op: BinaryOp, flags: ArithFlags, lhs: i32, rhs: i32) -> i32 {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
-        rvsdg.define_fn(func_id, |rb, state| {
-            let a = rb.const_i32(lhs);
-            let b = rb.const_i32(rhs);
-            let result = rb.binary(op, flags, a, b, I32);
-            Ok(FnResult {
-                state,
-                values: vec![result],
+        rvsdg
+            .define_fn(func_id, |rb, state| {
+                let a = rb.const_i32(lhs);
+                let b = rb.const_i32(rhs);
+                let result = rb.binary(op, flags, a, b, I32);
+                Ok(FnResult {
+                    state,
+                    values: vec![result],
+                })
             })
-        });
+            .unwrap();
         jit_run_i32(&rvsdg, "test")
     }
 
     fn build_binary_f32(op: BinaryOp, lhs: f32, rhs: f32) -> f32 {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[F32], Linkage::External);
-        rvsdg.define_fn(func_id, |rb, state| {
-            let a = rb.constant(F32, ConstValue::f32_from_native(lhs));
-            let b = rb.constant(F32, ConstValue::f32_from_native(rhs));
-            let result = rb.binary(op, ArithFlags::default(), a, b, F32);
-            Ok(FnResult {
-                state,
-                values: vec![result],
+        rvsdg
+            .define_fn(func_id, |rb, state| {
+                let a = rb.constant(F32, ConstValue::f32_from_native(lhs));
+                let b = rb.constant(F32, ConstValue::f32_from_native(rhs));
+                let result = rb.binary(op, ArithFlags::default(), a, b, F32);
+                Ok(FnResult {
+                    state,
+                    values: vec![result],
+                })
             })
-        });
+            .unwrap();
         jit_run_f32(&rvsdg, "test")
     }
 

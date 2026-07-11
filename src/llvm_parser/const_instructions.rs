@@ -166,6 +166,19 @@ impl RVSDGMod {
                 //   - many indices -> a typed aggregate access
                 //     `getelementptr (T, ptr base, 0, k, ...)`; the source type
                 //     T is what `base` points to.
+                //
+                // KNOWN UNSOUND for one input class: a single-index constant
+                // GEP whose true source type is not i8. Clang's constant
+                // emitter canonicalises global INITIALIZERS to the byte form
+                // (i8 recovery exact), but its in-function constant folder
+                // keeps single-index GEPs typed over the ELEMENT type (for
+                // example constant pointer arithmetic like `&arr[2] + 1`),
+                // and the two shapes are indistinguishable once the type is
+                // dropped -- the i8 assumption then computes a wrong address
+                // and MISCOMPILES silently. No local recovery can be sound;
+                // the fix is llvm-ir exposing the real source type on
+                // constant GEPs the way it already does on GEP instructions
+                // (LLVMGetGEPSourceElementType covers both).
                 let source_type = if gep.indices.len() == 1 {
                     TypeRef::Scalar(ScalarType::I8)
                 } else {
@@ -178,6 +191,26 @@ impl RVSDGMod {
                     .iter()
                     .map(|i| self.convert_const_ref(i.clone(), module))
                     .collect::<Result<Vec<_>, _>>()?;
+                // Validate the recovery: the indices must descend the
+                // recovered type (struct indices in range; array indices are
+                // unconstrained, matching LLVM). Optimised input can carry a
+                // constant GEP whose true source type is NOT the base's
+                // pointee (e.g. a folded access typed over a field), and
+                // llvm-ir gives us no way to know it -- lowering a wrong
+                // recovery is undefined behaviour inside LLVM (a segfault in
+                // practice), so refuse it here instead. The unoptimised
+                // clang pipeline types constant global accesses over the
+                // pointee and never hits this.
+                if gep.indices.len() > 1
+                    && self.descend_type(source_type, &index_ids[1..]).is_none()
+                {
+                    return Err(eyre!(
+                        "constant getelementptr indices do not fit the base's pointee \
+                         type; the true source element type is dropped by llvm-ir and \
+                         cannot be recovered (this shape typically comes from \
+                         LLVM-optimised input IR)"
+                    ));
+                }
                 let indices = self.constants.id_pool.push_slice(&index_ids);
                 ConstantDef {
                     ty: base_type,

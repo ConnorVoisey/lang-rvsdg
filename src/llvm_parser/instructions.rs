@@ -1,8 +1,8 @@
 use crate::{
     llvm_parser::{FnCtx, block_mapper::BasicBlockId, control_flow::scopes::SymbolScopes},
     rvsdg::{
-        ArithFlags, BinaryOp, CastOp, FCmpPred, ICmpPred, MatchArm, MemoryOrdering, State, UnaryOp,
-        ValueId,
+        ArithFlags, AtomicRMWOp, BinaryOp, CastOp, FCmpPred, ICmpPred, MatchArm, MemoryOrdering,
+        State, UnaryOp, ValueId,
         builder::{AllocaResult, LoadResult, RegionBuilder},
     },
 };
@@ -27,6 +27,15 @@ fn convert_int_pred(p: IntPredicate) -> ICmpPred {
     }
 }
 
+/// NOTE: only the ordering half of llvm-ir's `Atomicity` is converted;
+/// the synchronisation SCOPE (`synch_scope`) is deliberately dropped, so
+/// singlethread atomics and fences (`atomic_signal_fence`) are lowered at
+/// full system scope. That is a correct strengthening -- a system-scope
+/// operation orders everything a singlethread one would -- but emits
+/// unnecessary hardware fences on ARM. Restoring it needs a scope field
+/// on the atomic ValueKinds plus, at lowering, build_fence's second
+/// argument (already a singlethread flag, currently hardcoded 0) and one
+/// raw llvm-sys call for the instructions (LLVMSetAtomicSingleThread).
 fn convert_mem_ordering(o: LlvmMemoryOrdering) -> MemoryOrdering {
     match o {
         LlvmMemoryOrdering::Unordered
@@ -37,6 +46,38 @@ fn convert_mem_ordering(o: LlvmMemoryOrdering) -> MemoryOrdering {
         LlvmMemoryOrdering::AcquireRelease => MemoryOrdering::AcquireRelease,
         LlvmMemoryOrdering::SequentiallyConsistent => MemoryOrdering::SequentiallyConsistent,
     }
+}
+
+/// The atomic read-modify-write operation of an LLVM `atomicrmw`
+/// instruction. The two LLVM-19 wrapping increment/decrement operations
+/// have no RVSDG representation yet; clang only emits them for the
+/// corresponding builtins, which nothing we compile uses.
+fn convert_atomic_read_modify_write_op(
+    op: llvm_ir::instruction::RMWBinOp,
+) -> color_eyre::Result<AtomicRMWOp> {
+    use llvm_ir::instruction::RMWBinOp;
+    Ok(match op {
+        RMWBinOp::Xchg => AtomicRMWOp::Exchange,
+        RMWBinOp::Add => AtomicRMWOp::Add,
+        RMWBinOp::Sub => AtomicRMWOp::Sub,
+        RMWBinOp::And => AtomicRMWOp::And,
+        RMWBinOp::Nand => AtomicRMWOp::Nand,
+        RMWBinOp::Or => AtomicRMWOp::Or,
+        RMWBinOp::Xor => AtomicRMWOp::Xor,
+        RMWBinOp::Max => AtomicRMWOp::SignedMax,
+        RMWBinOp::Min => AtomicRMWOp::SignedMin,
+        RMWBinOp::UMax => AtomicRMWOp::UnsignedMax,
+        RMWBinOp::UMin => AtomicRMWOp::UnsignedMin,
+        RMWBinOp::FAdd => AtomicRMWOp::FloatAdd,
+        RMWBinOp::FSub => AtomicRMWOp::FloatSub,
+        RMWBinOp::FMax => AtomicRMWOp::FloatMax,
+        RMWBinOp::FMin => AtomicRMWOp::FloatMin,
+        other => {
+            return Err(color_eyre::eyre::eyre!(
+                "atomic read-modify-write operation {other:?} is not supported"
+            ));
+        }
+    })
 }
 
 fn convert_fp_pred(p: FPPredicate) -> FCmpPred {
@@ -213,8 +254,8 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
             Instruction::Load(i) => self.load(state, i)?.state,
             Instruction::Store(i) => self.store(state, i)?,
             Instruction::Fence(i) => self.fence(state, i),
-            Instruction::CmpXchg(_) => todo!("cmpxchg"),
-            Instruction::AtomicRMW(_) => todo!("atomic_rmw"),
+            Instruction::CmpXchg(i) => self.compare_and_swap(state, i)?,
+            Instruction::AtomicRMW(i) => self.atomic_read_modify_write(state, i)?,
             Instruction::GetElementPtr(i) => {
                 self.get_element_ptr(i)?;
                 state
@@ -368,6 +409,28 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
         inst: &llvm_ir::instruction::ExtractValue,
     ) -> color_eyre::Result<ValueId> {
         let aggregate = self.operand(&inst.aggregate)?;
+        // A compare-and-swap's `{old value, success flag}` pair has no
+        // aggregate value in the RVSDG; its fields are the node's two
+        // projections, which the builder lays out directly after the node.
+        if matches!(
+            self.rb.graph.values[aggregate.0 as usize].kind,
+            crate::rvsdg::ValueKind::CompareAndSwap { .. }
+        ) {
+            let &[index] = inst.indices.as_slice() else {
+                return Err(color_eyre::eyre::eyre!(
+                    "extractvalue on a compare-and-swap pair takes one index, got {:?}",
+                    inst.indices
+                ));
+            };
+            if index > 1 {
+                return Err(color_eyre::eyre::eyre!(
+                    "extractvalue index {index} out of range for a compare-and-swap pair"
+                ));
+            }
+            let projection = self.rb.graph.projection_of(aggregate, index as u16);
+            self.scopes.bind_name(&inst.dest, projection);
+            return Ok(projection);
+        }
         let llvm_ty = inst.get_type(&self.fn_ctx.llvm_mod.types);
         let field_type = self
             .rb
@@ -464,6 +527,7 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
                 loaded_type,
                 convert_mem_ordering(at.mem_ordering),
                 align,
+                inst.volatile,
             ),
             None => self.rb.load(state, addr, loaded_type, align, inst.volatile),
         };
@@ -487,6 +551,7 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
                 value,
                 convert_mem_ordering(at.mem_ordering),
                 align,
+                inst.volatile,
             ),
             None => self.rb.store(state, addr, value, align, inst.volatile),
         })
@@ -518,6 +583,69 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
     fn fence(&mut self, state: State, inst: &llvm_ir::instruction::Fence) -> State {
         let ordering = convert_mem_ordering(inst.atomicity.mem_ordering);
         self.rb.fence(state, ordering)
+    }
+
+    /// Lower an LLVM `cmpxchg` instruction: an atomic compare-and-swap.
+    fn compare_and_swap(
+        &mut self,
+        state: State,
+        inst: &llvm_ir::instruction::CmpXchg,
+    ) -> color_eyre::Result<State> {
+        let addr = self.operand(&inst.address)?;
+        let expected = self.operand(&inst.expected)?;
+        let desired = self.operand(&inst.replacement)?;
+        let value_type = self.rb.graph.values[expected.0 as usize].ty;
+        // `inst.weak` is deliberately dropped: the node is always a strong
+        // compare-and-swap, which never fails spuriously and is therefore a
+        // valid implementation of the weak form -- ALWAYS CORRECT, but not
+        // always ideal. On x86-64 and ARMv8.1+LSE the two compile
+        // identically; on pre-LSE AArch64 (load-linked/store-conditional)
+        // strong forces a retry loop nested inside the user's own CAS
+        // loop. Restoring weak needs a `weak: bool` here and one raw
+        // llvm-sys call at lowering (LLVMSetWeak on the cmpxchg
+        // instruction; inkwell has no wrapper but its AsValueRef trait is
+        // public).
+        let result = self.rb.compare_and_swap(
+            state,
+            addr,
+            expected,
+            desired,
+            convert_mem_ordering(inst.atomicity.mem_ordering),
+            convert_mem_ordering(inst.failure_memory_ordering),
+            value_type,
+            inst.volatile,
+        );
+        // The instruction produces an `{old value, success flag}` pair
+        // consumed by extractvalue; the RVSDG has no aggregate for it -- the
+        // fields are the node's two projections. The destination binds the
+        // NODE so `extract_value` can recognise the kind and route to the
+        // matching projection.
+        self.scopes.bind_name(&inst.dest, result.state.0);
+        Ok(result.state)
+    }
+
+    /// Lower an LLVM `atomicrmw` instruction: an atomic read-modify-write
+    /// returning the value the memory held before the operation.
+    fn atomic_read_modify_write(
+        &mut self,
+        state: State,
+        inst: &llvm_ir::instruction::AtomicRMW,
+    ) -> color_eyre::Result<State> {
+        let addr = self.operand(&inst.address)?;
+        let value = self.operand(&inst.value)?;
+        let value_type = self.rb.graph.values[value.0 as usize].ty;
+        let op = convert_atomic_read_modify_write_op(inst.operation)?;
+        let result = self.rb.atomic_read_modify_write(
+            state,
+            addr,
+            value,
+            op,
+            convert_mem_ordering(inst.atomicity.mem_ordering),
+            value_type,
+            inst.volatile,
+        );
+        self.scopes.bind_name(&inst.dest, result.value);
+        Ok(result.state)
     }
 
     fn select(&mut self, inst: &llvm_ir::instruction::Select) -> color_eyre::Result<ValueId> {

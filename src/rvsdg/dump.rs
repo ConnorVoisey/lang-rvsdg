@@ -292,18 +292,23 @@ fn fmt_node(
             }
             write!(f, "_ => arm{default} }}")
         }
-        ValueKind::Call { state, fn_id, args } => {
-            write!(f, "call {fn_id} args ")?;
+        ValueKind::Call {
+            state,
+            fn_id,
+            sig,
+            args,
+        } => {
+            write!(f, "call {fn_id} {sig} args ")?;
             fmt_value_list(f, m, *args)?;
             write!(f, " state_in {state} state_out %s{}", node_id.0)
         }
         ValueKind::CallIndirect {
             state,
             callee,
-            fn_ty,
+            sig,
             args,
         } => {
-            write!(f, "call_indirect {fn_ty} callee ")?;
+            write!(f, "call_indirect {sig} callee ")?;
             fmt_value_ref(f, m, *callee)?;
             f.write_str(" args ")?;
             fmt_value_list(f, m, *args)?;

@@ -2,8 +2,8 @@ use color_eyre::eyre::eyre;
 
 use crate::rvsdg::{
     FuncId, MatchArm, RegionId, State, Value, ValueId, ValueKind,
-    func::CallResult,
-    types::{FuncTypeId, ScalarType, TypeRef, VOID},
+    func::{CallResult, SignatureId},
+    types::{ScalarType, TypeRef, VOID},
 };
 
 use super::{
@@ -380,8 +380,32 @@ impl<'a> RegionBuilder<'a> {
         }
     }
 
+    /// Call a known function with an ABI signature derived from its
+    /// declaration. Exact for hand-built graphs and any non-variadic
+    /// call; a parser lowering real call sites should use
+    /// [`call_with_signature`](Self::call_with_signature) with the site's
+    /// own signature instead, because a variadic call site carries ABI
+    /// attributes for actual arguments the declaration knows nothing
+    /// about.
     #[inline]
     pub fn call(&mut self, fn_id: FuncId, state: State, args: &[ValueId]) -> CallResult {
+        let sig = self.graph.declaration_signature(fn_id);
+        self.call_with_signature(fn_id, state, args, sig)
+    }
+
+    /// Call a known function with the call site's own interned ABI
+    /// signature (one attribute set per ACTUAL argument, return
+    /// attributes, calling convention). LLVM attributes live on call
+    /// sites as well as declarations, so the site's signature is the
+    /// source of truth at emission.
+    #[inline]
+    pub fn call_with_signature(
+        &mut self,
+        fn_id: FuncId,
+        state: State,
+        args: &[ValueId],
+        sig: SignatureId,
+    ) -> CallResult {
         let args_span = self.graph.value_pool.push_slice(args);
 
         // call value is the state node
@@ -390,6 +414,7 @@ impl<'a> RegionBuilder<'a> {
             kind: ValueKind::Call {
                 state,
                 fn_id,
+                sig,
                 args: args_span,
             },
         });
@@ -415,18 +440,18 @@ impl<'a> RegionBuilder<'a> {
         }
     }
 
-    /// Call through a function pointer. The caller must provide the callee's
-    /// full signature (interned in the type arena): it can't be looked up
-    /// from the function table, and the callee value's type is an opaque
-    /// pointer. The result projections come from the signature's return
-    /// type.
+    /// Call through a function pointer. The caller must provide the call
+    /// site's interned [`Signature`](crate::rvsdg::func::Signature): it
+    /// can't be looked up from the function table, and the callee value's
+    /// type is an opaque pointer. The result projections come from the
+    /// signature's return type.
     #[inline]
     pub fn call_indirect(
         &mut self,
         callee: ValueId,
         state: State,
         args: &[ValueId],
-        fn_ty: FuncTypeId,
+        sig: SignatureId,
     ) -> CallResult {
         let args_span = self.graph.value_pool.push_slice(args);
 
@@ -435,14 +460,18 @@ impl<'a> RegionBuilder<'a> {
             kind: ValueKind::CallIndirect {
                 state,
                 callee,
-                fn_ty,
+                sig,
                 args: args_span,
             },
         });
         let out_state = State(call_val);
 
         let first_res = ValueId(self.graph.values.len() as u32);
-        let ret = self.graph.types.get_fn(fn_ty).ret;
+        let ret = self
+            .graph
+            .types
+            .get_fn(self.graph.signatures.get(sig).func_type)
+            .ret;
         let result_count = u16::from(ret != VOID);
         for i in 0..result_count {
             self.add_value(Value {

@@ -200,7 +200,12 @@ impl RVSDGMod {
                 ValueKind::Phi { region, .. } => {
                     self.valid_region(errs, region);
                 }
-                ValueKind::Call { state, fn_id, args } => {
+                ValueKind::Call {
+                    state,
+                    fn_id,
+                    sig: _,
+                    args,
+                } => {
                     self.valid_val(errs, state.0);
                     if (fn_id.0 as usize) >= self.functions.len() {
                         errs.push(RVSDGVerificationError::InvalidFnId(fn_id));
@@ -212,7 +217,7 @@ impl RVSDGMod {
                 ValueKind::CallIndirect {
                     state,
                     callee,
-                    fn_ty: _,
+                    sig: _,
                     args,
                 } => {
                     self.valid_val(errs, state.0);

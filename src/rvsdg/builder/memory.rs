@@ -97,6 +97,7 @@ impl<'a> RegionBuilder<'a> {
         loaded_type: TypeRef,
         ordering: MemoryOrdering,
         align: Option<u32>,
+        volatile: bool,
     ) -> LoadResult {
         let load_val = self.add_value(Value {
             ty: TypeRef::State,
@@ -106,6 +107,7 @@ impl<'a> RegionBuilder<'a> {
                 loaded_type,
                 ordering,
                 align,
+                volatile,
             },
         });
         let value = self.add_value(Value {
@@ -129,6 +131,7 @@ impl<'a> RegionBuilder<'a> {
         value: ValueId,
         ordering: MemoryOrdering,
         align: Option<u32>,
+        volatile: bool,
     ) -> State {
         let val = self.add_value(Value {
             ty: TypeRef::State,
@@ -138,6 +141,7 @@ impl<'a> RegionBuilder<'a> {
                 value,
                 ordering,
                 align,
+                volatile,
             },
         });
         State(val)
@@ -152,6 +156,7 @@ impl<'a> RegionBuilder<'a> {
         op: AtomicRMWOp,
         ordering: MemoryOrdering,
         value_type: TypeRef,
+        volatile: bool,
     ) -> LoadResult {
         let rmw_val = self.add_value(Value {
             ty: TypeRef::State,
@@ -161,6 +166,7 @@ impl<'a> RegionBuilder<'a> {
                 value,
                 op,
                 ordering,
+                volatile,
             },
         });
         let old_value = self.add_value(Value {
@@ -187,6 +193,7 @@ impl<'a> RegionBuilder<'a> {
         success_ordering: MemoryOrdering,
         failure_ordering: MemoryOrdering,
         value_type: TypeRef,
+        volatile: bool,
     ) -> CompareAndSwapResult {
         let cas_val = self.add_value(Value {
             ty: TypeRef::State,
@@ -197,6 +204,7 @@ impl<'a> RegionBuilder<'a> {
                 desired,
                 success_ordering,
                 failure_ordering,
+                volatile,
             },
         });
         let old_value = self.add_value(Value {

@@ -1,7 +1,7 @@
 use crate::rvsdg::{
     FCmpPred, ICmpPred, RVSDGMod, ValueId, ValueKind,
     func::Function,
-    lower_to_llvm::{LLVMBuilderCtx, ValueMapper},
+    lower_to_llvm::{LLVMBuilderCtx, ValueMapper, memory::ordering_to_llvm},
     types::VOID,
 };
 use color_eyre::eyre::{bail, eyre};
@@ -290,9 +290,68 @@ impl RVSDGMod {
                 None
             }
 
-            ValueKind::AtomicLoad { .. }
-            | ValueKind::AtomicStore { .. }
-            | ValueKind::AtomicReadModifyWrite { .. } => todo!("lower atomics"),
+            ValueKind::AtomicLoad {
+                state: _,
+                addr,
+                loaded_type,
+                ordering,
+                align,
+                volatile,
+            } => {
+                self.lower_atomic_load(
+                    llvm_builder,
+                    mapper,
+                    rvsdg_func,
+                    addr,
+                    loaded_type,
+                    ordering,
+                    align,
+                    volatile,
+                    value_id,
+                )?;
+                None
+            }
+            ValueKind::AtomicStore {
+                state: _,
+                addr,
+                value,
+                ordering,
+                align,
+                volatile,
+            } => {
+                self.lower_atomic_store(
+                    llvm_builder,
+                    mapper,
+                    rvsdg_func,
+                    addr,
+                    value,
+                    ordering,
+                    align,
+                    volatile,
+                )?;
+                None
+            }
+            ValueKind::AtomicReadModifyWrite {
+                state: _,
+                addr,
+                value,
+                op,
+                ordering,
+                volatile,
+            } => {
+                self.lower_atomic_read_modify_write(
+                    llvm_builder,
+                    mapper,
+                    rvsdg_func,
+                    value_id,
+                    addr,
+                    value,
+                    op,
+                    ordering,
+                    volatile,
+                )?;
+                None
+            }
 
             ValueKind::CompareAndSwap {
                 state: _,
@@ -301,8 +360,9 @@ impl RVSDGMod {
                 desired,
                 success_ordering,
                 failure_ordering,
+                volatile,
             } => {
-                self.lower_cmpxchg(
+                self.lower_compare_and_swap(
                     llvm_builder,
                     mapper,
                     rvsdg_func,
@@ -312,10 +372,24 @@ impl RVSDGMod {
                     desired,
                     success_ordering,
                     failure_ordering,
+                    volatile,
                 )?;
                 None
             }
-            ValueKind::Fence { .. } => todo!(),
+            ValueKind::Fence { state: _, ordering } => {
+                // The second argument is LLVM's single-thread flag; 0 is the
+                // default cross-thread (system) synchronisation scope. The
+                // frontend drops the input's scope (see
+                // convert_mem_ordering), so singlethread fences are
+                // strengthened to system scope here -- correct, but emits
+                // real hardware fences where none were needed. The name
+                // must be empty: a fence is void and LLVM rejects named
+                // void values.
+                llvm_builder
+                    .builder
+                    .build_fence(ordering_to_llvm(ordering), 0, "")?;
+                None
+            }
             ValueKind::Freeze { .. } => todo!(),
             ValueKind::Match {
                 input,
@@ -363,33 +437,44 @@ impl RVSDGMod {
                 condition,
                 state: _,
                 region_id: region,
-            } => self.lower_theta(
-                llvm_builder,
-                mapper,
-                rvsdg_func,
-                value_id,
-                loop_vars,
-                condition,
-                region,
-            )?,
+            } => {
+                mapper.begin_control(value_id)?;
+                let lowered = self.lower_theta(
+                    llvm_builder,
+                    mapper,
+                    rvsdg_func,
+                    value_id,
+                    loop_vars,
+                    condition,
+                    region,
+                )?;
+                mapper.finish_control(value_id);
+                lowered
+            }
             ValueKind::Gamma {
                 condition,
                 inputs,
                 state: _,
                 regions,
-            } => self.lower_gamma(
-                llvm_builder,
-                mapper,
-                rvsdg_func,
-                value_id,
-                condition,
-                inputs,
-                regions,
-            )?,
+            } => {
+                mapper.begin_control(value_id)?;
+                let lowered = self.lower_gamma(
+                    llvm_builder,
+                    mapper,
+                    rvsdg_func,
+                    value_id,
+                    condition,
+                    inputs,
+                    regions,
+                )?;
+                mapper.finish_control(value_id);
+                lowered
+            }
             ValueKind::Phi { .. } => todo!(),
             ValueKind::Call {
                 state: _,
                 fn_id,
+                sig,
                 args,
             } => {
                 let func = mapper
@@ -405,11 +490,13 @@ impl RVSDGMod {
                             .map(|v| v.into())
                     })
                     .collect::<color_eyre::Result<_>>()?;
-                match llvm_builder
-                    .builder
-                    .build_call(func, &llvm_args, "call")?
-                    .try_as_basic_value()
-                {
+                let call_site = llvm_builder.builder.build_call(func, &llvm_args, "call")?;
+                self.apply_call_site_abi(
+                    llvm_builder.context,
+                    call_site,
+                    self.signatures.get(sig),
+                )?;
+                match call_site.try_as_basic_value() {
                     LLVMValueKind::Basic(val) => Some(val),
                     LLVMValueKind::Instruction(_) => None,
                 }
@@ -417,11 +504,12 @@ impl RVSDGMod {
             ValueKind::CallIndirect {
                 state: _,
                 callee,
-                fn_ty,
+                sig,
                 args,
             } => {
                 let callee_val = self.expect_value(llvm_builder, mapper, rvsdg_func, callee)?;
-                let func_type_def = self.types.get_fn(fn_ty);
+                let signature = self.signatures.get(sig);
+                let func_type_def = self.types.get_fn(signature.func_type);
                 let param_types: Vec<_> = func_type_def
                     .params
                     .iter()
@@ -449,16 +537,14 @@ impl RVSDGMod {
                             .map(|v| v.into())
                     })
                     .collect::<color_eyre::Result<_>>()?;
-                match llvm_builder
-                    .builder
-                    .build_indirect_call(
-                        llvm_fn_type,
-                        callee_val.into_pointer_value(),
-                        &llvm_args,
-                        "callind",
-                    )?
-                    .try_as_basic_value()
-                {
+                let call_site = llvm_builder.builder.build_indirect_call(
+                    llvm_fn_type,
+                    callee_val.into_pointer_value(),
+                    &llvm_args,
+                    "callind",
+                )?;
+                self.apply_call_site_abi(llvm_builder.context, call_site, signature)?;
+                match call_site.try_as_basic_value() {
                     LLVMValueKind::Basic(val) => Some(val),
                     LLVMValueKind::Instruction(_) => None,
                 }

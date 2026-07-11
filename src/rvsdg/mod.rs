@@ -11,7 +11,7 @@ pub mod verify;
 
 pub use constant::{ConstId, ConstIdPool, ConstIdsSpan, ConstantDef, ConstantKind, ConstantPool};
 use func::Function;
-pub use global::{GlobalDef, GlobalInit};
+pub use global::{GlobalDef, GlobalInit, ThreadLocalMode};
 pub use ops::{
     ArithFlags, AtomicRMWOp, BinaryOp, CastOp, FCmpPred, ICmpPred, IntrinsicOp, MemoryOrdering,
     UnaryOp,
@@ -29,7 +29,14 @@ pub struct RVSDGMod {
     /// LLVM data layout string -- encodes pointer sizes, alignments, endianness
     /// for the target. Preserved verbatim for roundtripping through LLVM.
     pub data_layout: String,
+    /// Module-level inline assembly (`module asm "..."` lines), preserved
+    /// verbatim: it defines real symbols (e.g. hand-written context-switch
+    /// routines) that the rest of the module references.
+    pub module_asm: String,
     pub types: TypeArena,
+    /// Interned ABI signatures for indirect call sites (see
+    /// [`func::Signature`]).
+    pub signatures: func::SignatureTable,
     pub values: Vec<Value>,
     pub regions: Vec<Region>,
     pub functions: Vec<Function>,
@@ -51,7 +58,9 @@ impl RVSDGMod {
             mod_name,
             target,
             data_layout,
+            module_asm: String::new(),
             types: TypeArena::default(),
+            signatures: func::SignatureTable::default(),
             values: vec![],
             regions: vec![],
             functions: vec![],
@@ -84,6 +93,26 @@ impl RVSDGMod {
     #[inline]
     pub fn get_region_mut(&mut self, region_id: RegionId) -> &mut Region {
         &mut self.regions[region_id.0 as usize]
+    }
+
+    /// The `index`th projection of a multi-output node (loads, calls,
+    /// compare-and-swap, gammas, thetas, ...). Every builder allocates a
+    /// node's projections immediately after the node itself; this accessor
+    /// is the one place that layout is read back, and it CHECKS the
+    /// convention instead of trusting it, so a future builder change cannot
+    /// silently redirect consumers to the wrong values.
+    #[inline]
+    pub fn projection_of(&self, node: ValueId, index: u16) -> ValueId {
+        let id = ValueId(node.0 + 1 + index as u32);
+        match self.values.get(id.0 as usize).map(|value| &value.kind) {
+            Some(&ValueKind::Project { call, index: found }) if call == node && found == index => {
+                id
+            }
+            other => panic!(
+                "projection layout violated: expected Project {{ call: {node:?}, index: {index} }} \
+                 at {id:?}, found {other:?}"
+            ),
+        }
     }
 }
 
@@ -246,6 +275,8 @@ pub enum Visibility {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Linkage {
+    /// Like Internal but the symbol is also omitted from the symbol table
+    Private,
     Internal,
     External,
     /// Merged with other definitions, discarded if unused

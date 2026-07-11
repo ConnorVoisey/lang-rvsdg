@@ -6,10 +6,12 @@ use crate::{
         scc::SccTree,
     },
     rvsdg::{
-        GlobalId, GlobalInit, InlineHint, Linkage, RVSDGMod, Visibility,
+        GlobalId, GlobalInit, InlineHint, Linkage, RVSDGMod, ThreadLocalMode, Visibility,
         func::{
-            CallingConvention, FnAttrFlags, FnAttrs, FnDecl, Param, ParamAttrFlags, ParamAttrs,
+            CallingConvention, FnAttrFlags, FnAttrs, FnDecl, MemoryEffects, ModRef, Param,
+            ParamAttrFlags, ParamAttrs, ParamAttrsExtra,
         },
+        global::{DllStorageClass, GlobalDef, UnnamedAddr},
         types::{
             ArrayType, FuncType, PtrType, ScalarType, StructDef, StructField, TypeArena, TypeRef,
             VOID, VectorType,
@@ -155,10 +157,13 @@ impl RVSDGMod {
             ),
             None => RVSDGMod::new_host(module.name.clone()),
         };
+        // Module-level inline assembly defines real symbols (hand-written
+        // routines the module calls); preserve it verbatim.
+        rvsdg_mod.module_asm = module.inline_assembly.clone();
 
         // lower function declerations
         for func in &module.func_declarations {
-            let decl = FnDecl::from_signature(func, &mut rvsdg_mod.types, &module)?;
+            let decl = FnDecl::from_declaration(func, &mut rvsdg_mod.types, &module)?;
             rvsdg_mod.declare_fn_full(decl);
         }
         for func in &module.functions {
@@ -167,16 +172,43 @@ impl RVSDGMod {
         }
 
         // Globals are lowered in two passes so an initializer can reference
-        // a global/alias declared later in the module (csmith emits such
-        // forward references freely -- e.g. one global initialised with the
-        // address of another). Pass 1 registers every global, alias, and
-        // ifunc name (and its type) in `global_map`; pass 2 resolves the
-        // initializers, which may now look up any global by name.
+        // a global declared later in the module (csmith emits such forward
+        // references freely -- e.g. one global initialised with the
+        // address of another). Pass 1 registers every global's name (and
+        // its type) in `global_map`; pass 2 resolves the initializers,
+        // which may now look up any global by name. (Aliases and ifuncs
+        // are refused below, so no other symbol kinds exist here.)
 
         // Pass 1: register names with a placeholder (Extern) initializer.
         let mut var_ids: Vec<GlobalId> = Vec::with_capacity(module.global_vars.len());
         for global in &module.global_vars {
-            let value_ty = match &global.initializer {
+            // Exhaustive destructure: adding a field to llvm-ir's
+            // GlobalVariable breaks compilation HERE until it is carried or
+            // deliberately dropped. This is the completeness contract that
+            // stops attributes silently vanishing one broken build at a
+            // time (thread_local and module asm both got in that way).
+            let llvm_ir::module::GlobalVariable {
+                name,
+                linkage,
+                visibility,
+                is_constant,
+                ty,
+                addr_space,
+                dll_storage_class,
+                thread_local_mode,
+                unnamed_addr,
+                initializer,
+                section,
+                // COMDAT selection only matters for C++ ODR-style link
+                // dedup; linkonce/weak LINKAGE (carried above) covers the C
+                // corpus. Dropped until a real input needs it.
+                comdat: _comdat,
+                alignment,
+                // No debug info support yet.
+                debugloc: _debugloc,
+            } = global;
+
+            let value_ty = match initializer {
                 Some(init) => {
                     let ty = module.types.type_of(init.as_ref());
                     rvsdg_mod.types.convert_type_ref(&ty, &module)?
@@ -187,38 +219,62 @@ impl RVSDGMod {
                 // content type `ptr`); the old code dereferenced it and fell
                 // back to `void` for an opaque pointee, which is not a valid
                 // value type and crashed the backend.
-                None => rvsdg_mod.types.convert_type_ref(&global.ty, &module)?,
+                None => rvsdg_mod.types.convert_type_ref(ty, &module)?,
             };
-            let id = rvsdg_mod.define_global(
-                global_name_string(&global.name),
-                value_ty,
-                GlobalInit::Extern,
-                global.is_constant,
-                convert_linkage(global.linkage),
-            );
+            let id = rvsdg_mod.define_global(GlobalDef {
+                name: global_name_string(name),
+                ty: value_ty,
+                // Resolved in pass 2, once every name is registered.
+                initializer: GlobalInit::Extern,
+                is_constant: *is_constant,
+                linkage: convert_linkage(*linkage),
+                alignment: (*alignment != 0).then_some(*alignment),
+                section: section.clone(),
+                visibility: convert_visibility(*visibility),
+                thread_local: convert_thread_local_mode(*thread_local_mode),
+                addr_space: *addr_space,
+                unnamed_addr: match unnamed_addr {
+                    None => UnnamedAddr::None,
+                    Some(llvm_ir::module::UnnamedAddr::Local) => UnnamedAddr::Local,
+                    Some(llvm_ir::module::UnnamedAddr::Global) => UnnamedAddr::Global,
+                },
+                dll_storage_class: convert_dll_storage_class(*dll_storage_class),
+            });
             var_ids.push(id);
         }
-        let mut alias_ids: Vec<GlobalId> = Vec::with_capacity(module.global_aliases.len());
-        for global in &module.global_aliases {
-            let ty = rvsdg_mod.types.convert_type_ref(&global.ty, &module)?;
-            let id = rvsdg_mod.define_global(
-                global_name_string(&global.name),
-                ty,
-                GlobalInit::Extern,
-                true,
-                convert_linkage(global.linkage),
-            );
-            alias_ids.push(id);
+        // Aliases and ifuncs are refused, not mistranslated. An alias is a
+        // second NAME for an existing definition (a linker-level construct,
+        // not a computational one); an earlier encoding here (a global
+        // variable holding the aliasee's ADDRESS) silently changed
+        // semantics for pointer-typed aliases: loads through the alias read
+        // an address instead of the data, and the two symbols stopped
+        // being identical. An ifunc picks its implementation by running a
+        // resolver at LOAD time, so it cannot be resolved during
+        // compilation at all.
+        //
+        // The settled design, when an input needs it: aliases never enter
+        // the graph. In-module references to a NON-interposable alias
+        // (private/internal) resolve directly to the aliasee -- exact,
+        // since the two share one address, and better for the optimiser
+        // than an opaque second symbol. In-module references to an
+        // interposable (weak/external) alias stay refused: folding them
+        // would bypass link-time interposition. Every alias is carried as
+        // passive module metadata (like module_asm) and re-emitted for the
+        // symbol table via LLVMAddAlias2, which inkwell does not wrap (one
+        // contained llvm-sys call). Body copies or wrapper functions are
+        // NOT valid substitutes: both break the address identity
+        // (&alias == &aliasee) that the construct guarantees.
+        if let Some(alias) = module.global_aliases.first() {
+            return Err(eyre!(
+                "module defines the alias {:?}; aliases are not supported yet",
+                alias.name
+            ));
         }
-        for global in &module.global_ifuncs {
-            let ty = rvsdg_mod.types.convert_type_ref(&global.ty, &module)?;
-            rvsdg_mod.define_global(
-                global_name_string(&global.name),
-                ty,
-                GlobalInit::Extern,
-                true,
-                convert_linkage(global.linkage),
-            );
+        if let Some(ifunc) = module.global_ifuncs.first() {
+            return Err(eyre!(
+                "module defines the ifunc {:?}; ifuncs are not supported yet",
+                ifunc.name
+            ));
         }
 
         // Pass 2: resolve initializers now that every name is registered.
@@ -227,10 +283,6 @@ impl RVSDGMod {
                 let cid = rvsdg_mod.convert_const_ref(init.clone(), &module)?;
                 rvsdg_mod.set_global_init(id, GlobalInit::Init(cid));
             }
-        }
-        for (global, &id) in module.global_aliases.iter().zip(&alias_ids) {
-            let cid = rvsdg_mod.convert_const_ref(global.aliasee.clone(), &module)?;
-            rvsdg_mod.set_global_init(id, GlobalInit::Init(cid));
         }
         // TODO: lower types
         // pub types: Types,
@@ -292,6 +344,24 @@ impl RVSDGMod {
     }
 }
 impl TypeArena {
+    fn convert_struct_fields(
+        &mut self,
+        element_types: &[LLVMTypeRef],
+        module: &Module,
+    ) -> color_eyre::Result<Vec<StructField>> {
+        element_types
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                Ok(StructField {
+                    name: None,
+                    index: i as u64,
+                    field_type: self.convert_type_ref(t, module)?,
+                })
+            })
+            .collect()
+    }
+
     fn convert_type_ref(
         &mut self,
         ty: &LLVMTypeRef,
@@ -355,19 +425,9 @@ impl TypeArena {
             }
             llvm_ir::Type::StructType {
                 element_types,
-                is_packed: _,
+                is_packed,
             } => {
-                let fields: Vec<StructField> = element_types
-                    .iter()
-                    .enumerate()
-                    .map(|(i, t)| {
-                        Ok(StructField {
-                            name: None,
-                            index: i as u64,
-                            field_type: self.convert_type_ref(t, module)?,
-                        })
-                    })
-                    .collect::<color_eyre::Result<_>>()?;
+                let fields = self.convert_struct_fields(element_types, module)?;
                 TypeRef::Struct(self.intern_struct(StructDef {
                     name: None,
                     fields,
@@ -375,12 +435,35 @@ impl TypeArena {
                     // padding which LLVM will do for us, so we only need this when not going into
                     // LLVM.
                     size: 0,
+                    packed: *is_packed,
                 }))
             }
             llvm_ir::Type::NamedStructType { name } => {
                 match module.types.named_struct_def(name) {
+                    // Keep the NAME on the interned struct: emission
+                    // recreates it as an LLVM named struct, so the type
+                    // round-trips as %name instead of decaying to an
+                    // anonymous literal struct.
                     Some(llvm_ir::types::NamedStructDef::Defined(inner_ty)) => {
-                        self.convert_type_ref(inner_ty, module)?
+                        match inner_ty.as_ref() {
+                            llvm_ir::Type::StructType {
+                                element_types,
+                                is_packed,
+                            } => {
+                                let fields = self.convert_struct_fields(element_types, module)?;
+                                TypeRef::Struct(self.intern_struct(StructDef {
+                                    name: Some(name.clone()),
+                                    fields,
+                                    size: 0,
+                                    packed: *is_packed,
+                                }))
+                            }
+                            other => {
+                                return Err(eyre!(
+                                    "named struct '{name}' defined as a non-struct type: {other:?}"
+                                ));
+                            }
+                        }
                     }
                     Some(llvm_ir::types::NamedStructDef::Opaque) => {
                         // Opaque structs are only used behind pointers, so treat
@@ -389,6 +472,7 @@ impl TypeArena {
                             name: Some(name.clone()),
                             fields: vec![],
                             size: 0,
+                            packed: false,
                         }))
                     }
                     None => return Err(eyre!("named struct '{name}' not found in module")),
@@ -420,10 +504,12 @@ trait FnSignature {
     fn sig_parameters(&self) -> &[llvm_ir::function::Parameter];
     fn sig_is_var_arg(&self) -> bool;
     fn sig_return_type(&self) -> &LLVMTypeRef;
+    fn sig_return_attributes(&self) -> &[llvm_ir::function::ParameterAttribute];
     fn sig_linkage(&self) -> llvm_ir::module::Linkage;
     fn sig_visibility(&self) -> llvm_ir::module::Visibility;
     fn sig_calling_convention(&self) -> llvm_ir::function::CallingConvention;
     fn sig_alignment(&self) -> u32;
+    fn sig_dll_storage_class(&self) -> llvm_ir::module::DLLStorageClass;
 }
 
 macro_rules! impl_fn_signature {
@@ -441,6 +527,9 @@ macro_rules! impl_fn_signature {
             fn sig_return_type(&self) -> &LLVMTypeRef {
                 &self.return_type
             }
+            fn sig_return_attributes(&self) -> &[llvm_ir::function::ParameterAttribute] {
+                &self.return_attributes
+            }
             fn sig_linkage(&self) -> llvm_ir::module::Linkage {
                 self.linkage
             }
@@ -453,11 +542,71 @@ macro_rules! impl_fn_signature {
             fn sig_alignment(&self) -> u32 {
                 self.alignment
             }
+            fn sig_dll_storage_class(&self) -> llvm_ir::module::DLLStorageClass {
+                self.dll_storage_class
+            }
         }
     };
 }
 impl_fn_signature!(FunctionDeclaration);
 impl_fn_signature!(llvm_ir::Function);
+
+/// Convert a parameter's (or return value's) LLVM attribute list into the
+/// RVSDG representation. The ABI-bearing attributes matter most: `byval`
+/// (the caller stack-copies the pointee), `sret` (hidden struct-return
+/// slot), and `zeroext`/`signext` (sub-register integers are extended at
+/// the call boundary). Dropping any of these miscompiles calls that cross
+/// an externally-compiled boundary.
+fn convert_param_attrs(
+    attributes: &[llvm_ir::function::ParameterAttribute],
+    types: &mut TypeArena,
+    module: &Module,
+) -> color_eyre::Result<ParamAttrs> {
+    use llvm_ir::function::ParameterAttribute;
+    let mut flags = ParamAttrFlags::empty();
+    let mut by_value = None;
+    let mut struct_return = None;
+    let mut alignment = None;
+    let mut dereferenceable_bytes = None;
+    for attr in attributes {
+        match attr {
+            ParameterAttribute::ZeroExt => flags |= ParamAttrFlags::ZERO_EXTEND,
+            ParameterAttribute::SignExt => flags |= ParamAttrFlags::SIGN_EXTEND,
+            ParameterAttribute::NoAlias => flags |= ParamAttrFlags::NO_ALIAS,
+            ParameterAttribute::NoCapture => flags |= ParamAttrFlags::NO_CAPTURE,
+            ParameterAttribute::NonNull => flags |= ParamAttrFlags::NON_NULL,
+            ParameterAttribute::NoUndef => flags |= ParamAttrFlags::NO_UNDEF,
+            ParameterAttribute::Returned => flags |= ParamAttrFlags::RETURNED,
+            ParameterAttribute::ByVal(ty) => {
+                by_value = Some(types.convert_type_ref(ty, module)?);
+            }
+            ParameterAttribute::SRet(ty) => {
+                struct_return = Some(types.convert_type_ref(ty, module)?);
+            }
+            ParameterAttribute::Alignment(bytes) => alignment = Some(*bytes as u32),
+            ParameterAttribute::Dereferenceable(bytes) => {
+                dereferenceable_bytes = Some(*bytes);
+            }
+            // Optimisation-only attributes we do not model yet; dropping
+            // them is conservative (never changes the ABI).
+            _ => {}
+        }
+    }
+    let extra = (by_value.is_some()
+        || struct_return.is_some()
+        || alignment.is_some()
+        || dereferenceable_bytes.is_some())
+    .then(|| {
+        Box::new(ParamAttrsExtra {
+            by_value,
+            struct_return,
+            alignment,
+            dereferenceable_bytes,
+            range: None,
+        })
+    });
+    Ok(ParamAttrs { flags, extra })
+}
 
 impl FnDecl {
     fn from_signature<S: FnSignature + ?Sized>(
@@ -474,18 +623,16 @@ impl FnDecl {
                 .sig_parameters()
                 .iter()
                 .map(|param| {
+                    let attrs = convert_param_attrs(&param.attributes, types, module)?;
                     Ok(Param {
                         ty: types.convert_type_ref(&param.ty, module)?,
-                        flags: ParamAttrFlags::empty(),
-                        extra: None,
+                        flags: attrs.flags,
+                        extra: attrs.extra,
                     })
                 })
                 .collect::<color_eyre::Result<_>>()?,
             return_types,
-            return_attrs: ParamAttrs {
-                flags: ParamAttrFlags::empty(),
-                extra: None,
-            },
+            return_attrs: convert_param_attrs(func.sig_return_attributes(), types, module)?,
             linkage_type: convert_linkage(func.sig_linkage()),
             calling_convention: convert_calling_convention(func.sig_calling_convention())?,
             is_var_arg: func.sig_is_var_arg(),
@@ -500,8 +647,48 @@ impl FnDecl {
                     None
                 },
                 section: None,
+                memory: None,
+                // Function attributes (including string attributes) are
+                // layered on by from_fn; llvm-ir does not expose them on
+                // bare declarations.
+                string_attrs: Vec::new(),
             },
+            dll_storage_class: convert_dll_storage_class(func.sig_dll_storage_class()),
         })
+    }
+
+    /// Convert an external function DECLARATION. The exhaustive
+    /// destructure is the parse-side completeness contract: a new llvm-ir
+    /// field breaks compilation here until it is carried or deliberately
+    /// dropped.
+    fn from_declaration(
+        decl: &FunctionDeclaration,
+        types: &mut TypeArena,
+        module: &Module,
+    ) -> color_eyre::Result<Self> {
+        let FunctionDeclaration {
+            // Converted by from_signature through the FnSignature trait.
+            name: _,
+            parameters: _,
+            is_var_arg: _,
+            return_type: _,
+            return_attributes: _,
+            linkage: _,
+            visibility: _,
+            dll_storage_class: _,
+            calling_convention: _,
+            alignment: _,
+            garbage_collector_name,
+            // No debug info support yet.
+            debugloc: _debugloc,
+        } = decl;
+        if let Some(gc) = garbage_collector_name {
+            return Err(eyre!(
+                "function `{}` uses garbage collection strategy {gc:?}, which is not supported",
+                decl.name
+            ));
+        }
+        Self::from_signature(decl, types, module)
     }
 
     fn from_fn(
@@ -509,44 +696,144 @@ impl FnDecl {
         types: &mut TypeArena,
         module: &Module,
     ) -> color_eyre::Result<Self> {
+        // Exhaustive destructure: the parse-side completeness contract for
+        // function DEFINITIONS (see from_declaration for the rationale).
+        let llvm_ir::Function {
+            // Converted by from_signature through the FnSignature trait.
+            name: _,
+            parameters: _,
+            is_var_arg: _,
+            return_type: _,
+            return_attributes: _,
+            linkage: _,
+            visibility: _,
+            dll_storage_class: _,
+            calling_convention: _,
+            alignment: _,
+            // Lowered by lower_fn_body after declaration.
+            basic_blocks: _,
+            // Converted below.
+            function_attributes: _,
+            section: _,
+            // COMDAT selection only matters for C++ ODR-style link dedup;
+            // linkonce/weak linkage covers the C corpus. Dropped until a
+            // real input needs it.
+            comdat: _comdat,
+            garbage_collector_name,
+            // An exception personality is only meaningful together with
+            // invoke/landingpad, which the parser rejects outright; with no
+            // invokes in the module the personality can never run, so
+            // dropping it is safe.
+            personality_function: _personality_function,
+            // No debug info support yet.
+            debugloc: _debugloc,
+        } = func;
+        if let Some(gc) = garbage_collector_name {
+            return Err(eyre!(
+                "function `{}` uses garbage collection strategy {gc:?}, which is not supported",
+                func.name
+            ));
+        }
+
         // Read the signature fields directly off the `Function` (it and
         // `FunctionDeclaration` both implement `FnSignature`) -- no temporary
         // clone -- then layer on the function-level attributes declarations lack.
         let mut decl = Self::from_signature(func, types, module)?;
 
         // Apply function-level attributes that declarations don't have
+        use llvm_ir::function::FunctionAttribute;
+        let none = MemoryEffects {
+            other: ModRef::NoModRef,
+            arg_mem: ModRef::NoModRef,
+            inaccessible_mem: ModRef::NoModRef,
+        };
         for attr in &func.function_attributes {
             match attr {
-                llvm_ir::function::FunctionAttribute::NoReturn => {
-                    decl.attrs.flags |= FnAttrFlags::NO_RETURN;
+                FunctionAttribute::NoReturn => decl.attrs.flags |= FnAttrFlags::NO_RETURN,
+                FunctionAttribute::NoUnwind => decl.attrs.flags |= FnAttrFlags::NO_UNWIND,
+                FunctionAttribute::NoRecurse => decl.attrs.flags |= FnAttrFlags::NO_RECURSE,
+                FunctionAttribute::Cold => decl.attrs.flags |= FnAttrFlags::COLD,
+                FunctionAttribute::StackProtect => decl.attrs.flags |= FnAttrFlags::STACK_PROTECT,
+                FunctionAttribute::StackProtectReq => {
+                    decl.attrs.flags |= FnAttrFlags::STACK_PROTECT_REQ;
                 }
-                llvm_ir::function::FunctionAttribute::NoUnwind => {
-                    decl.attrs.flags |= FnAttrFlags::NO_UNWIND;
+                FunctionAttribute::StackProtectStrong => {
+                    decl.attrs.flags |= FnAttrFlags::STACK_PROTECT_STRONG;
                 }
-                llvm_ir::function::FunctionAttribute::ReadOnly => {
-                    decl.attrs.flags |= FnAttrFlags::READ_ONLY;
-                }
-                llvm_ir::function::FunctionAttribute::ReadNone => {
-                    decl.attrs.flags |= FnAttrFlags::NO_MEMORY;
-                }
-                llvm_ir::function::FunctionAttribute::WriteOnly => {
-                    decl.attrs.flags |= FnAttrFlags::WRITE_ONLY;
-                }
-                llvm_ir::function::FunctionAttribute::NoRecurse => {
-                    decl.attrs.flags |= FnAttrFlags::NO_RECURSE;
-                }
-                llvm_ir::function::FunctionAttribute::NoInline => {
+                FunctionAttribute::UWTable => decl.attrs.flags |= FnAttrFlags::UWTABLE,
+                FunctionAttribute::WillReturn => decl.attrs.flags |= FnAttrFlags::WILL_RETURN,
+                FunctionAttribute::NoSync => decl.attrs.flags |= FnAttrFlags::NO_SYNC,
+                FunctionAttribute::NoFree => decl.attrs.flags |= FnAttrFlags::NO_FREE,
+                FunctionAttribute::NoInline => {
                     decl.attrs.flags |= FnAttrFlags::NO_INLINE;
                     decl.inline_hint = InlineHint::Never;
                 }
-                llvm_ir::function::FunctionAttribute::AlwaysInline => {
+                FunctionAttribute::AlwaysInline => {
                     decl.attrs.flags |= FnAttrFlags::ALWAYS_INLINE;
                     decl.inline_hint = InlineHint::Always;
                 }
-                llvm_ir::function::FunctionAttribute::Cold => {
-                    decl.attrs.flags |= FnAttrFlags::COLD;
+                // Memory behaviour: LLVM 16+ input carries the composite
+                // memory(...) attribute; the bare variants are its pre-16
+                // spellings, mapped onto the same structure.
+                FunctionAttribute::Memory {
+                    default,
+                    argmem,
+                    inaccessible_mem,
+                } => {
+                    let conv = |e: &llvm_ir::function::MemoryEffect| match e {
+                        llvm_ir::function::MemoryEffect::None => ModRef::NoModRef,
+                        llvm_ir::function::MemoryEffect::Read => ModRef::Ref,
+                        llvm_ir::function::MemoryEffect::Write => ModRef::Mod,
+                        llvm_ir::function::MemoryEffect::ReadWrite => ModRef::ModRef,
+                    };
+                    decl.attrs.memory = Some(MemoryEffects {
+                        other: conv(default),
+                        arg_mem: conv(argmem),
+                        inaccessible_mem: conv(inaccessible_mem),
+                    });
                 }
-                _ => {} // ignore attributes we don't model yet
+                FunctionAttribute::ReadNone => decl.attrs.memory = Some(none),
+                FunctionAttribute::ReadOnly => {
+                    decl.attrs.memory = Some(MemoryEffects {
+                        other: ModRef::Ref,
+                        arg_mem: ModRef::Ref,
+                        inaccessible_mem: ModRef::Ref,
+                    });
+                }
+                FunctionAttribute::WriteOnly => {
+                    decl.attrs.memory = Some(MemoryEffects {
+                        other: ModRef::Mod,
+                        arg_mem: ModRef::Mod,
+                        inaccessible_mem: ModRef::Mod,
+                    });
+                }
+                FunctionAttribute::ArgMemOnly => {
+                    decl.attrs.memory = Some(MemoryEffects {
+                        arg_mem: ModRef::ModRef,
+                        ..none
+                    });
+                }
+                FunctionAttribute::InaccessibleMemOnly => {
+                    decl.attrs.memory = Some(MemoryEffects {
+                        inaccessible_mem: ModRef::ModRef,
+                        ..none
+                    });
+                }
+                FunctionAttribute::InaccessibleMemOrArgMemOnly => {
+                    decl.attrs.memory = Some(MemoryEffects {
+                        arg_mem: ModRef::ModRef,
+                        inaccessible_mem: ModRef::ModRef,
+                        ..none
+                    });
+                }
+                // Carried verbatim: these steer codegen (target features,
+                // stack-protector sizing, frame pointer policy, ...).
+                FunctionAttribute::StringAttribute { kind, value } => {
+                    decl.attrs.string_attrs.push((kind.clone(), value.clone()));
+                }
+                // Not modeled yet; the fidelity net surfaces any of these
+                // the moment a real input carries them.
+                _ => {}
             }
         }
 
@@ -558,9 +845,28 @@ impl FnDecl {
     }
 }
 
+fn convert_dll_storage_class(class: llvm_ir::module::DLLStorageClass) -> DllStorageClass {
+    match class {
+        llvm_ir::module::DLLStorageClass::Default => DllStorageClass::Default,
+        llvm_ir::module::DLLStorageClass::Import => DllStorageClass::Import,
+        llvm_ir::module::DLLStorageClass::Export => DllStorageClass::Export,
+    }
+}
+
+fn convert_thread_local_mode(mode: llvm_ir::module::ThreadLocalMode) -> ThreadLocalMode {
+    match mode {
+        llvm_ir::module::ThreadLocalMode::NotThreadLocal => ThreadLocalMode::NotThreadLocal,
+        llvm_ir::module::ThreadLocalMode::GeneralDynamic => ThreadLocalMode::GeneralDynamic,
+        llvm_ir::module::ThreadLocalMode::LocalDynamic => ThreadLocalMode::LocalDynamic,
+        llvm_ir::module::ThreadLocalMode::InitialExec => ThreadLocalMode::InitialExec,
+        llvm_ir::module::ThreadLocalMode::LocalExec => ThreadLocalMode::LocalExec,
+    }
+}
+
 fn convert_linkage(linkage: llvm_ir::module::Linkage) -> Linkage {
     match linkage {
-        llvm_ir::module::Linkage::Private | llvm_ir::module::Linkage::Internal => Linkage::Internal,
+        llvm_ir::module::Linkage::Private => Linkage::Private,
+        llvm_ir::module::Linkage::Internal => Linkage::Internal,
         llvm_ir::module::Linkage::External | llvm_ir::module::Linkage::ExternalWeak => {
             Linkage::External
         }

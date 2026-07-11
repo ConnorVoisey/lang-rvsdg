@@ -1,11 +1,12 @@
 use crate::rvsdg::{
     FuncId, GlobalId, MatchArmSpan, RegionId, RegionsSpan, State, U32Span, ValueId, ValuesSpan,
     constant::ConstId,
+    func::SignatureId,
     ops::{
         ArithFlags, AtomicRMWOp, BinaryOp, CastOp, FCmpPred, ICmpPred, IntrinsicOp, MemoryOrdering,
         UnaryOp,
     },
-    types::{FuncTypeId, TypeRef},
+    types::TypeRef,
 };
 
 /// The data associated with a Value in the pool.
@@ -140,6 +141,7 @@ pub enum ValueKind {
         loaded_type: TypeRef,
         ordering: MemoryOrdering,
         align: Option<u32>,
+        volatile: bool,
     },
     /// Atomic store. The node itself is the output state.
     AtomicStore {
@@ -148,6 +150,7 @@ pub enum ValueKind {
         value: ValueId,
         ordering: MemoryOrdering,
         align: Option<u32>,
+        volatile: bool,
     },
     /// Atomic read-modify-write. Output state is the node;
     /// Project { index: 0 } for the old value.
@@ -157,9 +160,13 @@ pub enum ValueKind {
         value: ValueId,
         op: AtomicRMWOp,
         ordering: MemoryOrdering,
+        volatile: bool,
     },
     /// Atomic compare-and-swap. Output state is the node;
     /// Project { index: 0 } for the old value, Project { index: 1 } for success flag.
+    /// Always strong: a strong compare-and-swap never fails spuriously,
+    /// which is a valid implementation of LLVM's `weak` form, so the weak
+    /// flag is dropped at parse time.
     CompareAndSwap {
         state: State,
         addr: ValueId,
@@ -167,6 +174,7 @@ pub enum ValueKind {
         desired: ValueId,
         success_ordering: MemoryOrdering,
         failure_ordering: MemoryOrdering,
+        volatile: bool,
     },
     /// Memory fence. The node itself is the output state.
     Fence {
@@ -225,20 +233,29 @@ pub enum ValueKind {
         /// The recursion variables (function references available inside the phi body)
         rv_count: u16,
     },
+    /// Direct call to a known function. The call site carries its own
+    /// interned ABI [`Signature`](crate::rvsdg::func::Signature), same as
+    /// an indirect call: LLVM attributes live on call sites as well as
+    /// declarations, and for a variadic call the site is the ONLY place
+    /// the variadic actual arguments' ABI attributes exist (e.g. byval on
+    /// a struct passed through `...`) -- the declaration has no parameter
+    /// entries for them.
     Call {
         state: State,
         fn_id: FuncId,
+        sig: SignatureId,
         args: ValuesSpan,
     },
-    /// Indirect call through a function pointer. The callee's signature is
-    /// stored here rather than derived from the callee value: pointers are
-    /// opaque (no pointee type), so the call site is the only place the
-    /// signature exists -- the same reason LLVM call instructions carry
-    /// their own function type.
+    /// Indirect call through a function pointer. The callee's full ABI
+    /// signature (function type, parameter/return attributes, calling
+    /// convention) is stored here rather than derived from the callee
+    /// value: pointers are opaque (no pointee type), so the call site is
+    /// the only place the signature exists -- the same reason LLVM call
+    /// instructions carry their own function type.
     CallIndirect {
         state: State,
         callee: ValueId,
-        fn_ty: FuncTypeId,
+        sig: SignatureId,
         args: ValuesSpan,
     },
     Project {

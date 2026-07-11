@@ -9,7 +9,7 @@ const BUF_SIZE: usize = 8192;
 
 fn main() -> color_eyre::Result<()> {
     let rvsdg = build_yes();
-    rvsdg.output_with_llvm("cat", &[], &[], false).unwrap();
+    rvsdg.output_with_llvm("cat", &[], &[], &[], false).unwrap();
     Ok(())
 }
 
@@ -31,7 +31,7 @@ pub fn build_yes() -> RVSDGMod {
         no_escape: false,
     }));
     let buf_const_id = rvsdg.constants.string(buf_type, buf);
-    let buf_global = rvsdg.define_global(
+    let buf_global = rvsdg.define_global_plain(
         String::from("yes_buf"),
         buf_type,
         GlobalInit::Init(buf_const_id),

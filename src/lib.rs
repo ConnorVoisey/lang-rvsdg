@@ -13,7 +13,6 @@ use tempfile::NamedTempFile;
 use tracing_chrome::{ChromeLayerBuilder, FlushGuard};
 use tracing_subscriber::Layer;
 use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::util::SubscriberInitExt;
 
 use crate::rvsdg::RVSDGMod;
 
@@ -54,28 +53,26 @@ pub fn init_chrome_tracing(path: &str) -> color_eyre::Result<FlushGuard> {
         .include_args(true)
         .build();
     // Spans only: the chrome trace exists for our #[tracing::instrument]
-    // spans, not for events.
-    tracing_subscriber::registry()
-        .with(
-            chrome_layer.with_filter(tracing_subscriber::filter::filter_fn(|metadata| {
-                metadata.is_span()
-            })),
-        )
-        .try_init()?;
-    // `try_init` also installs the log-to-tracing bridge (the tracing-log
-    // feature is forced on by other dependencies through feature
-    // unification). The llvm-ir parser logs per-value records at trace
-    // level, and the bridge pays dynamic-metadata dispatch for every call
-    // even when the record is filtered out -- measured on sqlite3, that
-    // turned a 1-second parse into 19 seconds whenever --trace was active
-    // and made the profile lie about where time goes. Turning the log side
-    // off makes each of those calls a single atomic load.
-    log::set_max_level(log::LevelFilter::Off);
+    // spans, not for events. Installed via set_global_default rather than
+    // try_init: try_init would also install the log-to-tracing bridge (the
+    // tracing-log feature is forced on by other dependencies through
+    // feature unification), and the llvm-ir parser logs per-value records
+    // at trace level -- the bridge's per-record dynamic dispatch turned a
+    // 1-second sqlite3 parse into 19 seconds whenever --trace was active
+    // and made the profile lie about where time goes. With no bridge
+    // installed, each of those log calls is a single atomic load.
+    let subscriber = tracing_subscriber::registry().with(chrome_layer.with_filter(
+        tracing_subscriber::filter::filter_fn(|metadata| metadata.is_span()),
+    ));
+    tracing::subscriber::set_global_default(subscriber)?;
     Ok(guard)
 }
 
+/// Parse an input (`.c` through the clang + mem2reg frontend, `.ll`/`.bc`
+/// directly) into an llvm-ir module. Public so the fidelity tests can
+/// parse the same inputs the compiler does -- one pipeline, not a copy.
 #[tracing::instrument(skip_all)]
-fn c_file_to_mod(
+pub fn c_file_to_mod(
     c_file_path: &Path,
     include_dirs: &[String],
     defines: &[String],
@@ -191,6 +188,8 @@ fn c_file_to_mod(
 )]
 #[command(group(ArgGroup::new("mode").required(false).args(["output", "run"])))]
 pub struct Cli {
+    /// Output executable path (an `.o` with the same stem is written next
+    /// to it). Defaults to the input file's stem in the current directory.
     #[arg(short, long)]
     pub(crate) output: Option<String>,
 
@@ -237,6 +236,25 @@ pub struct Cli {
 }
 
 impl Cli {
+    /// Test constructor: compile `input` to an executable at `output`,
+    /// linking the extra `link` inputs (the `--link` flag). Used by the
+    /// two-translation-unit ABI fixtures, which need a real linked binary
+    /// rather than the JIT.
+    pub fn get_output_integration(input: String, output: String, link: Vec<String>) -> Self {
+        Self {
+            output: Some(output),
+            run: false,
+            optimise: false,
+            quiet: true,
+            include: Vec::new(),
+            define: Vec::new(),
+            trace: None,
+            link,
+            link_arg: Vec::new(),
+            input,
+        }
+    }
+
     pub fn get_run_integration(input: String) -> Self {
         Self {
             output: None,
@@ -304,21 +322,45 @@ pub fn run_cli(cli: &Cli) -> color_eyre::Result<Option<u8>> {
         let res = unsafe { func.call() };
         Ok(Some(res))
     } else {
+        // Without -o, derive the output from the input file's stem
+        // (`foo.c` -> `./foo`), the rustc convention. The module name is
+        // NOT a usable default: for .ll input it is the input path itself,
+        // and a successful link once overwrote its own input IR.
         let output = match &cli.output {
-            Some(v) => &v.to_string(),
-            None => &rvsdg.mod_name,
+            Some(v) => v.clone(),
+            None => c_file_path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    color_eyre::eyre::eyre!(
+                        "cannot derive an output name from input path {}; pass -o",
+                        cli.input
+                    )
+                })?,
         };
-        // Without -o the default output is the module name, which for a
-        // .ll input is the input path itself -- a successful link would
-        // overwrite the input file with the executable. Refuse instead.
-        if Path::new(output).exists()
-            && std::fs::canonicalize(output)? == std::fs::canonicalize(c_file_path)?
+        // Defense in depth behind the stem default: never write the
+        // executable over the input file, whatever the paths resolve to.
+        if Path::new(&output).exists()
+            && std::fs::canonicalize(&output)? == std::fs::canonicalize(c_file_path)?
         {
             color_eyre::eyre::bail!(
                 "output path {output} is the input file; pass -o to choose a different output"
             );
         }
-        rvsdg.output_with_llvm(output, &cli.link, &cli.link_arg, &cli.include, cli.quiet)?;
+        // A --link-arg value with embedded whitespace that is not a file is
+        // almost always several linker flags squeezed into one argument
+        // (e.g. '-luring -lpq'); cc receives it as a single unknown option
+        // and the resulting linker error does not point back here.
+        for arg in &cli.link_arg {
+            if arg.contains(char::is_whitespace) && !Path::new(arg).exists() {
+                eprintln!(
+                    "warning: --link-arg value {arg:?} contains whitespace and is not a file; \
+                     linker flags must be passed one per --link-arg"
+                );
+            }
+        }
+        rvsdg.output_with_llvm(&output, &cli.link, &cli.link_arg, &cli.include, cli.quiet)?;
         Ok(None)
     }
 }

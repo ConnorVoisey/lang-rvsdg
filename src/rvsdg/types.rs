@@ -104,6 +104,9 @@ pub struct StructDef {
     pub fields: Vec<StructField>,
     /// Total size in bytes
     pub size: u64,
+    /// Packed layout (no inter-field padding; LLVM's `<{...}>` spelling).
+    /// Dropping this silently corrupts every field offset.
+    pub packed: bool,
 }
 
 #[derive(Debug, Default)]
