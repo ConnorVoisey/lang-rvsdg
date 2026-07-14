@@ -192,7 +192,10 @@ impl RVSDGMod {
                 linkage,
                 visibility,
                 is_constant,
-                ty,
+                // The global value's own type; superseded by `value_type`
+                // below (LLVMGlobalGetValueType), which is the authoritative
+                // content type and needs no derivation from the initializer.
+                ty: _ty,
                 addr_space,
                 dll_storage_class,
                 thread_local_mode,
@@ -206,20 +209,23 @@ impl RVSDGMod {
                 alignment,
                 // No debug info support yet.
                 debugloc: _debugloc,
+                value_type,
             } = global;
 
             let value_ty = match initializer {
+                // LLVM requires a global's type and its initializer's type
+                // to match EXACTLY, and the initializer is lowered from its
+                // own type (pass 2), so that type is authoritative here --
+                // value_type can legitimately differ in named-ness (a named
+                // struct global initialised by a literal struct constant).
                 Some(init) => {
                     let ty = module.types.type_of(init.as_ref());
                     rvsdg_mod.types.convert_type_ref(&ty, &module)?
                 }
-                // No initializer (external/declared global): use its declared
-                // type directly. Under opaque pointers `global.ty` is already
-                // the content type (e.g. `@stderr = external global ptr` has
-                // content type `ptr`); the old code dereferenced it and fell
-                // back to `void` for an opaque pointee, which is not a valid
-                // value type and crashed the backend.
-                None => rvsdg_mod.types.convert_type_ref(ty, &module)?,
+                // No initializer (external/declared global): value_type
+                // (LLVMGlobalGetValueType) is the authoritative content
+                // type; the global value's own type is just an opaque ptr.
+                None => rvsdg_mod.types.convert_type_ref(value_type, &module)?,
             };
             let id = rvsdg_mod.define_global(GlobalDef {
                 name: global_name_string(name),
@@ -381,6 +387,7 @@ impl TypeArena {
             llvm_ir::Type::FPType(fptype) => match fptype {
                 llvm_ir::types::FPType::Single => TypeRef::Scalar(ScalarType::F32),
                 llvm_ir::types::FPType::Double => TypeRef::Scalar(ScalarType::F64),
+                llvm_ir::types::FPType::X86_FP80 => TypeRef::Scalar(ScalarType::F80),
                 other => Err(eyre!("unsupported float type: {other:?}"))?,
             },
             llvm_ir::Type::FuncType {

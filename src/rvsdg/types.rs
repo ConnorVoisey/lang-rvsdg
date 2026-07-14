@@ -36,6 +36,10 @@ pub enum ScalarType {
     // TODO: add unsigned variants
     F32,
     F64,
+    /// x86 extended precision (C's `long double` on x86-64). Shows up in
+    /// real inputs mostly as STORAGE -- alignment unions (Lua's
+    /// LUAI_MAXALIGN), va_list slots -- lowered to LLVM's x86_fp80.
+    F80,
 
     Void,
 }
@@ -126,6 +130,15 @@ pub struct TypeArena {
 }
 
 impl TypeArena {
+    /// Total interned type entries across all kind tables.
+    pub fn interned_len(&self) -> usize {
+        self.ptrs.len()
+            + self.arrays.len()
+            + self.vectors.len()
+            + self.funcs.len()
+            + self.structs.len()
+    }
+
     pub fn intern_ptr(&mut self, info: PtrType) -> PtrTypeId {
         if let Some(&id) = self.ptr_cache.get(&info) {
             return id;

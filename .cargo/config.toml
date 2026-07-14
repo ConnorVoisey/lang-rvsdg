@@ -1,0 +1,7 @@
+# llvm-sys must link LLVM 22 (the version inkwell and llvm-ir are built
+# for). The system llvm-config IS 22 today, so this pin is belt and
+# braces: it keeps a future system upgrade (e.g. to LLVM 23) from
+# silently changing what a bare `cargo build` links against, which
+# historically produced binaries that panic on every parse.
+[env]
+LLVM_SYS_221_PREFIX = "/usr"

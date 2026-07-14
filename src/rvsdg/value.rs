@@ -16,9 +16,11 @@ pub struct Value {
     pub kind: ValueKind,
 }
 
-// Size: 32 bytes. Driven by Load/Store/AtomicLoad variants at 25 bytes payload.
-// Most variants are 4-16 bytes but boxing the large ones would add pointer chases
-// on the most frequently accessed operations -- not worth the tradeoff.
+// A Value (this kind plus its 8-byte TypeRef) measures 40 bytes; the
+// census's memory-budget table tracks the real figure. The size is
+// driven by the memory-op variants; most variants are 4-16 bytes, but
+// boxing the large ones would add pointer chases on the most frequently
+// accessed operations -- not worth the tradeoff.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ValueKind {
     Const(ConstValue),
@@ -270,6 +272,24 @@ pub enum ValueKind {
         values: ValuesSpan,
         state: State,
     },
+}
+
+impl ValueKind {
+    /// Region-free values denote the same thing in every region:
+    /// constants and symbol references. They are interned module-wide
+    /// (one node per distinct value), belong to NO region's node list,
+    /// and the scope rules exempt them from the values-flow-through-
+    /// edges requirement -- the emitter materialises LLVM constants for
+    /// them on demand, which needs no dominance.
+    pub fn is_region_free(&self) -> bool {
+        matches!(
+            self,
+            ValueKind::Const(_)
+                | ValueKind::ConstPoolRef(_)
+                | ValueKind::GlobalRef(_)
+                | ValueKind::FuncAddr(_)
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

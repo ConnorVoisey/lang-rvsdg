@@ -130,6 +130,7 @@ impl RVSDGMod {
         link_inputs: &[String],
         link_args: &[String],
         include_dirs: &[String],
+        defines: &[String],
         quiet: bool,
     ) -> color_eyre::Result<()> {
         // initialise things (guarded so concurrent callers don't race the
@@ -183,10 +184,13 @@ impl RVSDGMod {
 
         // Link the compiled object together with any extra inputs (e.g. a
         // benchmark harness like PolyBench's `utilities/polybench.c`). `cc`
-        // compiles any `.c` inputs and links everything; the `-I` paths are
-        // passed so those sources can find their headers. The extra link
-        // arguments (e.g. `-lm`) go after every object so library flags
-        // resolve the symbols those objects reference.
+        // compiles any `.c` inputs and links everything; the `-I` paths and
+        // `-D` defines are passed so those sources see the same headers and
+        // configuration the primary input was compiled with (PolyBench's
+        // timer, for one, is compiled out of polybench.c unless
+        // POLYBENCH_TIME reaches it and then silently reports zeros). The
+        // extra link arguments (e.g. `-lm`) go after every object so
+        // library flags resolve the symbols those objects reference.
         let mut link = Command::new("cc");
         link.arg(obj_arg);
         for input in link_inputs {
@@ -197,6 +201,9 @@ impl RVSDGMod {
         }
         for dir in include_dirs {
             link.arg("-I").arg(dir);
+        }
+        for define in defines {
+            link.arg(format!("-D{define}"));
         }
         link.args(["-o", output]);
         let status = link
@@ -592,9 +599,11 @@ impl RVSDGMod {
                 match res.len() {
                     0 => llvm_builder.builder.build_return(None)?,
                     1 => {
-                        let val = mapper.get_val(res[0]).ok_or_else(|| {
-                            eyre!("return value of `{}` was not lowered", rvsdg_func.name)
-                        })?;
+                        let val = self
+                            .lowered_result(llvm_builder, mapper, rvsdg_func, res[0])?
+                            .ok_or_else(|| {
+                                eyre!("return value of `{}` was not lowered", rvsdg_func.name)
+                            })?;
                         llvm_builder
                             .builder
                             .build_return(Some(&val as &dyn BasicValue))?
@@ -652,6 +661,7 @@ impl RVSDGMod {
                 ScalarType::I128 => BasicTypeEnum::IntType(context.i128_type()),
                 ScalarType::F32 => BasicTypeEnum::FloatType(context.f32_type()),
                 ScalarType::F64 => BasicTypeEnum::FloatType(context.f64_type()),
+                ScalarType::F80 => BasicTypeEnum::FloatType(context.x86_f80_type()),
                 // Void is not a BasicType in LLVM -- it only appears as a function
                 // return type, never as a value/parameter/alloca type.
                 ScalarType::Void => bail!("`void` is not a basic type"),

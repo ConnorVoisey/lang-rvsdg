@@ -462,6 +462,75 @@ fn test_53_variadic_byval() {
     );
 }
 
+// 54-64: accumulator-promotion corpus. Loops that read-modify-write an
+// array cell, from the plainly promotable shapes through the aliasing,
+// zero-trip, conditional, early-exit, varying-address and call-clobber
+// hazards where the cell's memory traffic is semantically visible. Each
+// fixture's comment describes the shape; the exit codes pin the
+// semantics.
+#[test]
+fn test_54_promote_basic() {
+    test_c_file("tests/fixtures/c/54_promote_basic.c");
+}
+
+#[test]
+fn test_55_promote_gemm() {
+    test_c_file("tests/fixtures/c/55_promote_gemm.c");
+}
+
+#[test]
+fn test_56_promote_two_cells() {
+    test_c_file("tests/fixtures/c/56_promote_two_cells.c");
+}
+
+#[test]
+fn test_57_promote_local_array() {
+    test_c_file("tests/fixtures/c/57_promote_local_array.c");
+}
+
+#[test]
+fn test_58_promote_alias_same_array() {
+    test_c_file("tests/fixtures/c/58_promote_alias_same_array.c");
+}
+
+#[test]
+fn test_59_promote_alias_params() {
+    test_c_file("tests/fixtures/c/59_promote_alias_params.c");
+}
+
+#[test]
+fn test_60_promote_zero_trip() {
+    test_c_file("tests/fixtures/c/60_promote_zero_trip.c");
+}
+
+#[test]
+fn test_61_promote_conditional() {
+    test_c_file("tests/fixtures/c/61_promote_conditional.c");
+}
+
+#[test]
+fn test_62_promote_early_exit() {
+    test_c_file("tests/fixtures/c/62_promote_early_exit.c");
+}
+
+#[test]
+fn test_63_promote_varying_address() {
+    test_c_file("tests/fixtures/c/63_promote_varying_address.c");
+}
+
+#[test]
+fn test_64_promote_call_clobber() {
+    test_c_file("tests/fixtures/c/64_promote_call_clobber.c");
+}
+
+// Constant getelementptr expressions whose source element type is not
+// recoverable from the base pointer (element-typed pointer arithmetic,
+// aggregate descent): the type must come from the expression itself.
+#[test]
+fn test_65_const_gep_addresses() {
+    test_c_file("tests/fixtures/c/65_const_gep_addresses.c");
+}
+
 // An alignas(64) global: the alignment attribute must survive re-emission
 // (checked through the global's runtime address).
 #[test]

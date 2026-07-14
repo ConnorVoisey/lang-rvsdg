@@ -302,6 +302,14 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
                 self.cast(i, CastOp::PtrToInt)?;
                 state
             }
+            // LLVM 22 instruction (address extraction for fat/tagged
+            // pointers); cannot occur in LLVM 19 input, which is the only
+            // version this pipeline builds against.
+            Instruction::PtrToAddr(_) => {
+                return Err(color_eyre::eyre::eyre!(
+                    "ptrtoaddr is an LLVM 22+ instruction; not supported"
+                ));
+            }
             Instruction::IntToPtr(i) => {
                 self.cast(i, CastOp::IntToPtr)?;
                 state

@@ -19,10 +19,11 @@
 
 use crate::rvsdg::{RVSDGMod, RegionId, ValueId, ValueKind, verify::RVSDGVerificationError};
 
-/// Where a value lives, built once over the whole graph and shared by the
-/// scope and state passes.
+/// Where a value lives, built once over the whole graph. Shared by the
+/// scope and state verifier passes and reused read-only by the census
+/// (`stats`), so there is one implementation of value ownership.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum Owner {
+pub(crate) enum Owner {
     /// Not in any region's nodes or params: region results, entry states,
     /// and other structural values that are never ordinary operands.
     Unowned,
@@ -38,7 +39,7 @@ impl RVSDGMod {
     /// is reported here; ownership then stays with the FIRST region seen,
     /// so any follow-up out-of-scope errors naming the other region are
     /// cascade noise from this one.
-    pub(super) fn build_value_ownership(
+    pub(crate) fn build_value_ownership(
         &self,
         errs: &mut Vec<RVSDGVerificationError>,
     ) -> Vec<Owner> {
@@ -71,15 +72,7 @@ impl RVSDGMod {
         // A value visible everywhere: constants and symbol references
         // denote the same thing in any region, so they are exempt from
         // ownership (the emitter materialises them where needed).
-        let region_free = |value: ValueId| {
-            matches!(
-                self.values[value.0 as usize].kind,
-                ValueKind::Const(_)
-                    | ValueKind::ConstPoolRef(_)
-                    | ValueKind::GlobalRef(_)
-                    | ValueKind::FuncAddr(_)
-            )
-        };
+        let region_free = |value: ValueId| self.values[value.0 as usize].kind.is_region_free();
 
         let check = |errs: &mut Vec<RVSDGVerificationError>,
                      user: ValueId,

@@ -72,7 +72,13 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
         inst: &llvm_ir::instruction::Call,
     ) -> color_eyre::Result<State> {
         let callee_operand = match &inst.function {
-            Either::Left(_inline_asm) => todo!("inline assembly call"),
+            // A call whose callee is an inline-assembly blob. Common in
+            // real inputs through force-inline header helpers whose bodies
+            // are asm (e.g. SDL_endian.h byte swaps) surviving the
+            // pass-free frontend as calls.
+            Either::Left(_inline_asm) => {
+                return Err(eyre!("inline-assembly call sites are not supported yet"));
+            }
             Either::Right(operand) => operand,
         };
 

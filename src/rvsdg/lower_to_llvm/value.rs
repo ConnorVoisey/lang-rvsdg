@@ -384,10 +384,11 @@ impl RVSDGMod {
                 // strengthened to system scope here -- correct, but emits
                 // real hardware fences where none were needed. The name
                 // must be empty: a fence is void and LLVM rejects named
-                // void values.
+                // void values. Not single-thread: syncscope is dropped at
+                // parse (system scope), so the fence is cross-thread.
                 llvm_builder
                     .builder
-                    .build_fence(ordering_to_llvm(ordering), 0, "")?;
+                    .build_fence(ordering_to_llvm(ordering), false, "")?;
                 None
             }
             ValueKind::Freeze { .. } => todo!(),
@@ -590,5 +591,24 @@ impl RVSDGMod {
     ) -> color_eyre::Result<BasicValueEnum<'ctx>> {
         self.lower_value(llvm_builder, mapper, rvsdg_func, value_id)?
             .ok_or_else(|| eyre!("expected a value-producing node, got a state-only node"))
+    }
+
+    /// Fetch one of a region's RESULT values after its body has been
+    /// lowered. Body values come straight out of the mapper (the region
+    /// walk lowered them); region-free values (interned constants and
+    /// symbol references, which belong to no region and are never
+    /// walked) are materialised on demand -- LLVM constants need no
+    /// instructions, so this is safe at any builder position.
+    pub(crate) fn lowered_result<'a, 'ctx>(
+        &self,
+        llvm_builder: &LLVMBuilderCtx<'a, 'ctx>,
+        mapper: &mut ValueMapper<'ctx>,
+        rvsdg_func: &Function,
+        result_id: ValueId,
+    ) -> color_eyre::Result<Option<BasicValueEnum<'ctx>>> {
+        if self.values[result_id.0 as usize].kind.is_region_free() {
+            return self.lower_value(llvm_builder, mapper, rvsdg_func, result_id);
+        }
+        Ok(*mapper.get_val(result_id))
     }
 }

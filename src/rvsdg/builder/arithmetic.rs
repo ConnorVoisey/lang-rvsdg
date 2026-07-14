@@ -8,37 +8,29 @@ use crate::rvsdg::{
 use super::{IntrinsicResult, OverflowResult, RegionBuilder};
 
 impl<'a> RegionBuilder<'a> {
+    // Constants and symbol references are region-free: interned
+    // module-wide on the graph, one node per distinct value, owned by
+    // no region. These builder methods are thin forwards kept so
+    // region-building code has everything in one place.
+
     #[inline]
     pub fn constant(&mut self, ty: TypeRef, const_val: ConstValue) -> ValueId {
-        // TODO: add constant dedupe here
-        self.add_value(Value {
-            ty,
-            kind: ValueKind::Const(const_val),
-        })
+        self.graph.intern_const(ty, const_val)
     }
 
     #[inline]
     pub fn global_ref(&mut self, global: crate::rvsdg::GlobalId, ptr_type: TypeRef) -> ValueId {
-        self.add_value(Value {
-            ty: ptr_type,
-            kind: ValueKind::GlobalRef(global),
-        })
+        self.graph.intern_global_ref(global, ptr_type)
     }
 
     #[inline]
     pub fn func_addr(&mut self, func_id: FuncId, ptr_type: TypeRef) -> ValueId {
-        self.add_value(Value {
-            ty: ptr_type,
-            kind: ValueKind::FuncAddr(func_id),
-        })
+        self.graph.intern_func_addr(func_id, ptr_type)
     }
 
     #[inline]
     pub fn const_pool_ref(&mut self, const_id: ConstId, ty: TypeRef) -> ValueId {
-        self.add_value(Value {
-            ty,
-            kind: ValueKind::ConstPoolRef(const_id),
-        })
+        self.graph.intern_const_pool_ref(const_id, ty)
     }
 
     #[inline]

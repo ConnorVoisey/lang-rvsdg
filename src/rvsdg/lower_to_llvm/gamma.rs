@@ -102,10 +102,12 @@ impl RVSDGMod {
 
             // Collect result values from the region
             let result_ids = self.value_pool.get(region.results).to_vec();
-            let results: Vec<BasicValueEnum<'ctx>> = result_ids
-                .iter()
-                .filter_map(|&rid| *mapper.get_val(rid))
-                .collect();
+            let mut results: Vec<BasicValueEnum<'ctx>> = Vec::with_capacity(result_ids.len());
+            for &rid in &result_ids {
+                if let Some(value) = self.lowered_result(llvm_builder, mapper, rvsdg_func, rid)? {
+                    results.push(value);
+                }
+            }
 
             // lowering the region could insert a new basic block, so get the current basic block
             // here

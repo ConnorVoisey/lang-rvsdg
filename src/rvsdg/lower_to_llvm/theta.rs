@@ -63,10 +63,12 @@ impl RVSDGMod {
         // Lower region, get results
         self.lower_region(llvm_builder, mapper, rvsdg_func, region)?;
         let result_ids = self.value_pool.get(region.results).to_vec();
-        let results: Vec<BasicValueEnum> = result_ids
-            .iter()
-            .filter_map(|&rid| *mapper.get_val(rid))
-            .collect();
+        let mut results: Vec<BasicValueEnum> = Vec::with_capacity(result_ids.len());
+        for &rid in &result_ids {
+            if let Some(value) = self.lowered_result(llvm_builder, mapper, rvsdg_func, rid)? {
+                results.push(value);
+            }
+        }
 
         // The back-edge wiring below zips phis with results; a mismatch would
         // silently leave some loop-variable phis with no back-edge incoming,

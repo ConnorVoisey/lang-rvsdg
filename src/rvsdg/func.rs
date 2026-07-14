@@ -261,6 +261,11 @@ impl SignatureTable {
     pub fn get(&self, id: SignatureId) -> &Signature {
         &self.signatures[id.0 as usize]
     }
+
+    /// Number of distinct interned signatures.
+    pub fn len(&self) -> usize {
+        self.signatures.len()
+    }
 }
 
 impl RVSDGMod {

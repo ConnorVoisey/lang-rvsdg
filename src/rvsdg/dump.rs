@@ -427,6 +427,12 @@ fn fmt_value_ref(f: &mut std::fmt::Formatter<'_>, m: &RVSDGMod, id: ValueId) -> 
     match m.get(id).kind {
         ValueKind::RegionParam { index, .. } => write!(f, "a{index}"),
         ValueKind::Project { call, index } => write!(f, "%v{}#{}", call.0, index),
+        // Region-free values have no defining line in any region (they
+        // are interned module-wide), so print them inline at each use.
+        ValueKind::Const(const_value) => write!(f, "const {const_value}"),
+        ValueKind::GlobalRef(global_id) => write!(f, "global_addr {global_id}"),
+        ValueKind::FuncAddr(func_id) => write!(f, "func_addr {func_id}"),
+        ValueKind::ConstPoolRef(const_id) => fmt_const_ref(f, m, const_id),
         _ => write!(f, "{id}"),
     }
 }
@@ -482,6 +488,7 @@ impl Display for ScalarType {
             ScalarType::I128 => "i128",
             ScalarType::F32 => "f32",
             ScalarType::F64 => "f64",
+            ScalarType::F80 => "f80",
             ScalarType::Void => "void",
         };
         f.write_str(s)

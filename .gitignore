@@ -1,1 +1,6 @@
 /target
+
+/bench-results/*
+!/bench-results/poly-bench
+/bench-results/poly-bench/*
+!/bench-results/poly-bench/plot.gp

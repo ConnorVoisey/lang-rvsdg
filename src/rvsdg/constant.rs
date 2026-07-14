@@ -86,6 +86,11 @@ pub struct ConstantPool {
 }
 
 impl ConstantPool {
+    /// Number of distinct interned constants.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
     pub fn intern(&mut self, def: ConstantDef) -> ConstId {
         if let Some(&id) = self.cache.get(&def) {
             return id;

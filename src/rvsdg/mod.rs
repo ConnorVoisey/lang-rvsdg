@@ -1,3 +1,4 @@
+pub mod alias;
 pub mod builder;
 pub mod constant;
 pub mod dump;
@@ -18,7 +19,7 @@ pub use ops::{
 };
 use rustc_hash::FxHashMap;
 pub use target_lexicon::Triple;
-use types::TypeArena;
+use types::{TypeArena, TypeRef};
 pub use value::{ConstValue, Value, ValueKind};
 
 #[derive(Debug)]
@@ -46,6 +47,10 @@ pub struct RVSDGMod {
     pub region_pool: RegionPool,
     pub u32_pool: U32Pool,
     pub match_arm_pool: MatchArmPool,
+    /// Interned region-free values (constants and symbol references):
+    /// one node per distinct value, module-wide, owned by no region.
+    /// See [`ValueKind::is_region_free`].
+    interned_values: FxHashMap<Value, ValueId>,
 
     // These maps should probably use &str instead of String
     pub fn_map: FxHashMap<String, FuncId>,
@@ -70,6 +75,7 @@ impl RVSDGMod {
             region_pool: RegionPool(vec![]),
             u32_pool: U32Pool(vec![]),
             match_arm_pool: MatchArmPool(vec![]),
+            interned_values: FxHashMap::default(),
             fn_map: FxHashMap::default(),
             global_map: FxHashMap::default(),
         }
@@ -91,8 +97,190 @@ impl RVSDGMod {
     }
 
     #[inline]
+    pub fn get_function(&self, func_id: FuncId) -> &Function {
+        &self.functions[func_id.0 as usize]
+    }
+
+    /// Intern a scalar constant: one node per distinct (type, value)
+    /// pair, module-wide. Like every region-free value it is pushed into
+    /// the value array but into NO region's node list -- region-free
+    /// values are usable from every region (the scope verifier exempts
+    /// them) and the emitter materialises LLVM constants on demand, so
+    /// region membership would only bloat node lists (measured at 71%
+    /// of all values on sqlite3.c before interning).
+    pub fn intern_const(&mut self, ty: TypeRef, value: ConstValue) -> ValueId {
+        self.intern_value(Value {
+            ty,
+            kind: ValueKind::Const(value),
+        })
+    }
+
+    /// Intern the address of a global: one node per global, module-wide.
+    pub fn intern_global_ref(&mut self, global: GlobalId, ptr_type: TypeRef) -> ValueId {
+        self.intern_value(Value {
+            ty: ptr_type,
+            kind: ValueKind::GlobalRef(global),
+        })
+    }
+
+    /// Intern the address of a function: one node per function,
+    /// module-wide.
+    pub fn intern_func_addr(&mut self, func: FuncId, ptr_type: TypeRef) -> ValueId {
+        self.intern_value(Value {
+            ty: ptr_type,
+            kind: ValueKind::FuncAddr(func),
+        })
+    }
+
+    /// Intern a reference to a pooled constant (aggregates, strings,
+    /// constant address expressions): one node per pool entry.
+    pub fn intern_const_pool_ref(&mut self, constant: ConstId, ty: TypeRef) -> ValueId {
+        self.intern_value(Value {
+            ty,
+            kind: ValueKind::ConstPoolRef(constant),
+        })
+    }
+
+    /// Shared by the intern_* constructors above, which are the only
+    /// callers and only ever build region-free kinds.
+    fn intern_value(&mut self, value: Value) -> ValueId {
+        if let Some(&id) = self.interned_values.get(&value) {
+            return id;
+        }
+        let id = ValueId(self.values.len() as u32);
+        self.values.push(value.clone());
+        self.interned_values.insert(value, id);
+        id
+    }
+
+    #[inline]
     pub fn get_region_mut(&mut self, region_id: RegionId) -> &mut Region {
         &mut self.regions[region_id.0 as usize]
+    }
+
+    /// Visit every VALUE operand of `value`, spans expanded through the
+    /// pools. State operands are not value operands and are not visited;
+    /// this is plain enumeration with no scoping semantics (the scope and
+    /// state verifiers have their own, special-cased walks). Exhaustive
+    /// over `ValueKind`, so adding a variant forces a decision here.
+    pub fn for_each_value_operand(&self, value: ValueId, mut f: impl FnMut(ValueId)) {
+        match &self.values[value.0 as usize].kind {
+            ValueKind::Unary { operand, .. }
+            | ValueKind::Cast { value: operand, .. }
+            | ValueKind::Freeze { value: operand }
+            | ValueKind::Match { input: operand, .. }
+            | ValueKind::ExtractField {
+                aggregate: operand, ..
+            }
+            | ValueKind::Project { call: operand, .. }
+            | ValueKind::Alloca { count: operand, .. } => f(*operand),
+            ValueKind::Binary { left, right, .. }
+            | ValueKind::ICmp { left, right, .. }
+            | ValueKind::FCmp { left, right, .. } => {
+                f(*left);
+                f(*right);
+            }
+            ValueKind::Ternary {
+                condition,
+                true_val,
+                false_val,
+            } => {
+                f(*condition);
+                f(*true_val);
+                f(*false_val);
+            }
+            ValueKind::ExtractLane { vector, index } => {
+                f(*vector);
+                f(*index);
+            }
+            ValueKind::InsertLane {
+                vector,
+                index,
+                value,
+            } => {
+                f(*vector);
+                f(*index);
+                f(*value);
+            }
+            ValueKind::ShuffleLanes { left, right, mask } => {
+                f(*left);
+                f(*right);
+                for &lane in self.value_pool.get(*mask) {
+                    f(lane);
+                }
+            }
+            ValueKind::InsertField {
+                aggregate, value, ..
+            } => {
+                f(*aggregate);
+                f(*value);
+            }
+            ValueKind::PtrOffset { base, indices, .. } => {
+                f(*base);
+                for &index in self.value_pool.get(*indices) {
+                    f(index);
+                }
+            }
+            ValueKind::Load { addr, .. } | ValueKind::AtomicLoad { addr, .. } => f(*addr),
+            ValueKind::Store { addr, value, .. }
+            | ValueKind::AtomicStore { addr, value, .. }
+            | ValueKind::AtomicReadModifyWrite { addr, value, .. } => {
+                f(*addr);
+                f(*value);
+            }
+            ValueKind::CompareAndSwap {
+                addr,
+                expected,
+                desired,
+                ..
+            } => {
+                f(*addr);
+                f(*expected);
+                f(*desired);
+            }
+            ValueKind::Intrinsic { args, .. } | ValueKind::Call { args, .. } => {
+                for &arg in self.value_pool.get(*args) {
+                    f(arg);
+                }
+            }
+            ValueKind::CallIndirect { callee, args, .. } => {
+                f(*callee);
+                for &arg in self.value_pool.get(*args) {
+                    f(arg);
+                }
+            }
+            ValueKind::Gamma {
+                condition, inputs, ..
+            } => {
+                f(*condition);
+                for &input in self.value_pool.get(*inputs) {
+                    f(input);
+                }
+            }
+            ValueKind::Theta {
+                loop_vars,
+                condition,
+                ..
+            } => {
+                f(*condition);
+                for &var in self.value_pool.get(*loop_vars) {
+                    f(var);
+                }
+            }
+            ValueKind::RegionResult { values, .. } => {
+                for &result in self.value_pool.get(*values) {
+                    f(result);
+                }
+            }
+            ValueKind::Const(_)
+            | ValueKind::ConstPoolRef(_)
+            | ValueKind::GlobalRef(_)
+            | ValueKind::FuncAddr(_)
+            | ValueKind::Fence { .. }
+            | ValueKind::Lambda { .. }
+            | ValueKind::Phi { .. }
+            | ValueKind::RegionParam { .. } => {}
+        }
     }
 
     /// The `index`th projection of a multi-output node (loads, calls,
@@ -143,6 +331,11 @@ impl ValuePool {
     pub fn get(&self, values: ValuesSpan) -> &[ValueId] {
         &self.0[values.start as usize..(values.start as usize + values.len as usize)]
     }
+
+    /// Total pooled entries (live and dead spans alike).
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -167,6 +360,11 @@ impl RegionPool {
     pub fn get(&self, span: RegionsSpan) -> &[RegionId] {
         &self.0[span.start as usize..(span.start as usize + span.len as usize)]
     }
+
+    /// Total pooled entries (live and dead spans alike).
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -190,6 +388,11 @@ impl U32Pool {
 
     pub fn get(&self, values: U32Span) -> &[u32] {
         &self.0[values.start as usize..(values.start as usize + values.len as usize)]
+    }
+
+    /// Total pooled entries (live and dead spans alike).
+    pub fn len(&self) -> usize {
+        self.0.len()
     }
 }
 
@@ -225,6 +428,11 @@ impl MatchArmPool {
 
     pub fn get(&self, span: MatchArmSpan) -> &[MatchArm] {
         &self.0[span.start as usize..(span.start as usize + span.len as usize)]
+    }
+
+    /// Total pooled entries (live and dead spans alike).
+    pub fn len(&self) -> usize {
+        self.0.len()
     }
 }
 

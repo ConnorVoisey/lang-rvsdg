@@ -101,7 +101,17 @@ impl RVSDGMod {
                     kind: ConstantKind::Scalar(ConstValue::Poison),
                 }
             }
-            llvm_ir::Constant::BlockAddress => todo!(),
+            // The address of a basic block (GNU computed goto). Not yet
+            // implemented on our side: the lowering is mechanical -- assign
+            // each referenced block a small integer, rewrite blockaddress
+            // as inttoptr of it and indirectbr as a switch over the
+            // destination list (LLVM's own IndirectBrExpand shape) -- but
+            // not worth building until enough inputs need it.
+            llvm_ir::Constant::BlockAddress => {
+                return Err(eyre!(
+                    "blockaddress constants (computed goto) are not implemented yet"
+                ));
+            }
             llvm_ir::Constant::GlobalReference { name, ty: _ } => {
                 let name_str = global_name_string(name);
                 // The VALUE of a global reference is always a pointer.
@@ -159,58 +169,23 @@ impl RVSDGMod {
             llvm_ir::Constant::GetElementPtr(gep) => {
                 let base = self.convert_const_ref(gep.address.clone(), module)?;
                 let base_type = self.constants.get(base).ty;
-                // llvm-ir drops the source element type on a constant GEP
-                // (opaque pointers), so recover it from the index shape:
-                //   - one index  -> LLVM's canonical byte form
-                //     `getelementptr (i8, ptr base, i64 offset)`; index over i8.
-                //   - many indices -> a typed aggregate access
-                //     `getelementptr (T, ptr base, 0, k, ...)`; the source type
-                //     T is what `base` points to.
-                //
-                // KNOWN UNSOUND for one input class: a single-index constant
-                // GEP whose true source type is not i8. Clang's constant
-                // emitter canonicalises global INITIALIZERS to the byte form
-                // (i8 recovery exact), but its in-function constant folder
-                // keeps single-index GEPs typed over the ELEMENT type (for
-                // example constant pointer arithmetic like `&arr[2] + 1`),
-                // and the two shapes are indistinguishable once the type is
-                // dropped -- the i8 assumption then computes a wrong address
-                // and MISCOMPILES silently. No local recovery can be sound;
-                // the fix is llvm-ir exposing the real source type on
-                // constant GEPs the way it already does on GEP instructions
-                // (LLVMGetGEPSourceElementType covers both).
-                let source_type = if gep.indices.len() == 1 {
-                    TypeRef::Scalar(ScalarType::I8)
-                } else {
-                    self.const_pointee_type(base).ok_or_else(|| {
-                        eyre!("could not infer source type for multi-index constant getelementptr")
-                    })?
-                };
+                // The source element type comes from the constant
+                // expression itself (our llvm-ir fork reads it via
+                // LLVMGetGEPSourceElementType, exactly as it already did
+                // for GEP instructions). No recovery heuristics: with
+                // opaque pointers the base's pointee type is NOT reliable
+                // -- clang's constant folder emits single-index GEPs typed
+                // over element types (`&arr[2] + 1`) and field-typed
+                // folded accesses, which are unrecoverable from the shape
+                // alone and used to force a refusal here.
+                let source_type = self
+                    .types
+                    .convert_type_ref(&gep.source_element_type, module)?;
                 let index_ids = gep
                     .indices
                     .iter()
                     .map(|i| self.convert_const_ref(i.clone(), module))
                     .collect::<Result<Vec<_>, _>>()?;
-                // Validate the recovery: the indices must descend the
-                // recovered type (struct indices in range; array indices are
-                // unconstrained, matching LLVM). Optimised input can carry a
-                // constant GEP whose true source type is NOT the base's
-                // pointee (e.g. a folded access typed over a field), and
-                // llvm-ir gives us no way to know it -- lowering a wrong
-                // recovery is undefined behaviour inside LLVM (a segfault in
-                // practice), so refuse it here instead. The unoptimised
-                // clang pipeline types constant global accesses over the
-                // pointee and never hits this.
-                if gep.indices.len() > 1
-                    && self.descend_type(source_type, &index_ids[1..]).is_none()
-                {
-                    return Err(eyre!(
-                        "constant getelementptr indices do not fit the base's pointee \
-                         type; the true source element type is dropped by llvm-ir and \
-                         cannot be recovered (this shape typically comes from \
-                         LLVM-optimised input IR)"
-                    ));
-                }
                 let indices = self.constants.id_pool.push_slice(&index_ids);
                 ConstantDef {
                     ty: base_type,
@@ -268,56 +243,6 @@ impl RVSDGMod {
             ty,
             kind: ConstantKind::Cast { op, operand },
         })
-    }
-
-    /// The element type a pointer constant points to -- the *source type* for a
-    /// typed GEP applied to it. A global points to its value type; a nested
-    /// constant GEP points to the element its own indices land on (its source
-    /// type descended by every index after the leading pointer-stride index).
-    /// `None` for pointers whose pointee we don't track (e.g. function or null
-    /// pointers), which can't be a typed-GEP base.
-    fn const_pointee_type(&self, id: ConstId) -> Option<TypeRef> {
-        match &self.constants.get(id).kind {
-            ConstantKind::GlobalAddr(global_id) => Some(self.get_global(*global_id).ty),
-            ConstantKind::GetElementPointer {
-                source_type,
-                indices,
-                ..
-            } => {
-                let indices = self.constants.get_aggregate_elements(*indices).to_vec();
-                self.descend_type(*source_type, &indices[1..])
-            }
-            _ => None,
-        }
-    }
-
-    /// Walk an aggregate type along constant GEP indices, returning the type
-    /// reached. Array indices step into the element type; struct indices select
-    /// a field by its constant index. `None` on a non-aggregate or bad index.
-    fn descend_type(&self, mut ty: TypeRef, indices: &[ConstId]) -> Option<TypeRef> {
-        for &index in indices {
-            ty = match ty {
-                TypeRef::Array(array_id) => self.types.get_array(array_id).element,
-                TypeRef::Struct(struct_id) => {
-                    let field = self.const_int_value(index)? as usize;
-                    self.types
-                        .get_struct(struct_id)
-                        .fields
-                        .get(field)?
-                        .field_type
-                }
-                _ => return None,
-            };
-        }
-        Some(ty)
-    }
-
-    /// The integer value of a scalar integer constant, if it is one.
-    fn const_int_value(&self, id: ConstId) -> Option<i64> {
-        match self.constants.get(id).kind {
-            ConstantKind::Scalar(ConstValue::Int(v)) => Some(v),
-            _ => None,
-        }
     }
 
     fn fold_int_binop(

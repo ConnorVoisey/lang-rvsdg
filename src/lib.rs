@@ -36,8 +36,10 @@ pub(crate) fn init_llvm_native() -> color_eyre::Result<()> {
         .map_err(|e| color_eyre::eyre::eyre!("failed to initialize native LLVM target: {e}"))
 }
 
+pub mod bench;
 pub mod llvm_parser;
 pub mod rvsdg;
+pub mod stats;
 
 /// Install a Chrome-trace `tracing` subscriber writing to `path`, returning a
 /// flush guard the caller must hold until the traced work finishes -- dropping
@@ -102,7 +104,7 @@ pub fn c_file_to_mod(
     let bc_file = NamedTempFile::with_suffix(".bc")?;
     let bc_output = bc_file.path();
 
-    let mut clang = Command::new("clang-19");
+    let mut clang = Command::new("clang");
     // `-w`: we don't care about clang's warnings on the input here (it's
     // just the SSA frontend), and on fuzzer input they flood stderr and
     // bury our own diagnostics.
@@ -141,21 +143,21 @@ pub fn c_file_to_mod(
     let bc_output_str = bc_output
         .to_str()
         .ok_or_else(|| color_eyre::eyre::eyre!("temporary .bc path is not valid UTF-8"))?;
-    let clang_stdout = clang_cmd.stdout.ok_or_else(|| {
-        color_eyre::eyre::eyre!("clang-19 produced no stdout to pipe into opt-19")
-    })?;
+    let clang_stdout = clang_cmd
+        .stdout
+        .ok_or_else(|| color_eyre::eyre::eyre!("clang produced no stdout to pipe into opt"))?;
     {
         let _span = tracing::info_span!("frontend_clang_opt").entered();
         // Bitcode out (no `-S`): the file exists only to hand the module
         // to the parser, and bitcode skips LLVM's text lexer on the way
         // back in.
-        let status = Command::new("opt-19")
+        let status = Command::new("opt")
             .args(["-passes=mem2reg", "-o", bc_output_str])
             .stdin(clang_stdout)
             .stdout(Stdio::piped())
             .status()?;
         if !status.success() {
-            color_eyre::eyre::bail!("opt-19 failed with status {status}");
+            color_eyre::eyre::bail!("opt failed with status {status}");
         }
     }
 
@@ -163,7 +165,7 @@ pub fn c_file_to_mod(
     // csmith checksum) is never mixed with compiler logging. The bitcode is
     // disassembled on demand; this path is for humans, not the pipeline.
     if !quiet {
-        let dis = Command::new("llvm-dis-19")
+        let dis = Command::new("llvm-dis")
             .args([bc_output_str, "-o", "-"])
             .output()?;
         eprintln!(
@@ -220,8 +222,9 @@ pub struct Cli {
     /// Extra source/object files to compile and link alongside the compiled
     /// input (repeatable), e.g. `--link utilities/polybench.c` so PolyBench's
     /// harness (`polybench_alloc_data`, timing) resolves. Passed to the final
-    /// `cc` link step together with the `-I` include paths. Only the primary
-    /// `input` goes through the RVSDG pipeline; these are compiled normally.
+    /// `cc` link step together with the `-I` include paths and `-D` defines.
+    /// Only the primary `input` goes through the RVSDG pipeline; these are
+    /// compiled normally.
     #[arg(long = "link", value_name = "FILE")]
     pub(crate) link: Vec<String>,
 
@@ -360,7 +363,14 @@ pub fn run_cli(cli: &Cli) -> color_eyre::Result<Option<u8>> {
                 );
             }
         }
-        rvsdg.output_with_llvm(&output, &cli.link, &cli.link_arg, &cli.include, cli.quiet)?;
+        rvsdg.output_with_llvm(
+            &output,
+            &cli.link,
+            &cli.link_arg,
+            &cli.include,
+            &cli.define,
+            cli.quiet,
+        )?;
         Ok(None)
     }
 }
