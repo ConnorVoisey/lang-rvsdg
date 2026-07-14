@@ -285,8 +285,17 @@ impl RVSDGMod {
                 state: _,
                 elem_type,
                 count,
+                align,
             } => {
-                self.lower_alloca(llvm_builder, mapper, rvsdg_func, value_id, elem_type, count)?;
+                self.lower_alloca(
+                    llvm_builder,
+                    mapper,
+                    rvsdg_func,
+                    value_id,
+                    elem_type,
+                    count,
+                    align,
+                )?;
                 None
             }
 

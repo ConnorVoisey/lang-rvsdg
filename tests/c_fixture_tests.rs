@@ -70,6 +70,32 @@ fn test_c_pair(our_file: &str, clang_file: &str) {
     assert_eq!(ours_code, ref_code);
 }
 
+/// Like `test_c_file`, but our side runs as a SUBPROCESS binary instead
+/// of in-process JIT: for fixtures whose failure mode is a crash (e.g.
+/// a misaligned SSE store), a JIT run would take the whole test harness
+/// down with it, while a crashed child is just a differing exit code.
+fn test_c_file_binary(input: &str) {
+    let tmp_dir = TempDir::new().expect("failed to create temp dir");
+    let ours_bin = tmp_dir
+        .path()
+        .join("ours")
+        .to_str()
+        .expect("failed to construct path")
+        .to_string();
+    let cli = Cli::get_output_integration(input.to_string(), ours_bin.clone(), vec![]);
+    run_cli(&cli).unwrap();
+    let ours_code = Command::new(&ours_bin)
+        .status()
+        .expect("failed to run our binary")
+        .code();
+    let clang_code = run_example_clang(input);
+    assert_eq!(
+        ours_code,
+        Some(clang_code),
+        "our binary exited {ours_code:?} (None = killed by signal), clang's exited {clang_code}"
+    );
+}
+
 fn run_example_clang(input: &str) -> i32 {
     let tmp_dir = TempDir::new().expect("failed to create temp dir").keep();
     let path_str = {
@@ -529,6 +555,23 @@ fn test_64_promote_call_clobber() {
 #[test]
 fn test_65_const_gep_addresses() {
     test_c_file("tests/fixtures/c/65_const_gep_addresses.c");
+}
+
+// An over-aligned local whose alloca alignment must survive emission:
+// the constant-copy initialisation claims align 16 and the backend
+// expands it with aligned SSE stores, so a dropped alloca alignment
+// segfaults. Subprocess harness: the failure mode is a crash.
+#[test]
+fn test_66_alloca_alignment() {
+    test_c_file_binary("tests/fixtures/c/66_alloca_alignment.c");
+}
+
+// Bitfield storage units have non-power-of-two widths (a 22-bit field
+// stores as a 24-bit integer): the type and its masked accesses must
+// flow through the whole pipeline.
+#[test]
+fn test_67_bitfield_i24() {
+    test_c_file("tests/fixtures/c/67_bitfield_i24.c");
 }
 
 // An alignas(64) global: the alignment attribute must survive re-emission

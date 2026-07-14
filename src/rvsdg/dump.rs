@@ -480,6 +480,7 @@ fn pad(f: &mut std::fmt::Formatter<'_>, indent: usize) -> std::fmt::Result {
 impl Display for ScalarType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
+            ScalarType::IntArbitrary(bits) => return write!(f, "i{bits}"),
             ScalarType::Bool => "bool",
             ScalarType::I8 => "i8",
             ScalarType::I16 => "i16",

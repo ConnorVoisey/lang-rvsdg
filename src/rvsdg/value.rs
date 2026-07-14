@@ -135,6 +135,11 @@ pub enum ValueKind {
         elem_type: TypeRef,
         /// Number of elements (usually a constant 1)
         count: ValueId,
+        /// Alignment in bytes (None = natural alignment for the type).
+        /// MUST be carried: initialising stores/memcpys keep their own
+        /// alignment claims, and a slot laid out below what they claim
+        /// faults under the backend's aligned-SSE expansions.
+        align: Option<u32>,
     },
     /// Atomic load. Output state is the node; Project { index: 0 } for the value.
     AtomicLoad {

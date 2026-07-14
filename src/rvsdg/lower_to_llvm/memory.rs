@@ -89,6 +89,7 @@ impl RVSDGMod {
         value_id: ValueId,
         elem_type: TypeRef,
         count: ValueId,
+        align: Option<u32>,
     ) -> color_eyre::Result<()> {
         let llvm_type = self.type_to_basic_type_llvm(llvm_builder.context, elem_type)?;
         let count_val = self.expect_value(llvm_builder, mapper, rvsdg_func, count)?;
@@ -97,6 +98,16 @@ impl RVSDGMod {
             count_val.into_int_value(),
             "alloca",
         )?;
+        // The slot's alignment must be at least what the initialising
+        // stores/memcpys claim (they carry the input's alignment), or
+        // the backend's aligned-SSE expansions fault at runtime.
+        if let Some(align) = align {
+            alloca
+                .as_instruction()
+                .ok_or_else(|| eyre!("alloca did not produce an instruction"))?
+                .set_alignment(align)
+                .map_err(|e| eyre!("failed to set alloca alignment: {e}"))?;
+        }
         let ptr_val = BasicValueEnum::PointerValue(alloca);
         let project_id = self.projection_of(value_id, 0);
         mapper.set_val(project_id, ptr_val);
@@ -455,7 +466,7 @@ mod tests {
         rvsdg
             .define_fn(func_id, |rb, state| {
                 let one = rb.const_i32(1);
-                let alloc = rb.alloca(state, I32, one, ptr_ty);
+                let alloc = rb.alloca(state, I32, one, ptr_ty, None);
                 let val = rb.const_i32(77);
                 let s1 = rb.store(alloc.state, alloc.ptr, val, None, false);
                 let loaded = rb.load(s1, alloc.ptr, I32, None, false);
@@ -478,7 +489,7 @@ mod tests {
         rvsdg
             .define_fn(func_id, |rb, state| {
                 let one = rb.const_i32(1);
-                let alloc = rb.alloca(state, I32, one, ptr_ty);
+                let alloc = rb.alloca(state, I32, one, ptr_ty, None);
                 let zero = rb.const_i32(0);
                 let s1 = rb.store(alloc.state, alloc.ptr, zero, None, false);
 
@@ -523,8 +534,8 @@ mod tests {
         rvsdg
             .define_fn(func_id, |rb, state| {
                 let one = rb.const_i32(1);
-                let a = rb.alloca(state, I32, one, ptr_ty);
-                let b = rb.alloca(a.state, I32, one, ptr_ty);
+                let a = rb.alloca(state, I32, one, ptr_ty, None);
+                let b = rb.alloca(a.state, I32, one, ptr_ty, None);
 
                 // a = 10, b = 20
                 let ten = rb.const_i32(10);
@@ -666,7 +677,7 @@ mod tests {
         rvsdg
             .define_fn(func_id, |rb, state| {
                 let one = rb.const_i32(1);
-                let alloc = rb.alloca(state, arr_ty, one, arr_ptr_ty);
+                let alloc = rb.alloca(state, arr_ty, one, arr_ptr_ty, None);
 
                 let zero = rb.const_i32(0);
                 let idx0 = rb.const_i32(0);
@@ -904,7 +915,7 @@ mod tests {
         rvsdg
             .define_fn(func_id, |rb, state| {
                 let one = rb.const_i32(1);
-                let alloc = rb.alloca(state, I32, one, ptr_ty);
+                let alloc = rb.alloca(state, I32, one, ptr_ty, None);
                 let ten = rb.const_i32(10);
                 let s1 = rb.store(alloc.state, alloc.ptr, ten, None, false);
 
@@ -940,7 +951,7 @@ mod tests {
         rvsdg
             .define_fn(func_id, |rb, state| {
                 let one = rb.const_i32(1);
-                let alloc = rb.alloca(state, I32, one, ptr_ty);
+                let alloc = rb.alloca(state, I32, one, ptr_ty, None);
                 let ten = rb.const_i32(10);
                 let s1 = rb.store(alloc.state, alloc.ptr, ten, None, false);
 
@@ -978,7 +989,7 @@ mod tests {
         rvsdg
             .define_fn(func_id, |rb, state| {
                 let one = rb.const_i32(1);
-                let alloc = rb.alloca(state, I32, one, ptr_ty);
+                let alloc = rb.alloca(state, I32, one, ptr_ty, None);
                 let ten = rb.const_i32(10);
                 let s1 = rb.store(alloc.state, alloc.ptr, ten, None, false);
 
@@ -1015,7 +1026,7 @@ mod tests {
         rvsdg
             .define_fn(func_id, |rb, state| {
                 let one = rb.const_i32(1);
-                let alloc = rb.alloca(state, I32, one, ptr_ty);
+                let alloc = rb.alloca(state, I32, one, ptr_ty, None);
                 let ten = rb.const_i32(10);
                 let s1 = rb.store(alloc.state, alloc.ptr, ten, None, false);
 
@@ -1051,7 +1062,7 @@ mod tests {
         rvsdg
             .define_fn(func_id, |rb, state| {
                 let one = rb.const_i32(1);
-                let alloc = rb.alloca(state, I32, one, ptr_ty);
+                let alloc = rb.alloca(state, I32, one, ptr_ty, None);
                 let ten = rb.const_i32(10);
                 let s1 = rb.store(alloc.state, alloc.ptr, ten, None, false);
 

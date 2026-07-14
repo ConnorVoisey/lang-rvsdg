@@ -67,6 +67,7 @@ impl<'a> RegionBuilder<'a> {
         elem_type: TypeRef,
         count: ValueId,
         ptr_type: TypeRef,
+        align: Option<u32>,
     ) -> AllocaResult {
         let alloca_val = self.add_value(Value {
             ty: TypeRef::State,
@@ -74,6 +75,7 @@ impl<'a> RegionBuilder<'a> {
                 state,
                 elem_type,
                 count,
+                align,
             },
         });
         let ptr = self.add_value(Value {

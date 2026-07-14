@@ -583,7 +583,10 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
             .types
             .convert_type_ref(&llvm_ptr_ty, self.fn_ctx.llvm_mod)?;
 
-        let result = self.rb.alloca(state, elem_type, count, ptr_type);
+        // Zero means "no explicit alignment" in LLVM; natural alignment
+        // applies. clang stamps every local's alloca explicitly.
+        let align = (inst.alignment != 0).then_some(inst.alignment);
+        let result = self.rb.alloca(state, elem_type, count, ptr_type, align);
         self.scopes.bind_name(&inst.dest, result.ptr);
         Ok(result)
     }

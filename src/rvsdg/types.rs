@@ -33,6 +33,14 @@ pub enum ScalarType {
     I32,
     I64,
     I128,
+    /// An integer width with no named variant: C bitfield storage units
+    /// round to whole bytes and produce i24/i40/i48/i56. Only the
+    /// parser's `int_bit_to_scalar` may construct this, and it maps the
+    /// named widths to their own variants first -- an `IntArbitrary(32)`
+    /// would be a distinct type from `I32`, never equal to it. Widths
+    /// above 64 (other than the named I128) stay unsupported because
+    /// `ConstValue::Int` carries an i64.
+    IntArbitrary(u16),
     // TODO: add unsigned variants
     F32,
     F64,

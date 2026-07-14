@@ -1430,7 +1430,7 @@ mod tests {
         rvsdg
             .define_fn(func_id, |rb, state| {
                 let one = rb.const_i32(1);
-                let alloc = rb.alloca(state, I32, one, ptr);
+                let alloc = rb.alloca(state, I32, one, ptr, None);
                 let zero = rb.const_i32(0);
                 let s1 = rb.store(alloc.state, alloc.ptr, zero, None, false);
                 let i = rb.const_i32(0);
@@ -1488,7 +1488,7 @@ mod tests {
                 let res = rb.theta(state, &[i], |rb| {
                     let loop_i = rb.param(0);
                     let one = rb.const_i32(1);
-                    let alloc = rb.alloca(state, I32, one, ptr);
+                    let alloc = rb.alloca(state, I32, one, ptr, None);
                     let s2 = rb.store(alloc.state, alloc.ptr, loop_i, None, false);
                     let next_i = rb.binary(BinaryOp::Add, ArithFlags::default(), loop_i, one, I32);
                     let five = rb.const_i32(5);

@@ -659,6 +659,14 @@ impl RVSDGMod {
                 ScalarType::I32 => BasicTypeEnum::IntType(context.i32_type()),
                 ScalarType::I64 => BasicTypeEnum::IntType(context.i64_type()),
                 ScalarType::I128 => BasicTypeEnum::IntType(context.i128_type()),
+                ScalarType::IntArbitrary(bits) => BasicTypeEnum::IntType(
+                    context
+                        .custom_width_int_type(
+                            std::num::NonZeroU32::new(bits as u32)
+                                .ok_or_else(|| eyre!("zero-width integer type"))?,
+                        )
+                        .map_err(|e| eyre!("invalid integer width {bits}: {e}"))?,
+                ),
                 ScalarType::F32 => BasicTypeEnum::FloatType(context.f32_type()),
                 ScalarType::F64 => BasicTypeEnum::FloatType(context.f64_type()),
                 ScalarType::F80 => BasicTypeEnum::FloatType(context.x86_f80_type()),

@@ -82,6 +82,21 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
             Either::Right(operand) => operand,
         };
 
+        // Stack-lifetime markers are optimisation hints for LLVM's stack
+        // colouring, not semantics: dropping them costs at most frame
+        // size, never correctness. They cannot survive our pipeline as-is
+        // because construction threads alloca pointers through theta loop
+        // variables, and LLVM's verifier (22+) requires the marker's
+        // operand to be the alloca itself -- a loop-carried phi is
+        // rejected. Refinement if frame sizes ever matter: keep the
+        // markers whose operand still reaches emission as a direct
+        // alloca.
+        if let Some(name) = callee_as_global_name(callee_operand)
+            && crate::llvm_parser::global_name_string(name).starts_with("llvm.lifetime.")
+        {
+            return Ok(state);
+        }
+
         let args: Vec<ValueId> = inst
             .arguments
             .iter()

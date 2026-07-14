@@ -952,7 +952,14 @@ pub(super) fn int_bit_to_scalar(bits: u32) -> color_eyre::Result<ScalarType> {
         32 => ScalarType::I32,
         64 => ScalarType::I64,
         128 => ScalarType::I128,
-        _ => Err(eyre!("unsupported integer width: {bits}"))?,
+        // Bitfield storage units and other odd widths (i24, i40, ...).
+        // Named widths were matched above, so IntArbitrary can never
+        // duplicate them. Above 64 (except the named 128) stays
+        // unsupported: ConstValue::Int carries an i64.
+        2..=63 => ScalarType::IntArbitrary(bits as u16),
+        _ => Err(eyre!(
+            "unsupported integer width: {bits} (wider than 64 and not 128)"
+        ))?,
     })
 }
 
