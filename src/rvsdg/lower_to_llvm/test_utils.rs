@@ -17,11 +17,18 @@ pub mod test_utils {
                     .create_jit_execution_engine(OptimizationLevel::None)
                     .expect("failed to create JIT engine");
 
+                // SAFETY: each runner is instantiated with the return
+                // type its test fixtures declare, and a wrong guess
+                // fails the assertion rather than corrupting the test
+                // harness (the value is read from a return register).
                 let func = unsafe {
                     engine
                         .get_function::<unsafe extern "C" fn() -> $ret>(fn_name)
                         .expect("failed to find function")
                 };
+                // SAFETY: runs the just-lowered test module in-process;
+                // these fixtures are pure computations built by the
+                // test itself.
                 unsafe { func.call() }
             }
         };

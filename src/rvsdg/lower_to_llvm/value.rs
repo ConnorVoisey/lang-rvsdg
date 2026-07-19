@@ -222,17 +222,22 @@ impl RVSDGMod {
                             .map(|v| v.into_int_value())
                     })
                     .collect::<color_eyre::Result<_>>()?;
-                let result = if inbounds {
-                    unsafe {
+                // SAFETY: inkwell marks every GEP constructor `unsafe`
+                // because mismatched indices/type are UB in LLVM.
+                // `pointee_type` and the index list both come from the
+                // same PtrOffset node, whose shape the frontend
+                // validated against the source element type at
+                // conversion (it refuses unrecoverable shapes). Same
+                // contract as the constant GEP lowering in const_val.rs.
+                let result = unsafe {
+                    if inbounds {
                         llvm_builder.builder.build_in_bounds_gep(
                             pointee_type,
                             ptr.into_pointer_value(),
                             &idx_vals,
                             "gep",
                         )?
-                    }
-                } else {
-                    unsafe {
+                    } else {
                         llvm_builder.builder.build_gep(
                             pointee_type,
                             ptr.into_pointer_value(),

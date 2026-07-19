@@ -3,7 +3,7 @@ use std::{
     process::{Command, Stdio},
 };
 
-use lang_rvsdg::{Cli, run_cli};
+use lang_rvsdg::{Cli, OutputIntegration, run_cli};
 use tempfile::TempDir;
 
 fn test_c_file(input: &str) {
@@ -42,11 +42,11 @@ fn test_c_pair(our_file: &str, clang_file: &str) {
 
     // Our half, linked against the clang object.
     let ours_bin = path_of("ours");
-    let cli = Cli::get_output_integration(
-        our_file.to_string(),
-        ours_bin.clone(),
-        vec![helper_obj.clone()],
-    );
+    let cli = Cli::get_output_integration(OutputIntegration {
+        input: our_file.to_string(),
+        output: ours_bin.clone(),
+        link: vec![helper_obj.clone()],
+    });
     run_cli(&cli).unwrap();
     let ours_code = Command::new(&ours_bin)
         .status()
@@ -82,7 +82,11 @@ fn test_c_file_binary(input: &str) {
         .to_str()
         .expect("failed to construct path")
         .to_string();
-    let cli = Cli::get_output_integration(input.to_string(), ours_bin.clone(), vec![]);
+    let cli = Cli::get_output_integration(OutputIntegration {
+        input: input.to_string(),
+        output: ours_bin.clone(),
+        link: vec![],
+    });
     run_cli(&cli).unwrap();
     let ours_code = Command::new(&ours_bin)
         .status()

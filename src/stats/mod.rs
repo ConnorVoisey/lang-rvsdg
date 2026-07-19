@@ -1,10 +1,10 @@
 //! Read-only census over a constructed RVSDG.
 //!
-//! Two jobs (see graph_stats_plan.md): design input for the optimizer
-//! substrate (rebuild vs mutate, holes vs compaction, use-list strategy,
-//! how far alias analysis must go) and, once passes exist, a
-//! before/after shape diff that quantifies each pass and catches
-//! hygiene regressions correctness tests cannot see.
+//! Two jobs: design input for the optimizer substrate (rebuild vs
+//! mutate, holes vs compaction, use-list strategy, how far alias
+//! analysis must go) and a before/after shape diff that quantifies each
+//! pass and catches hygiene regressions correctness tests cannot see.
+//! Surfaced through the compiler's --stats / --stats-json flags.
 //!
 //! Several queries here are deliberate DRY RUNS of pass analyses -- the
 //! duplicate-node map (common node elimination), the foldable count
@@ -30,7 +30,7 @@ use crate::rvsdg::{
 };
 
 /// Census of one function's region tree. Distributions keep their raw
-/// samples; the CSV row derives its aggregates from them.
+/// samples; the human summary derives percentiles and maxima from them.
 #[derive(Debug, Default, Clone)]
 pub struct FunctionCensus {
     pub name: String,
@@ -87,92 +87,6 @@ pub struct FunctionCensus {
     pub licm_movable: u64,
 }
 
-/// One per-function CSV row. Serde keeps the header and the values in
-/// sync by construction; aggregates are derived from the census samples
-/// in [`FunctionCensus::row`].
-#[derive(Debug, Serialize)]
-pub struct FunctionRow<'a> {
-    pub module: &'a str,
-    pub function: &'a str,
-    pub values: u64,
-    pub regions: u64,
-    pub max_region_nodes: u32,
-    pub p50_region_nodes: u32,
-    pub max_depth: u32,
-    pub max_loop_depth: u32,
-    pub gammas: u64,
-    pub thetas: u64,
-    pub theta_arity_max: u32,
-    pub matches: u64,
-    pub projections: u64,
-    pub gamma_outputs: u64,
-    pub gamma_passthrough: u64,
-    pub theta_outputs: u64,
-    pub theta_passthrough: u64,
-    pub gamma_result_entries: u64,
-    pub gamma_poison_results: u64,
-    pub theta_mem_ops_max: u32,
-    pub theta_bases_p90: u32,
-    pub addr_external: u64,
-    pub addr_computable: u64,
-    pub addr_varying: u64,
-    pub candidates: u64,
-    pub bail_call: u64,
-    pub bail_alias: u64,
-    pub bail_nested: u64,
-    pub bail_sync: u64,
-    pub bail_varying: u64,
-    pub dup_pure_region: u64,
-    pub dup_pure_cross: u64,
-    pub foldable: u64,
-    pub licm_movable: u64,
-    pub calls_in_thetas: u64,
-    pub calls_readonly: u64,
-}
-
-impl FunctionCensus {
-    pub fn row<'a>(&'a self, module: &'a str) -> FunctionRow<'a> {
-        FunctionRow {
-            module,
-            function: &self.name,
-            values: self.values,
-            regions: self.regions,
-            max_region_nodes: self.region_node_counts.iter().copied().max().unwrap_or(0),
-            p50_region_nodes: percentile(&self.region_node_counts, 50),
-            max_depth: self.max_depth,
-            max_loop_depth: self.max_loop_depth,
-            gammas: self.gammas,
-            thetas: self.thetas,
-            theta_arity_max: self.theta_arities.iter().copied().max().unwrap_or(0),
-            matches: self.matches,
-            projections: self.projections,
-            gamma_outputs: self.gamma_outputs,
-            gamma_passthrough: self.gamma_passthrough,
-            theta_outputs: self.theta_outputs,
-            theta_passthrough: self.theta_passthrough,
-            gamma_result_entries: self.gamma_result_entries,
-            gamma_poison_results: self.gamma_poison_results,
-            theta_mem_ops_max: self.theta_mem_ops.iter().copied().max().unwrap_or(0),
-            theta_bases_p90: percentile(&self.theta_distinct_bases, 90),
-            addr_external: self.addr_external,
-            addr_computable: self.addr_computable,
-            addr_varying: self.addr_varying,
-            candidates: self.promotion_candidates,
-            bail_call: self.bail_call,
-            bail_alias: self.bail_alias,
-            bail_nested: self.bail_nested,
-            bail_sync: self.bail_sync,
-            bail_varying: self.bail_varying,
-            dup_pure_region: self.dup_pure_in_region,
-            dup_pure_cross: self.dup_pure_cross_region,
-            foldable: self.foldable,
-            licm_movable: self.licm_movable,
-            calls_in_thetas: self.calls_in_thetas,
-            calls_readonly: self.calls_readonly,
-        }
-    }
-}
-
 /// Bytes held by each backing array of the graph, so representation
 /// debates start from a measured budget instead of hand arithmetic.
 /// Interner tables (types/signatures/constants) are reported by COUNT
@@ -213,11 +127,58 @@ pub struct SpanComposition {
 /// profiles).
 #[derive(Debug, Default, Clone, Copy, Serialize)]
 pub struct PhaseTiming {
-    pub frontend_and_parse_ms: u64,
-    pub construction_ms: u64,
-    pub verify_ms: u64,
-    pub optimise_ms: u64,
-    pub census_ms: u64,
+    pub frontend_and_parse_ms: f64,
+    pub construction_ms: f64,
+    /// Everything spent verifying: the debug post-construction check
+    /// plus the --verify-all pipeline checks. Absent verification
+    /// reports as zero.
+    pub verify_ms: f64,
+    pub optimise_ms: f64,
+    /// Total across every census snapshot taken this compile.
+    pub census_ms: f64,
+}
+
+/// Whole-compile statistics document written by `--stats-json`: the
+/// census summaries before and after the pass pipeline, one row per
+/// pass, and the emitted-IR counts. One JSON object per compile, for
+/// corpus sweeps and regression tracking.
+#[derive(Debug, Serialize)]
+pub struct CompileReportJson<'a> {
+    /// Bumped on any breaking change to this document's shape, so
+    /// downstream tooling rejects or adapts instead of misparsing.
+    pub schema_version: u32,
+    pub input: &'a str,
+    /// Per-compile facts, stated once (census rows carry graph shape
+    /// only).
+    pub phases: PhaseTiming,
+    pub heap: HeapUsage,
+    pub census_pre_opt: &'a ModuleSummaryRow,
+    pub census_post_opt: Option<&'a ModuleSummaryRow>,
+    pub passes: &'a [crate::opt::PassReport],
+    pub emitted_ir: Option<EmittedIrStats>,
+    /// Lowering + codegen + link (or JIT engine build), everything
+    /// after the pass pipeline; None when that stage was never reached.
+    pub output_ms: Option<f64>,
+    /// The compile failure this document accompanies, if any: stats are
+    /// written even for failed compiles (write-what-you-have), and this
+    /// field is how a partial document is told apart from a complete one.
+    pub error: Option<&'a str>,
+}
+
+/// The current [`CompileReportJson`] shape version.
+pub const COMPILE_REPORT_SCHEMA_VERSION: u32 = 1;
+
+/// Shape of the emitted LLVM module, counted by a walk after lowering.
+/// The link between graph metrics and backend cost: instruction and
+/// especially phi counts are what LLVM's verifier and instruction
+/// selection actually pay for, so interface-shrinking passes should
+/// move these, not just the graph numbers.
+#[derive(Debug, Default, Clone, Copy, Serialize)]
+pub struct EmittedIrStats {
+    pub functions: usize,
+    pub basic_blocks: usize,
+    pub instructions: usize,
+    pub phis: usize,
 }
 
 /// Rust-heap bytes at pipeline boundaries, filled by the DRIVER from
@@ -258,8 +219,6 @@ pub struct ModuleCensus {
     pub value_references: u64,
     pub memory_budget: MemoryBudget,
     pub span_composition: SpanComposition,
-    pub timing: PhaseTiming,
-    pub heap: HeapUsage,
 
     pub value_pool_len: usize,
     pub region_pool_len: usize,
@@ -273,17 +232,21 @@ pub struct ModuleCensus {
     pub functions: Vec<FunctionCensus>,
 }
 
-/// One aggregated CSV row per module, for corpus-level plots.
-#[derive(Debug, Serialize)]
-pub struct ModuleSummaryRow<'a> {
-    pub module: &'a str,
+/// One aggregated graph-shape row per module: the census part of the
+/// compile report (see [`CompileReportJson`]). Owned, so it outlives
+/// the census it was derived from -- the full `ModuleCensus` holds
+/// per-value sample vectors that must NOT stay alive across the pass
+/// pipeline, or they poison every later heap measurement.
+#[derive(Debug, Clone, Serialize)]
+pub struct ModuleSummaryRow {
+    pub module: String,
     pub functions: usize,
     pub values: u64,
     pub live_values: u64,
     pub regions: u64,
     pub thetas: u64,
     pub gammas: u64,
-    pub candidates: u64,
+    pub promotion_candidates: u64,
     pub bail_call: u64,
     pub bail_alias: u64,
     pub bail_nested: u64,
@@ -313,16 +276,8 @@ pub struct ModuleSummaryRow<'a> {
     pub span_region_results: usize,
     pub span_loop_vars: usize,
     pub span_call_args: usize,
-    pub span_gep_indices: usize,
+    pub span_ptr_offset_indices: usize,
     pub span_unaccounted: usize,
-    pub frontend_and_parse_ms: u64,
-    pub construction_ms: u64,
-    pub verify_ms: u64,
-    pub optimise_ms: u64,
-    pub census_ms: u64,
-    pub heap_after_parse_bytes: usize,
-    pub heap_live_at_census_bytes: usize,
-    pub heap_peak_bytes: usize,
 }
 
 /// Exhaustive kind naming: a new `ValueKind` variant fails to compile
@@ -1201,17 +1156,17 @@ pub fn percentile(samples: &[u32], p: u32) -> u32 {
 }
 
 impl ModuleCensus {
-    pub fn summary_row(&self) -> ModuleSummaryRow<'_> {
+    pub fn summary_row(&self) -> ModuleSummaryRow {
         let sum = |f: fn(&FunctionCensus) -> u64| self.functions.iter().map(f).sum::<u64>();
         ModuleSummaryRow {
-            module: &self.mod_name,
+            module: self.mod_name.clone(),
             functions: self.functions.len(),
             values: self.total_values,
             live_values: self.live_values,
             regions: sum(|f| f.regions),
             thetas: sum(|f| f.thetas),
             gammas: sum(|f| f.gammas),
-            candidates: sum(|f| f.promotion_candidates),
+            promotion_candidates: sum(|f| f.promotion_candidates),
             bail_call: sum(|f| f.bail_call),
             bail_alias: sum(|f| f.bail_alias),
             bail_nested: sum(|f| f.bail_nested),
@@ -1243,21 +1198,13 @@ impl ModuleCensus {
             span_region_results: self.span_composition.region_results,
             span_loop_vars: self.span_composition.theta_loop_vars,
             span_call_args: self.span_composition.call_args,
-            span_gep_indices: self.span_composition.ptr_offset_indices,
+            span_ptr_offset_indices: self.span_composition.ptr_offset_indices,
             span_unaccounted: self.span_composition.unaccounted,
-            frontend_and_parse_ms: self.timing.frontend_and_parse_ms,
-            construction_ms: self.timing.construction_ms,
-            verify_ms: self.timing.verify_ms,
-            optimise_ms: self.timing.optimise_ms,
-            census_ms: self.timing.census_ms,
-            heap_after_parse_bytes: self.heap.after_parse_bytes,
-            heap_live_at_census_bytes: self.heap.live_at_census_bytes,
-            heap_peak_bytes: self.heap.peak_bytes,
         }
     }
 
-    /// Human summary. The caller supplies the sink (a buffered stdout
-    /// lock from the driver; a Vec in tests).
+    /// Human summary. The caller supplies the sink (a stderr lock from
+    /// the compiler's --stats path; a Vec in tests).
     pub fn write_summary(&self, out: &mut impl io::Write) -> io::Result<()> {
         let summary = self.summary_row();
         writeln!(out, "=== module {} ===", self.mod_name)?;
@@ -1335,7 +1282,7 @@ impl ModuleCensus {
         writeln!(
             out,
             "  promotion candidates {}  bails: call {} alias {} nested {} sync {} varying {}",
-            summary.candidates,
+            summary.promotion_candidates,
             summary.bail_call,
             summary.bail_alias,
             summary.bail_nested,
@@ -1378,7 +1325,7 @@ impl ModuleCensus {
         let spans = &self.span_composition;
         writeln!(
             out,
-            "-- value_pool spans -- gamma inputs {}, region results {}, loop vars {}, call args {}, gep indices {}, shuffle masks {}, unaccounted {}",
+            "-- value_pool spans -- gamma inputs {}, region results {}, loop vars {}, call args {}, ptr offset indices {}, shuffle masks {}, unaccounted {}",
             spans.gamma_inputs,
             spans.region_results,
             spans.theta_loop_vars,
@@ -1387,33 +1334,6 @@ impl ModuleCensus {
             spans.shuffle_masks,
             spans.unaccounted,
         )?;
-        if self.timing.frontend_and_parse_ms
-            + self.timing.construction_ms
-            + self.timing.verify_ms
-            + self.timing.census_ms
-            > 0
-        {
-            writeln!(
-                out,
-                "-- timing -- frontend+parse {}ms, construction {}ms, verify {}ms, optimise {}ms, census {}ms",
-                self.timing.frontend_and_parse_ms,
-                self.timing.construction_ms,
-                self.timing.verify_ms,
-                self.timing.optimise_ms,
-                self.timing.census_ms,
-            )?;
-        }
-        if self.heap.peak_bytes > 0 {
-            let mib = |bytes: usize| bytes as f64 / (1024.0 * 1024.0);
-            writeln!(
-                out,
-                "-- rust heap -- after parse {:.1}MiB (llvm-ir AST), live at census {:.1}MiB, \
-                 process peak {:.1}MiB; LLVM's C++ heap and subprocesses are outside these",
-                mib(self.heap.after_parse_bytes),
-                mib(self.heap.live_at_census_bytes),
-                mib(self.heap.peak_bytes),
-            )?;
-        }
         writeln!(
             out,
             "  addr origin in theta bodies: external {} computable {} varying {}",

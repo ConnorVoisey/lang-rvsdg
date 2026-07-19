@@ -23,6 +23,31 @@ use inkwell::{
 };
 use std::{path::Path, process::Command};
 
+/// Count the emitted module's shape (see [`crate::stats::EmittedIrStats`]):
+/// the link between graph metrics and LLVM backend cost. One linear walk
+/// over the module; only run when stats were asked for.
+pub fn emitted_ir_stats(module: &Module) -> crate::stats::EmittedIrStats {
+    let mut stats = crate::stats::EmittedIrStats::default();
+    for function in module.get_functions() {
+        // Bodiless declarations (externals, llvm.* intrinsics) are
+        // referenced symbols, not emitted functions.
+        if function.count_basic_blocks() == 0 {
+            continue;
+        }
+        stats.functions += 1;
+        for block in function.get_basic_block_iter() {
+            stats.basic_blocks += 1;
+            for instruction in block.get_instructions() {
+                stats.instructions += 1;
+                if instruction.get_opcode() == inkwell::values::InstructionOpcode::Phi {
+                    stats.phis += 1;
+                }
+            }
+        }
+    }
+    stats
+}
+
 pub mod binary;
 pub mod cast;
 pub mod const_val;
@@ -132,6 +157,7 @@ impl RVSDGMod {
         include_dirs: &[String],
         defines: &[String],
         quiet: bool,
+        emitted_stats: Option<&mut crate::stats::EmittedIrStats>,
     ) -> color_eyre::Result<()> {
         // initialise things (guarded so concurrent callers don't race the
         // process-global target registry)
@@ -139,6 +165,9 @@ impl RVSDGMod {
 
         let context = Context::create();
         let module = self.lower_to_llvm_module(&context)?;
+        if let Some(stats) = emitted_stats {
+            *stats = emitted_ir_stats(&module);
+        }
         if !quiet {
             eprintln!("LLVM IR:");
             eprintln!("{}", module.print_to_string().to_string());

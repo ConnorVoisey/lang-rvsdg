@@ -5,9 +5,28 @@ use crate::rvsdg::{
     U32Span, ValueId, ValueKind, ValuePool, ValuesSpan, func::Function,
 };
 
+/// Counters only this pass can produce cheaply: slot-level interface
+/// shrink and adjacency pinning, each a single increment inside a loop
+/// the pass runs anyway. Whole-graph deltas (values, regions, pools)
+/// are measured by the pipeline driver around the pass instead
+/// (see [`super::PassReport`]).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct DneEffects {
+    /// Gamma input slots dropped because no arm reads the parameter.
+    pub gamma_input_slots_dropped: u64,
+    /// Theta loop variable slots dropped (all four faces dead).
+    pub theta_loop_var_slots_dropped: u64,
+    /// Result entries dropped from subregion result spans, counted per
+    /// region: a gamma result slot dead across N arms counts N.
+    pub result_entries_dropped: u64,
+    /// Dead projections of live signature-fixed nodes (calls, loads,
+    /// ...) kept alive for the projection adjacency contract; what a
+    /// per-site slot representation could additionally remove.
+    pub pinned_projections: u64,
+}
+
 impl RVSDGMod {
-    #[tracing::instrument(skip_all)]
-    pub fn opt_dead_node_elimination(&mut self) -> color_eyre::Result<()> {
+    pub fn opt_dead_node_elimination(&mut self) -> color_eyre::Result<DneEffects> {
         // Phi constructs (mutual recursion environments) are not yet
         // handled: their recursion variables live in the node list
         // rather than the params list, and lambdas defined inside are
@@ -24,16 +43,21 @@ impl RVSDGMod {
             ));
         }
 
+        let mut effects = DneEffects::default();
         let mut alive = vec![false; self.values.len()];
-        self.mark_all_alive_nodes(&mut alive)?;
+        self.mark_all_alive_nodes(&mut alive, &mut effects)?;
 
-        self.remove_dead_nodes(&alive)?;
+        self.remove_dead_nodes(&alive, &mut effects)?;
 
-        Ok(())
+        Ok(effects)
     }
 
     #[tracing::instrument(skip_all)]
-    fn mark_all_alive_nodes(&self, alive: &mut Vec<bool>) -> color_eyre::Result<()> {
+    fn mark_all_alive_nodes(
+        &self,
+        alive: &mut Vec<bool>,
+        effects: &mut DneEffects,
+    ) -> color_eyre::Result<()> {
         for func in &self.functions {
             self.mark_alive_nodes(alive, func)?;
         }
@@ -51,8 +75,9 @@ impl RVSDGMod {
                     self.values[call.0 as usize].kind,
                     ValueKind::Gamma { .. } | ValueKind::Theta { .. } | ValueKind::Phi { .. }
                 );
-                if !slotted && alive[call.0 as usize] {
+                if !slotted && alive[call.0 as usize] && !alive[index] {
                     alive[index] = true;
+                    effects.pinned_projections += 1;
                 }
             }
         }
@@ -267,7 +292,11 @@ impl RVSDGMod {
     }
 
     #[tracing::instrument(skip_all)]
-    fn remove_dead_nodes(&mut self, alive: &[bool]) -> color_eyre::Result<()> {
+    fn remove_dead_nodes(
+        &mut self,
+        alive: &[bool],
+        effects: &mut DneEffects,
+    ) -> color_eyre::Result<()> {
         debug_assert_eq!(alive.len(), self.values.len());
 
         // Both mappers are plain prefix sums of the mark, complete
@@ -316,6 +345,7 @@ impl RVSDGMod {
                     module: self,
                     fresh: &mut fresh,
                     scratch: &mut scratch,
+                    effects,
                 },
             )?;
             self.values[value_mapper[old] as usize] = value;
@@ -354,6 +384,7 @@ impl RVSDGMod {
                 results,
                 |slot| keep_all_results || alive[owner_old.0 as usize + 1 + slot],
             );
+            effects.result_entries_dropped += (results.len - new_results.len) as u64;
 
             let region = &mut self.regions[new as usize];
             region.results = new_results;
@@ -451,6 +482,8 @@ struct RemapContext<'a> {
     fresh: &'a mut FreshPools,
     /// Reused staging buffer for masked span copies.
     scratch: &'a mut Vec<ValueId>,
+    /// Slot-drop counters, incremented at the shrink sites.
+    effects: &'a mut DneEffects,
 }
 
 impl RemapContext<'_> {
@@ -669,8 +702,10 @@ fn remap_kind(
                 );
             }
             let body_params: &[ValueId] = &body.params;
-            *loop_vars =
+            let repooled =
                 ctx.repool_values_masked(*loop_vars, |slot| alive[body_params[slot].0 as usize]);
+            ctx.effects.theta_loop_var_slots_dropped += (loop_vars.len - repooled.len) as u64;
+            *loop_vars = repooled;
             *region_id = ctx.map_region(*region_id);
         }
         ValueKind::Gamma {
@@ -687,7 +722,10 @@ fn remap_kind(
             let alive = ctx.alive;
             let arm0 = ctx.module.region_pool.get(*regions)[0];
             let arm0_params: &[ValueId] = &ctx.module.regions[arm0.0 as usize].params;
-            *inputs = ctx.repool_values_masked(*inputs, |slot| alive[arm0_params[slot].0 as usize]);
+            let repooled =
+                ctx.repool_values_masked(*inputs, |slot| alive[arm0_params[slot].0 as usize]);
+            ctx.effects.gamma_input_slots_dropped += (inputs.len - repooled.len) as u64;
+            *inputs = repooled;
             *regions = ctx.repool_regions(*regions);
         }
         ValueKind::Phi { .. } => {
@@ -734,6 +772,7 @@ fn remap_kind(
 mod tests {
     use std::cell::Cell;
 
+    use super::DneEffects;
     use crate::rvsdg::{
         ArithFlags, BinaryOp, ConstValue, ICmpPred, Linkage, RVSDGMod, ValueId, ValueKind,
         builder::{BranchResult, LoopResult},
@@ -1022,7 +1061,8 @@ mod tests {
             })
             .collect();
 
-        m.remove_dead_nodes(&alive).unwrap();
+        m.remove_dead_nodes(&alive, &mut DneEffects::default())
+            .unwrap();
 
         assert_verified(&m);
         assert_eq!(count_muls(&m), 0, "flagged node removed from its region");
@@ -1059,7 +1099,8 @@ mod tests {
             .map(|v| !matches!(v.kind, ValueKind::RegionResult { .. }))
             .collect();
 
-        m.remove_dead_nodes(&alive).unwrap();
+        m.remove_dead_nodes(&alive, &mut DneEffects::default())
+            .unwrap();
 
         assert_verified(&m);
         assert_eq!(count_nodes(&m, |_| true), nodes_before);
@@ -1125,6 +1166,91 @@ mod tests {
         // in the value pool.
         assert_eq!(m.value_pool.len(), 1);
         assert_eq!(m.region_pool.len(), 0);
+    }
+
+    /// Layer-1 observability: the pipeline returns one report per pass
+    /// carrying the driver-measured shape delta and the pass's own slot
+    /// counters, with exact values for a known graph.
+    #[test]
+    fn pass_report_carries_shape_delta_and_slot_counters() {
+        let mut m = RVSDGMod::new_host(String::from("test"));
+        let f = m.declare_fn(String::from("f"), &[I32], &[I32], Linkage::Internal);
+        m.define_fn(f, |rb, state| {
+            let x = rb.param(0);
+            // One dead gamma input slot: neither arm reads param 0.
+            let dead_input = rb.binary(BinaryOp::Mul, ArithFlags::default(), x, x, I32);
+            let flag = rb.constant(BOOL, ConstValue::Int(1));
+            let predicate = rb.bool_predicate(flag);
+            let picked = rb.gamma(
+                predicate,
+                state,
+                &[dead_input],
+                |rb| {
+                    let zero = rb.const_i32(0);
+                    Ok(BranchResult {
+                        state,
+                        values: vec![zero],
+                    })
+                },
+                |rb| {
+                    let one = rb.const_i32(1);
+                    Ok(BranchResult {
+                        state,
+                        values: vec![one],
+                    })
+                },
+            )?;
+            // One dead theta slot: j feeds only its own next value. The
+            // gamma output inits the LIVE slot i, so the gamma's result
+            // slot stays live and the counters below stay independent.
+            let res = rb.theta(picked.state, &[picked.result(0), x], |rb| {
+                let i = rb.param(0);
+                let j = rb.param(1);
+                let one = rb.const_i32(1);
+                let next_i = rb.binary(BinaryOp::Add, ArithFlags::default(), i, one, I32);
+                let next_j = rb.binary(BinaryOp::Mul, ArithFlags::default(), j, one, I32);
+                let five = rb.const_i32(5);
+                let condition = rb.icmp(ICmpPred::SignedLt, next_i, five);
+                Ok(LoopResult {
+                    condition,
+                    next_state: picked.state,
+                    next_vars: vec![next_i, next_j],
+                })
+            })?;
+            Ok(FnResult {
+                state: res.state,
+                values: vec![res.result(0)],
+            })
+        })
+        .unwrap();
+
+        let pipeline = m.optimise_default(true).unwrap();
+
+        assert_eq!(pipeline.passes.len(), 1);
+        assert!(
+            pipeline.pre_verify_duration > std::time::Duration::ZERO,
+            "verify_all times the pre-pass verification"
+        );
+        let report = &pipeline.passes[0];
+        assert_eq!(report.pass, "DeadNodeElimination");
+        assert!(
+            report.verify_duration > std::time::Duration::ZERO,
+            "verify_all times each post-pass verification"
+        );
+        assert!(
+            report.shape_after.values < report.shape_before.values,
+            "shape delta shows removal: {} -> {}",
+            report.shape_before.values,
+            report.shape_after.values
+        );
+        assert!(report.shape_after.value_pool_entries < report.shape_before.value_pool_entries);
+        let crate::opt::PassEffects::DeadNodeElimination(effects) = report.effects;
+        assert_eq!(effects.gamma_input_slots_dropped, 1);
+        assert_eq!(effects.theta_loop_var_slots_dropped, 1);
+        // Exactly the dead theta slot's body result entry: the gamma's
+        // result slot is live (it inits the live theta slot), so both
+        // arms keep their entries.
+        assert_eq!(effects.result_entries_dropped, 1);
     }
 
     // -- Basic cases -------------------------------------------------
