@@ -48,6 +48,7 @@ impl<'a> RegionBuilder<'a> {
             }
             let results = rb.graph.value_pool.push_slice(&res.values);
             rb.graph.regions[rb.region_id.0 as usize].results = results;
+            rb.graph.regions[rb.region_id.0 as usize].exit_state = res.state;
             branch_regions.push(rb.region_id);
         }
 
@@ -64,6 +65,9 @@ impl<'a> RegionBuilder<'a> {
                 regions,
             },
         });
+        for &arm in &branch_regions {
+            self.graph.regions[arm.0 as usize].owner = gamma_val;
+        }
         let out_state = State(gamma_val);
 
         let first_result = ValueId(self.graph.values.len() as u32);
@@ -119,6 +123,9 @@ impl<'a> RegionBuilder<'a> {
                 regions,
             },
         });
+        for &arm in branch_regions {
+            self.graph.regions[arm.0 as usize].owner = gamma_val;
+        }
         let out_state = State(gamma_val);
 
         let first_result = ValueId(self.graph.values.len() as u32);
@@ -168,6 +175,7 @@ impl<'a> RegionBuilder<'a> {
                 region_id: body_region,
             },
         });
+        self.graph.regions[body_region.0 as usize].owner = theta_val;
         let out_state = State(theta_val);
 
         let first_result = ValueId(self.graph.values.len() as u32);
@@ -282,6 +290,7 @@ impl<'a> RegionBuilder<'a> {
             );
             let results = rb.graph.value_pool.push_slice(&res.next_vars);
             rb.graph.regions[rb.region_id.0 as usize].results = results;
+            rb.graph.regions[rb.region_id.0 as usize].exit_state = res.next_state;
             (rb.region_id, res.condition)
         };
 
@@ -294,6 +303,7 @@ impl<'a> RegionBuilder<'a> {
                 region_id: region,
             },
         });
+        self.graph.regions[region.0 as usize].owner = theta_val;
         let out_state = State(theta_val);
 
         let first_result = ValueId(self.graph.values.len() as u32);
@@ -340,6 +350,7 @@ impl<'a> RegionBuilder<'a> {
                 kind: ValueKind::RegionParam {
                     index: i as u32,
                     ty: TypeRef::Scalar(ScalarType::Void),
+                    region,
                 },
             });
             rb.graph.regions[region.0 as usize].nodes.push(id);
@@ -357,11 +368,14 @@ impl<'a> RegionBuilder<'a> {
         );
         let results = rb.graph.value_pool.push_slice(&phi_body.values);
         rb.graph.regions[region.0 as usize].results = results;
+        // A phi region only defines lambdas, so it is always pure.
+        rb.graph.regions[region.0 as usize].exit_state = state;
 
         let phi_val = self.add_value(Value {
             ty: TypeRef::Scalar(ScalarType::Void),
             kind: ValueKind::Phi { region, rv_count },
         });
+        self.graph.regions[region.0 as usize].owner = phi_val;
 
         let first_result = ValueId(self.graph.values.len() as u32);
         for i in 0..rv_count {

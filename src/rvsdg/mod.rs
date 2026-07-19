@@ -153,6 +153,17 @@ impl RVSDGMod {
         id
     }
 
+    /// Bring the interner along through a compaction pass: drop entries
+    /// whose value died and rewrite the survivors' ids, so interning
+    /// after the pass never hands out a dangling id. `alive` and
+    /// `value_mapper` are indexed by pre-compaction id.
+    pub(crate) fn remap_interned_values(&mut self, alive: &[bool], value_mapper: &[u32]) {
+        self.interned_values.retain(|_, id| alive[id.0 as usize]);
+        for id in self.interned_values.values_mut() {
+            *id = ValueId(value_mapper[id.0 as usize]);
+        }
+    }
+
     #[inline]
     pub fn get_region_mut(&mut self, region_id: RegionId) -> &mut Region {
         &mut self.regions[region_id.0 as usize]
@@ -163,6 +174,7 @@ impl RVSDGMod {
     /// this is plain enumeration with no scoping semantics (the scope and
     /// state verifiers have their own, special-cased walks). Exhaustive
     /// over `ValueKind`, so adding a variant forces a decision here.
+    #[inline(always)]
     pub fn for_each_value_operand(&self, value: ValueId, mut f: impl FnMut(ValueId)) {
         match &self.values[value.0 as usize].kind {
             ValueKind::Unary { operand, .. }
@@ -308,6 +320,13 @@ impl RVSDGMod {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ValueId(pub u32);
 
+impl ValueId {
+    /// Sentinel for "no value". Deliberately out of range so accidental
+    /// use panics at the first indexed access instead of silently
+    /// resolving to a real value.
+    pub const INVALID: ValueId = ValueId(u32::MAX);
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FuncId(u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -315,7 +334,13 @@ pub struct GlobalId(u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RegionId(pub u32);
 
-#[derive(Debug, Clone)]
+impl RegionId {
+    /// Sentinel for "no region". Same fail-fast rationale as
+    /// [`ValueId::INVALID`].
+    pub const INVALID: RegionId = RegionId(u32::MAX);
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct ValuePool(Vec<ValueId>);
 
 impl ValuePool {
@@ -344,7 +369,7 @@ pub struct ValuesSpan {
     pub len: u16,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct RegionPool(Vec<RegionId>);
 
 impl RegionPool {
@@ -361,6 +386,14 @@ impl RegionPool {
         &self.0[span.start as usize..(span.start as usize + span.len as usize)]
     }
 
+    /// Mutable view of a span's contents, for the copy-then-remap-in-
+    /// place pattern. Every span is uniquely owned by the field holding
+    /// it (`push_slice` always appends), so an owner mutating its span
+    /// never aliases another owner's.
+    pub fn get_mut(&mut self, span: RegionsSpan) -> &mut [RegionId] {
+        &mut self.0[span.start as usize..(span.start as usize + span.len as usize)]
+    }
+
     /// Total pooled entries (live and dead spans alike).
     pub fn len(&self) -> usize {
         self.0.len()
@@ -373,7 +406,7 @@ pub struct RegionsSpan {
     pub len: u16,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct U32Pool(Vec<u32>);
 
 impl U32Pool {
@@ -413,7 +446,7 @@ pub struct MatchArm {
     pub alternative: u32,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct MatchArmPool(Vec<MatchArm>);
 
 impl MatchArmPool {
@@ -447,6 +480,15 @@ pub struct MatchArmSpan {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct State(pub ValueId);
 
+impl State {
+    /// Placeholder for a not-yet-set state slot (regions are created
+    /// with this exit state and every finaliser must overwrite it, pure
+    /// regions included). Forgetting to set it panics at the first
+    /// indexed use instead of silently reading a real value, and the
+    /// verifier reports any that survive to a checkpoint.
+    pub const INVALID: State = State(ValueId::INVALID);
+}
+
 #[derive(Debug, Clone)]
 pub struct Region {
     /// The region's parameters, in input order. An explicit list (not a
@@ -456,7 +498,20 @@ pub struct Region {
     /// global value array. Consumers identify a parameter by its position
     /// here, never by value-id arithmetic.
     pub params: Vec<ValueId>,
+    /// The lambda/gamma/theta/phi value this region belongs to. The
+    /// graph only stores the forward direction during emission (the
+    /// construct value does not exist until its regions are finished),
+    /// so like `exit_state` this is created as [`ValueId::INVALID`] and
+    /// stamped by the construct's finaliser; the verifier rejects any
+    /// region left unset.
+    pub owner: ValueId,
     pub entry_state: State,
+    /// Equal to `entry_state` when the region is pure. A field rather
+    /// than a results-span entry so slot machinery (projections, phis,
+    /// dead slot elimination) never has to special-case a state slot.
+    /// Created as [`State::INVALID`]; every finaliser must set it
+    /// explicitly, and the verifier rejects any region still unset.
+    pub exit_state: State,
     pub results: ValuesSpan,
     /// All values in this region (in topo order)
     pub nodes: Vec<ValueId>,

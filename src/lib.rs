@@ -38,6 +38,7 @@ pub(crate) fn init_llvm_native() -> color_eyre::Result<()> {
 
 pub mod bench;
 pub mod llvm_parser;
+pub mod opt;
 pub mod rvsdg;
 pub mod stats;
 
@@ -101,8 +102,61 @@ pub fn c_file_to_mod(
         _ => {}
     }
 
-    let bc_file = NamedTempFile::with_suffix(".bc")?;
+    let bc_file = c_file_to_bc(c_file_path, include_dirs, defines)?;
     let bc_output = bc_file.path();
+    let bc_output_str = bc_output
+        .to_str()
+        .ok_or_else(|| color_eyre::eyre::eyre!("temporary .bc path is not valid UTF-8"))?;
+
+    // Diagnostics go to stderr so a compiled program's own stdout (e.g. a
+    // csmith checksum) is never mixed with compiler logging. The bitcode is
+    // disassembled on demand; this path is for humans, not the pipeline.
+    if !quiet {
+        let dis = Command::new("llvm-dis")
+            .args([bc_output_str, "-o", "-"])
+            .output()?;
+        eprintln!(
+            "Parsed LLVM IR (text): {}",
+            String::from_utf8_lossy(&dis.stdout)
+        );
+    }
+
+    let _parse_span = tracing::info_span!("llvm_ir_parse").entered();
+    let module = Module::from_bc_path(bc_output)
+        .map_err(|e| color_eyre::eyre::eyre!("failed to parse LLVM bitcode: {e}"))?;
+
+    Ok(module)
+}
+
+/// Run the scaffold C frontend -- clang generating IR with every LLVM
+/// pass disabled, piped into `opt -passes=mem2reg` -- producing a bitcode
+/// temp file (deleted on drop). Public so the differential tester can
+/// produce ONE .bc per program and time both compilers from the same
+/// input: the frontend is shared scaffolding, not part of either side's
+/// measured work.
+///
+/// Only `mem2reg` runs here: it promotes the allocas clang emits for
+/// locals into SSA values and phi nodes, which the construction needs to
+/// read the gamma/theta signatures off the phi nodes. Everything else --
+/// restructuring (loop-simplify, loop-rotate, lcssa) and optimisation
+/// (sroa, instcombine, gvn, simplifycfg, ...) -- is deliberately omitted:
+/// the RVSDG construction restructures raw control flow itself (Bahmann,
+/// Reissmann, Jahre, Meyer 2015 sections 4.1/4.2), and the mid-level
+/// optimisation is the RVSDG's job, so letting LLVM do it would both
+/// pre-empt that work and bias any later benchmark of our optimisations
+/// against LLVM's.
+#[tracing::instrument(skip_all)]
+pub fn c_file_to_bc(
+    c_file_path: &Path,
+    include_dirs: &[String],
+    defines: &[String],
+) -> color_eyre::Result<NamedTempFile> {
+    let bc_file = NamedTempFile::with_suffix(".bc")?;
+    let bc_output_str = bc_file
+        .path()
+        .to_str()
+        .ok_or_else(|| color_eyre::eyre::eyre!("temporary .bc path is not valid UTF-8"))?
+        .to_string();
 
     let mut clang = Command::new("clang");
     // `-w`: we don't care about clang's warnings on the input here (it's
@@ -130,19 +184,6 @@ pub fn c_file_to_mod(
     clang.arg(c_file_path).args(["-o", "-"]);
     let clang_cmd = clang.stdout(Stdio::piped()).spawn()?;
 
-    // Only `mem2reg` runs here: it promotes the allocas clang emits for locals
-    // into SSA values and phi nodes, which the construction needs to read the
-    // gamma/theta signatures off the phi nodes. Everything else -- restructuring
-    // (loop-simplify, loop-rotate, lcssa) and optimisation (sroa, instcombine,
-    // gvn, simplifycfg, ...) -- is deliberately omitted: the RVSDG construction
-    // restructures raw control flow itself (Bahmann, Reissmann, Jahre, Meyer
-    // 2015 sections 4.1/4.2: multi-entry/multi-latch/multi-exit loops and the
-    // branch p-demux), and the mid-level optimisation is the RVSDG's job, so
-    // letting LLVM do it would both pre-empt that work and bias any later
-    // benchmark of our optimisations against LLVM's.
-    let bc_output_str = bc_output
-        .to_str()
-        .ok_or_else(|| color_eyre::eyre::eyre!("temporary .bc path is not valid UTF-8"))?;
     let clang_stdout = clang_cmd
         .stdout
         .ok_or_else(|| color_eyre::eyre::eyre!("clang produced no stdout to pipe into opt"))?;
@@ -152,7 +193,7 @@ pub fn c_file_to_mod(
         // to the parser, and bitcode skips LLVM's text lexer on the way
         // back in.
         let status = Command::new("opt")
-            .args(["-passes=mem2reg", "-o", bc_output_str])
+            .args(["-passes=mem2reg", "-o", &bc_output_str])
             .stdin(clang_stdout)
             .stdout(Stdio::piped())
             .status()?;
@@ -161,24 +202,7 @@ pub fn c_file_to_mod(
         }
     }
 
-    // Diagnostics go to stderr so a compiled program's own stdout (e.g. a
-    // csmith checksum) is never mixed with compiler logging. The bitcode is
-    // disassembled on demand; this path is for humans, not the pipeline.
-    if !quiet {
-        let dis = Command::new("llvm-dis")
-            .args([bc_output_str, "-o", "-"])
-            .output()?;
-        eprintln!(
-            "Parsed LLVM IR (text): {}",
-            String::from_utf8_lossy(&dis.stdout)
-        );
-    }
-
-    let _parse_span = tracing::info_span!("llvm_ir_parse").entered();
-    let module = Module::from_bc_path(bc_output)
-        .map_err(|e| color_eyre::eyre::eyre!("failed to parse LLVM bitcode: {e}"))?;
-
-    Ok(module)
+    Ok(bc_file)
 }
 
 #[derive(Parser, Debug)]
@@ -198,8 +222,17 @@ pub struct Cli {
     #[arg(long, short, default_value_t = false)]
     pub(crate) run: bool,
 
-    #[arg(long, default_value_t = false)]
-    pub(crate) optimise: bool,
+    /// Disable the optimisation pipeline (which is on by default), for
+    /// A/B measurement of the passes themselves.
+    #[arg(long = "no-optimise", default_value_t = false)]
+    pub(crate) no_optimise: bool,
+
+    /// Verify the whole graph before any pass runs and again after each
+    /// pass, attributing a broken invariant to the pass that broke it.
+    /// Available in release builds (debug builds always verify once
+    /// after construction).
+    #[arg(long = "verify-all", default_value_t = false)]
+    pub(crate) verify_all: bool,
 
     #[arg(long, short, default_value_t = false)]
     pub(crate) quiet: bool,
@@ -247,7 +280,10 @@ impl Cli {
         Self {
             output: Some(output),
             run: false,
-            optimise: false,
+            no_optimise: false,
+            // Fixture graphs are tiny; per-pass verification is free
+            // coverage that names the guilty pass on failure.
+            verify_all: true,
             quiet: true,
             include: Vec::new(),
             define: Vec::new(),
@@ -262,7 +298,8 @@ impl Cli {
         Self {
             output: None,
             run: true,
-            optimise: false,
+            no_optimise: false,
+            verify_all: true,
             quiet: true,
             include: Vec::new(),
             define: Vec::new(),
@@ -285,7 +322,7 @@ pub fn run_cli(cli: &Cli) -> color_eyre::Result<Option<u8>> {
     let c_file_path = Path::new(&cli.input);
     let module = c_file_to_mod(c_file_path, &cli.include, &cli.define, cli.quiet)?;
 
-    let rvsdg = RVSDGMod::from_llvm_mod(module)?;
+    let mut rvsdg = RVSDGMod::from_llvm_mod(module)?;
     #[cfg(debug_assertions)]
     {
         let errs = rvsdg.verify();
@@ -296,8 +333,8 @@ pub fn run_cli(cli: &Cli) -> color_eyre::Result<Option<u8>> {
             panic!("Got errors");
         }
     }
-    if cli.optimise {
-        color_eyre::eyre::bail!("--optimise is not implemented yet");
+    if !cli.no_optimise {
+        rvsdg.optimise_default(cli.verify_all)?;
     }
     if !cli.quiet {
         eprintln!("RVSDG:");
@@ -371,6 +408,16 @@ pub fn run_cli(cli: &Cli) -> color_eyre::Result<Option<u8>> {
             &cli.define,
             cli.quiet,
         )?;
+        // Non-zero only when the binary installs the counting allocator
+        // (main does); the rest of RSS is LLVM's C++ heap and the
+        // clang/opt frontend subprocesses.
+        let heap_peak = stats::heap::peak_bytes();
+        if !cli.quiet && heap_peak > 0 {
+            eprintln!(
+                "peak rust heap: {:.1} MiB",
+                heap_peak as f64 / (1024.0 * 1024.0)
+            );
+        }
         Ok(None)
     }
 }

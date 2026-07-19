@@ -3,17 +3,20 @@ use thiserror::Error;
 use crate::rvsdg::{ConstId, FuncId, GlobalId, RVSDGMod, RegionId, ValueId};
 
 pub mod ids;
+pub mod ownership;
 pub mod predicate_form;
 pub mod scope;
 pub mod state;
 
 impl RVSDGMod {
+    #[tracing::instrument(skip_all)]
     pub fn verify(&self) -> Vec<RVSDGVerificationError> {
         let mut errs = vec![];
         self.verify_ids(&mut errs);
         let ownership = self.build_value_ownership(&mut errs);
         self.verify_scope(&ownership, &mut errs);
         self.verify_state(&ownership, &mut errs);
+        self.verify_region_ownership(&mut errs);
         self.verify_predicate_form(&mut errs);
         errs
     }
@@ -70,6 +73,27 @@ pub enum RVSDGVerificationError {
 
     #[error("state edge into {user}: operand {operand} is defined later in the same region")]
     StateEdgeUsedBeforeDefinition { user: ValueId, operand: ValueId },
+
+    #[error(
+        "region {region}'s exit state {operand} is neither its entry state nor a \
+         state-producing node of that region"
+    )]
+    RegionExitStateInvalid { region: RegionId, operand: ValueId },
+
+    #[error("region {0}'s exit state was never set by its finaliser")]
+    RegionExitStateUnset(RegionId),
+
+    #[error("region {0}'s owner was never set by its finaliser")]
+    RegionOwnerUnset(RegionId),
+
+    #[error("region {region}'s owner {owner} is not a construct whose region list names it")]
+    RegionOwnerInvalid { region: RegionId, owner: ValueId },
+
+    #[error(
+        "region {region}'s parameter list holds {param}, which is not a RegionParam naming \
+         that region back"
+    )]
+    RegionParamLinkInvalid { region: RegionId, param: ValueId },
 
     #[error("Region {region_id} takes in {input_count} params yet returns {output_count} params")]
     RegionInvalidArgReturnCount {

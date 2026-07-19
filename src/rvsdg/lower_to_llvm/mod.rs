@@ -154,15 +154,21 @@ impl RVSDGMod {
         // register allocation, machine-level opts), never the mid-level IR
         // optimizer (instcombine/GVN/LICM/vectorize), which is only run via a
         // PassBuilder pipeline we deliberately don't invoke. So the mid level
-        // stays "-O0" (RVSDG owns those optimizations); `Aggressive` (-O3)
-        // gives the greedy register allocator and aggressive instruction
-        // selection/scheduling for the final code, not extra IR optimization.
+        // is "-O0" (RVSDG owns those optimizations) at every setting here.
+        //
+        // TEMPORARY: `None` (-O0 codegen: fast instruction selection, basic
+        // register allocator) so compile-time comparisons against the
+        // difftest's `clang -O0` reference measure our pipeline like for
+        // like instead of charging us for LLVM's -O3 backend. Restore
+        // `Aggressive` -- or make it a CLI flag -- when output quality
+        // matters again: runtime benchmarks (polybench charts) are
+        // meaningless at `None`.
         let machine = target
             .create_target_machine(
                 &llvm_triple,
                 "generic",
                 "",
-                OptimizationLevel::Aggressive,
+                OptimizationLevel::None,
                 RelocMode::PIC,
                 CodeModel::Default,
             )
@@ -170,9 +176,15 @@ impl RVSDGMod {
 
         let obj_file = format!("{}.o", output);
         let obj_path = Path::new(&obj_file);
-        machine
-            .write_to_file(&module, FileType::Object, obj_path)
-            .map_err(|e| eyre!("failed to write object file {}: {e}", obj_path.display()))?;
+        {
+            // Codegen scales with the SIZE OF OUR OUTPUT (phi count above
+            // all), not the input program: it was an invisible half of the
+            // compile before this span existed.
+            let _span = tracing::info_span!("llvm_codegen_object").entered();
+            machine
+                .write_to_file(&module, FileType::Object, obj_path)
+                .map_err(|e| eyre!("failed to write object file {}: {e}", obj_path.display()))?;
+        }
 
         // Status/diagnostics go to stderr so the compiler never writes to
         // stdout -- that belongs to the compiled program when it runs.
@@ -191,6 +203,7 @@ impl RVSDGMod {
         // POLYBENCH_TIME reaches it and then silently reports zeros). The
         // extra link arguments (e.g. `-lm`) go after every object so
         // library flags resolve the symbols those objects reference.
+        let _link_span = tracing::info_span!("link_cc").entered();
         let mut link = Command::new("cc");
         link.arg(obj_arg);
         for input in link_inputs {
@@ -242,8 +255,13 @@ impl RVSDGMod {
             }
             self.lower_fn(llvm_builder, mapper, func)?;
         }
-        if let Err(e) = llvm_builder.module.verify() {
-            bail!("LLVM module verification failed: {e}");
+        {
+            // Like codegen, LLVM's verifier walks OUR emitted module and
+            // scales with its size; span it so it can't hide in traces.
+            let _span = tracing::info_span!("llvm_module_verify").entered();
+            if let Err(e) = llvm_builder.module.verify() {
+                bail!("LLVM module verification failed: {e}");
+            }
         }
 
         Ok(())

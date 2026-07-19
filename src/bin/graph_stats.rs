@@ -8,6 +8,11 @@ use std::path::PathBuf;
 use clap::Parser;
 use lang_rvsdg::{c_file_to_mod, rvsdg::RVSDGMod, stats};
 
+/// Real Rust-heap numbers for the census memory report; the library
+/// stays allocator-agnostic.
+#[global_allocator]
+static ALLOCATOR: stats::heap::CountingAllocator = stats::heap::CountingAllocator;
+
 #[derive(Parser, Debug)]
 #[command(
     name = "graph-stats",
@@ -33,6 +38,13 @@ struct Args {
     /// Write one aggregated CSV row per module across all inputs.
     #[arg(long, value_name = "FILE")]
     summary_csv: Option<PathBuf>,
+
+    /// Run the optimisation pipeline after the first census and take a
+    /// second census of the result (reported/serialised with a
+    /// " post-opt" module suffix), so passes can be quantified as a
+    /// before/after shape diff.
+    #[arg(long, default_value_t = false)]
+    optimise: bool,
 }
 
 fn main() -> color_eyre::Result<()> {
@@ -65,9 +77,10 @@ fn main() -> color_eyre::Result<()> {
             }
         };
         let frontend_and_parse = phase_start.elapsed();
+        let heap_after_parse = stats::heap::live_bytes();
 
         let phase_start = std::time::Instant::now();
-        let rvsdg = match RVSDGMod::from_llvm_mod(module) {
+        let mut rvsdg = match RVSDGMod::from_llvm_mod(module) {
             Ok(rvsdg) => rvsdg,
             Err(error) => {
                 writeln!(out, "SKIP {} (construction: {error:#})", input.display())?;
@@ -96,12 +109,18 @@ fn main() -> color_eyre::Result<()> {
             frontend_and_parse_ms: frontend_and_parse.as_millis() as u64,
             construction_ms: construction.as_millis() as u64,
             verify_ms: verify.as_millis() as u64,
+            optimise_ms: 0,
             census_ms: phase_start.elapsed().as_millis() as u64,
         };
         // The constructed module is named after the frontend's temp
         // file; label census output by the actual input instead.
         census.mod_name = input.display().to_string();
         census.timing = timing;
+        census.heap = stats::HeapUsage {
+            after_parse_bytes: heap_after_parse,
+            live_at_census_bytes: stats::heap::live_bytes(),
+            peak_bytes: stats::heap::peak_bytes(),
+        };
         census.write_summary(&mut out)?;
         writeln!(out)?;
 
@@ -112,6 +131,54 @@ fn main() -> color_eyre::Result<()> {
         }
         if let Some(writer) = summary_csv.as_mut() {
             writer.serialize(census.summary_row())?;
+        }
+
+        if args.optimise {
+            let phase_start = std::time::Instant::now();
+            // No verify_all here: the driver runs its own verify before
+            // and after with skip-and-report handling, which suits a
+            // census tool better than aborting.
+            if let Err(error) = rvsdg.optimise_default(false) {
+                writeln!(out, "SKIP {} (optimise: {error:#})", input.display())?;
+                continue;
+            }
+            let optimise = phase_start.elapsed();
+
+            let verification_errors = rvsdg.verify();
+            if !verification_errors.is_empty() {
+                writeln!(
+                    out,
+                    "WARNING {}: {} verification errors after optimise; post census skipped",
+                    input.display(),
+                    verification_errors.len()
+                )?;
+                continue;
+            }
+
+            let phase_start = std::time::Instant::now();
+            let mut post = stats::collect(&rvsdg);
+            post.mod_name = format!("{} post-opt", input.display());
+            post.timing = stats::PhaseTiming {
+                optimise_ms: optimise.as_millis() as u64,
+                census_ms: phase_start.elapsed().as_millis() as u64,
+                ..census.timing
+            };
+            post.heap = stats::HeapUsage {
+                after_parse_bytes: heap_after_parse,
+                live_at_census_bytes: stats::heap::live_bytes(),
+                peak_bytes: stats::heap::peak_bytes(),
+            };
+            post.write_summary(&mut out)?;
+            writeln!(out)?;
+
+            if let Some(writer) = function_csv.as_mut() {
+                for function in &post.functions {
+                    writer.serialize(function.row(&post.mod_name))?;
+                }
+            }
+            if let Some(writer) = summary_csv.as_mut() {
+                writer.serialize(post.summary_row())?;
+            }
         }
     }
 

@@ -116,6 +116,9 @@ enum Run {
 
 enum Outcome {
     Pass {
+        /// The shared clang+mem2reg frontend that produced the bitcode
+        /// BOTH compile times below start from.
+        frontend_compile: Duration,
         rvsdg_compile: Duration,
         clang_compile: Duration,
         rvsdg_run: Duration,
@@ -189,7 +192,7 @@ fn spawn_timed(
 
 fn compile_rvsdg(
     cc: &Path,
-    c_file: &Path,
+    input: &Path,
     out: &Path,
     args: &Args,
     tmp: &Path,
@@ -198,10 +201,9 @@ fn compile_rvsdg(
     let err_file = fs::File::create(&err_path)?;
     let mut cmd = Command::new(cc);
     cmd.arg("--output").arg(out).arg("-q");
-    for dir in &args.include {
-        cmd.arg("-I").arg(dir);
-    }
-    cmd.arg(c_file);
+    // The input is the shared frontend's bitcode (or a caller-supplied
+    // .ll/.bc), self-contained: no include paths needed.
+    cmd.arg(input);
     // Plain-text diagnostics (no ANSI) so saved finding logs stay readable.
     cmd.env("NO_COLOR", "1");
     cmd.stdout(Stdio::null()).stderr(err_file);
@@ -216,16 +218,16 @@ fn compile_rvsdg(
     })
 }
 
-fn compile_clang(c_file: &Path, out: &Path, args: &Args) -> std::io::Result<bool> {
+fn compile_clang(input: &Path, out: &Path, args: &Args) -> std::io::Result<bool> {
     let mut cmd = Command::new("clang");
-    // `-O0`: the RVSDG path does no optimisation yet, so an unoptimised clang
-    // is the apples-to-apples baseline -- both the compile-time and runtime
-    // comparisons then reflect codegen, not clang's optimiser doing extra work.
+    // `-O0`: clang's middle-end stays off, so both the compile-time and
+    // runtime comparisons reflect codegen cost. The RVSDG side runs its
+    // default pipeline (the lang-rvsdg binary optimises by default);
+    // pass --no-optimise through a custom --cc wrapper to A/B that. The
+    // input is the SAME bitcode our side consumes, so neither side is
+    // charged for the shared C frontend.
     cmd.args(["-O0", "-w"]);
-    for dir in &args.include {
-        cmd.arg("-I").arg(dir);
-    }
-    cmd.arg(c_file).arg("-o").arg(out);
+    cmd.arg(input).arg("-o").arg(out);
     cmd.stdout(Stdio::null()).stderr(Stdio::null());
     let (status, _) = spawn_timed(cmd, Duration::from_secs(args.compile_timeout))?;
     Ok(status.map(|s| s.success()).unwrap_or(false) && out.exists())
@@ -263,7 +265,34 @@ fn differential_test(
     let clang_bin = tmp.join("clang_out");
     let _ = fs::remove_file(&rvsdg_bin);
 
-    let rvsdg = compile_rvsdg(cc, c_file, &rvsdg_bin, args, tmp)?;
+    // Shared frontend: produce ONE bitcode (clang IR gen + mem2reg, the
+    // scaffolding both compilers build on) and time both compiles from
+    // it, so neither side is charged for the frontend and the compile
+    // comparison measures the parts each compiler actually owns.
+    // Caller-supplied .ll/.bc inputs skip the frontend entirely.
+    let already_ir = matches!(
+        c_file.extension().and_then(|e| e.to_str()),
+        Some("ll") | Some("bc")
+    );
+    let (bc_holder, input_path, frontend_compile) = if already_ir {
+        (None, c_file.to_path_buf(), Duration::ZERO)
+    } else {
+        let frontend_start = Instant::now();
+        match lang_rvsdg::c_file_to_bc(c_file, &args.include, &[]) {
+            Ok(bc) => {
+                let path = bc.path().to_path_buf();
+                (Some(bc), path, frontend_start.elapsed())
+            }
+            // The shared frontend is clang; if it cannot build the
+            // input, that is the input's problem, same as the old
+            // reference-compile failure.
+            Err(_) => return Ok(Outcome::ClangCompileFail),
+        }
+    };
+    // Hold the temp bitcode alive across both compiles.
+    let _bc_holder = bc_holder;
+
+    let rvsdg = compile_rvsdg(cc, &input_path, &rvsdg_bin, args, tmp)?;
     let rvsdg_compile = match &rvsdg {
         Compile::Timeout { elapsed } => return Ok(Outcome::CompileSlow { elapsed: *elapsed }),
         Compile::Ice { elapsed, stderr } => {
@@ -275,9 +304,10 @@ fn differential_test(
         Compile::Ok { elapsed, .. } => *elapsed,
     };
 
-    // Reference compile. If clang can't build it, the input is not our bug.
+    // Reference compile from the same bitcode. If clang can't build it,
+    // the input is not our bug.
     let clang_start = Instant::now();
-    if !compile_clang(c_file, &clang_bin, args)? {
+    if !compile_clang(&input_path, &clang_bin, args)? {
         return Ok(Outcome::ClangCompileFail);
     }
     let clang_compile = clang_start.elapsed();
@@ -307,6 +337,7 @@ fn differential_test(
 
     if r == c {
         Ok(Outcome::Pass {
+            frontend_compile,
             rvsdg_compile,
             clang_compile,
             rvsdg_run: r_dur,
@@ -433,11 +464,27 @@ struct Stats {
     /// Summed over passing programs, so the aggregate compares rvsdg vs clang
     /// on the same corpus (the per-program ratio is reported by `report_single`).
     rvsdg_compile_sum: Duration,
+    frontend_compile_sum: Duration,
     clang_compile_sum: Duration,
     rvsdg_run_sum: Duration,
     clang_run_sum: Duration,
-    /// (compile time, tag) for the slowest RVSDG compiles seen.
-    slowest: Vec<(Duration, String)>,
+    /// The passing programs where our compile time diverges most from
+    /// clang's (by ratio): the scaling watchlist. Sorted worst-first,
+    /// top 5 kept.
+    largest_compile_diffs: Vec<CompileDiff>,
+}
+
+/// One program's compile-time comparison.
+struct CompileDiff {
+    rvsdg: Duration,
+    clang: Duration,
+    tag: String,
+}
+
+impl CompileDiff {
+    fn ratio(&self) -> f64 {
+        self.rvsdg.as_secs_f64() / self.clang.as_secs_f64().max(1e-9)
+    }
 }
 
 impl Stats {
@@ -445,37 +492,41 @@ impl Stats {
         self.total += 1;
         match outcome {
             Outcome::Pass {
+                frontend_compile,
                 rvsdg_compile,
                 clang_compile,
                 rvsdg_run,
                 clang_run,
             } => {
                 self.pass += 1;
+                self.frontend_compile_sum += *frontend_compile;
                 self.rvsdg_compile_sum += *rvsdg_compile;
                 self.clang_compile_sum += *clang_compile;
                 self.rvsdg_run_sum += *rvsdg_run;
                 self.clang_run_sum += *clang_run;
-                self.note_compile(*rvsdg_compile, tag);
+                self.note_compile_diff(*rvsdg_compile, *clang_compile, tag);
             }
             Outcome::Mismatch { .. } => self.mismatch += 1,
-            Outcome::Ice { elapsed, .. } => {
-                self.ice += 1;
-                self.note_compile(*elapsed, tag);
-            }
-            Outcome::CompileSlow { elapsed } => {
-                self.compile_slow += 1;
-                self.note_compile(*elapsed, tag);
-            }
+            // ICE and compile-slow programs have no meaningful clang
+            // comparison; their seeds are already named inline as
+            // findings.
+            Outcome::Ice { .. } => self.ice += 1,
+            Outcome::CompileSlow { .. } => self.compile_slow += 1,
             Outcome::RunTimeout => self.run_timeout += 1,
             Outcome::ClangRunTimeout => self.clang_run_timeout += 1,
             Outcome::BothTimeout => self.both_timeout += 1,
             Outcome::ClangCompileFail => self.clang_fail += 1,
         }
     }
-    fn note_compile(&mut self, d: Duration, tag: &str) {
-        self.slowest.push((d, tag.to_string()));
-        self.slowest.sort_by(|a, b| b.0.cmp(&a.0));
-        self.slowest.truncate(5);
+    fn note_compile_diff(&mut self, rvsdg: Duration, clang: Duration, tag: &str) {
+        self.largest_compile_diffs.push(CompileDiff {
+            rvsdg,
+            clang,
+            tag: tag.to_string(),
+        });
+        self.largest_compile_diffs
+            .sort_by(|a, b| b.ratio().total_cmp(&a.ratio()));
+        self.largest_compile_diffs.truncate(5);
     }
     fn print(&self) {
         println!("\n=== summary ({} programs) ===", self.total);
@@ -492,7 +543,11 @@ impl Stats {
             let mean = |d: Duration| d.as_secs_f64() / n;
             println!("  over {} passing programs (mean per program):", self.pass);
             println!(
-                "    compile:  rvsdg {:.3}s  clang {:.3}s  ({:.1}x slower)",
+                "    frontend (shared clang+mem2reg bitcode): {:.3}s",
+                mean(self.frontend_compile_sum),
+            );
+            println!(
+                "    compile from bitcode:  rvsdg {:.3}s  clang {:.3}s  ({:.1}x slower)",
                 mean(self.rvsdg_compile_sum),
                 mean(self.clang_compile_sum),
                 ratio(self.rvsdg_compile_sum, self.clang_compile_sum),
@@ -504,10 +559,16 @@ impl Stats {
                 ratio(self.rvsdg_run_sum, self.clang_run_sum),
             );
         }
-        if !self.slowest.is_empty() {
-            println!("  slowest RVSDG compiles:");
-            for (d, tag) in &self.slowest {
-                println!("    {:>8.3}s  {tag}", d.as_secs_f64());
+        if !self.largest_compile_diffs.is_empty() {
+            println!("  largest compile-time diffs (rvsdg vs clang):");
+            for diff in &self.largest_compile_diffs {
+                println!(
+                    "    {:>8.3}s vs {:>6.3}s  ({:>5.1}x)  {}",
+                    diff.rvsdg.as_secs_f64(),
+                    diff.clang.as_secs_f64(),
+                    diff.ratio(),
+                    diff.tag,
+                );
             }
         }
     }
@@ -629,13 +690,15 @@ fn fuzz(cc: &Path, args: &Args) -> std::io::Result<()> {
 fn report_single(input: &Path, outcome: &Outcome) {
     match outcome {
         Outcome::Pass {
+            frontend_compile,
             rvsdg_compile,
             clang_compile,
             rvsdg_run,
             clang_run,
         } => println!(
-            "PASS  {}  compile: rvsdg {:.3}s / clang {:.3}s ({:.1}x)  run: rvsdg {:.3}s / clang {:.3}s ({:.1}x)",
+            "PASS  {}  frontend {:.3}s  compile-from-bc: rvsdg {:.3}s / clang {:.3}s ({:.1}x)  run: rvsdg {:.3}s / clang {:.3}s ({:.1}x)",
             input.display(),
+            frontend_compile.as_secs_f64(),
             rvsdg_compile.as_secs_f64(),
             clang_compile.as_secs_f64(),
             ratio(*rvsdg_compile, *clang_compile),

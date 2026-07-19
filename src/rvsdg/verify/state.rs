@@ -20,6 +20,10 @@
 //! every operand field of every kind is visited by exactly one pass, so
 //! nothing is exempt-by-omission.
 //!
+//! Every region also carries an `exit_state` closing its chain (checked
+//! here against the same rule), so edge-following passes reach subregion
+//! state ops without positional scans.
+//!
 //! One structural limit: a function's `RegionResult` value records the
 //! function's final state, but RegionResult values are not members of any
 //! region's node list, so their owning region is unrepresented. Their
@@ -54,6 +58,28 @@ impl RVSDGMod {
 
         for (region_index, region) in self.regions.iter().enumerate() {
             let user_region = region_index as u32;
+
+            // The region's exit state closes its chain: entry state for a
+            // pure region, else one of its own state-producing nodes.
+            // Checked before anything else touches it: INVALID is an
+            // out-of-range id, so indexing with it would panic.
+            if region.exit_state == State::INVALID {
+                errs.push(RVSDGVerificationError::RegionExitStateUnset(RegionId(
+                    user_region,
+                )));
+            } else if region.exit_state != region.entry_state {
+                let valid = matches!(
+                    owner[region.exit_state.0.0 as usize],
+                    Owner::Node { region: r, .. } if r == user_region
+                ) && produces_state(region.exit_state.0);
+                if !valid {
+                    errs.push(RVSDGVerificationError::RegionExitStateInvalid {
+                        region: RegionId(user_region),
+                        operand: region.exit_state.0,
+                    });
+                }
+            }
+
             for (position, &user) in region.nodes.iter().enumerate() {
                 // Exhaustive over ValueKind: every variant either names its
                 // state operand or is listed as pure, so adding a variant
@@ -213,6 +239,90 @@ mod tests {
             errs.iter()
                 .any(|e| matches!(e, RVSDGVerificationError::StateEdgeOutOfScope { .. })),
             "expected a state scope violation, got: {errs:?}"
+        );
+    }
+
+    /// A region whose exit state points at another region's chain (here:
+    /// corrupted after construction) must be rejected.
+    #[test]
+    fn foreign_exit_state_is_caught() {
+        let mut rvsdg = RVSDGMod::new_host(String::from("test"));
+        let main_fn = rvsdg.declare_fn(String::from("main"), &[], &[I32], Linkage::Internal);
+        let first_fence = Cell::new(None);
+        rvsdg
+            .define_fn(main_fn, |rb, state| {
+                let fenced = rb.fence(state, MemoryOrdering::SequentiallyConsistent);
+                first_fence.set(Some(fenced));
+                let fenced_again = rb.fence(fenced, MemoryOrdering::SequentiallyConsistent);
+                let flag = rb.constant(BOOL, ConstValue::Int(1));
+                let predicate = rb.bool_predicate(flag);
+                let zero = rb.const_i32(0);
+                let res = rb.gamma(
+                    predicate,
+                    fenced_again,
+                    &[],
+                    |_rb| {
+                        Ok(BranchResult {
+                            state: fenced_again,
+                            values: vec![zero],
+                        })
+                    },
+                    |_rb| {
+                        Ok(BranchResult {
+                            state: fenced_again,
+                            values: vec![zero],
+                        })
+                    },
+                )?;
+                Ok(FnResult {
+                    state: res.state,
+                    values: vec![res.result(0)],
+                })
+            })
+            .unwrap();
+
+        // Corrupt an arm's exit state to the FUNCTION region's first
+        // fence: a state-producing node, but of the wrong region (and
+        // not the arm's entry state, which is the second fence).
+        let arm = rvsdg
+            .regions
+            .iter()
+            .position(|region| region.params.is_empty() && region.nodes.is_empty())
+            .expect("gamma arm region exists");
+        rvsdg.regions[arm].exit_state = first_fence.get().unwrap();
+
+        let errs = rvsdg.verify();
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, RVSDGVerificationError::RegionExitStateInvalid { .. })),
+            "expected an exit-state violation, got: {errs:?}"
+        );
+    }
+
+    /// Regions are created with `State::INVALID` and every finaliser must
+    /// overwrite it; one that slips through must be reported, not chased
+    /// through an out-of-range index.
+    #[test]
+    fn unset_exit_state_is_caught() {
+        let mut rvsdg = RVSDGMod::new_host(String::from("test"));
+        let main_fn = rvsdg.declare_fn(String::from("main"), &[], &[I32], Linkage::Internal);
+        rvsdg
+            .define_fn(main_fn, |rb, state| {
+                let zero = rb.const_i32(0);
+                Ok(FnResult {
+                    state,
+                    values: vec![zero],
+                })
+            })
+            .unwrap();
+
+        rvsdg.regions[0].exit_state = State::INVALID;
+
+        let errs = rvsdg.verify();
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, RVSDGVerificationError::RegionExitStateUnset(_))),
+            "expected an unset exit-state error, got: {errs:?}"
         );
     }
 }

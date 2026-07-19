@@ -272,6 +272,11 @@ pub enum ValueKind {
     RegionParam {
         index: u32,
         ty: TypeRef,
+        /// The region this value is a parameter of. Regions do not own
+        /// their parameter values in the global array, so the back link
+        /// lives here; stamped at creation, verified against the
+        /// region's params list.
+        region: RegionId,
     },
     RegionResult {
         values: ValuesSpan,

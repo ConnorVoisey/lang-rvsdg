@@ -13,6 +13,8 @@
 //! share one implementation of each rule. Base-object resolution lives
 //! in `rvsdg::alias` for the same reason.
 
+pub mod heap;
+
 use std::io;
 use std::mem::size_of;
 
@@ -214,7 +216,25 @@ pub struct PhaseTiming {
     pub frontend_and_parse_ms: u64,
     pub construction_ms: u64,
     pub verify_ms: u64,
+    pub optimise_ms: u64,
     pub census_ms: u64,
+}
+
+/// Rust-heap bytes at pipeline boundaries, filled by the DRIVER from
+/// the [`heap`] counters (all zero when its binary does not install the
+/// counting allocator). LLVM's C++ heap and the frontend subprocesses
+/// are invisible to these numbers: the gap to peak RSS is them.
+#[derive(Debug, Default, Clone, Copy, Serialize)]
+pub struct HeapUsage {
+    /// Live after frontend + parse: the llvm-ir AST.
+    pub after_parse_bytes: usize,
+    /// Live when the census ran: the graph, the AST already dropped.
+    /// Vec::truncate keeps capacity, so a post-optimise census reports
+    /// the same live bytes; the byte budget shows the logical shrink.
+    pub live_at_census_bytes: usize,
+    /// Process-lifetime peak so far; construction is where the AST and
+    /// the graph coexist, so this usually dates from there.
+    pub peak_bytes: usize,
 }
 
 /// Census of one module.
@@ -239,6 +259,7 @@ pub struct ModuleCensus {
     pub memory_budget: MemoryBudget,
     pub span_composition: SpanComposition,
     pub timing: PhaseTiming,
+    pub heap: HeapUsage,
 
     pub value_pool_len: usize,
     pub region_pool_len: usize,
@@ -297,7 +318,11 @@ pub struct ModuleSummaryRow<'a> {
     pub frontend_and_parse_ms: u64,
     pub construction_ms: u64,
     pub verify_ms: u64,
+    pub optimise_ms: u64,
     pub census_ms: u64,
+    pub heap_after_parse_bytes: usize,
+    pub heap_live_at_census_bytes: usize,
+    pub heap_peak_bytes: usize,
 }
 
 /// Exhaustive kind naming: a new `ValueKind` variant fails to compile
@@ -1223,7 +1248,11 @@ impl ModuleCensus {
             frontend_and_parse_ms: self.timing.frontend_and_parse_ms,
             construction_ms: self.timing.construction_ms,
             verify_ms: self.timing.verify_ms,
+            optimise_ms: self.timing.optimise_ms,
             census_ms: self.timing.census_ms,
+            heap_after_parse_bytes: self.heap.after_parse_bytes,
+            heap_live_at_census_bytes: self.heap.live_at_census_bytes,
+            heap_peak_bytes: self.heap.peak_bytes,
         }
     }
 
@@ -1366,11 +1395,23 @@ impl ModuleCensus {
         {
             writeln!(
                 out,
-                "-- timing -- frontend+parse {}ms, construction {}ms, verify {}ms, census {}ms",
+                "-- timing -- frontend+parse {}ms, construction {}ms, verify {}ms, optimise {}ms, census {}ms",
                 self.timing.frontend_and_parse_ms,
                 self.timing.construction_ms,
                 self.timing.verify_ms,
+                self.timing.optimise_ms,
                 self.timing.census_ms,
+            )?;
+        }
+        if self.heap.peak_bytes > 0 {
+            let mib = |bytes: usize| bytes as f64 / (1024.0 * 1024.0);
+            writeln!(
+                out,
+                "-- rust heap -- after parse {:.1}MiB (llvm-ir AST), live at census {:.1}MiB, \
+                 process peak {:.1}MiB; LLVM's C++ heap and subprocesses are outside these",
+                mib(self.heap.after_parse_bytes),
+                mib(self.heap.live_at_census_bytes),
+                mib(self.heap.peak_bytes),
             )?;
         }
         writeln!(

@@ -26,7 +26,7 @@ impl RVSDGMod {
         let id = ValueId(self.values.len() as u32);
         self.values.push(Value {
             ty,
-            kind: ValueKind::RegionParam { index, ty },
+            kind: ValueKind::RegionParam { index, ty, region },
         });
         self.regions[region.0 as usize].params.push(id);
         id
@@ -34,17 +34,24 @@ impl RVSDGMod {
 
     /// Replace `region`'s parameter list with `params` (construct assembly
     /// aligns every alternative's parameters to one canonical input order),
-    /// fixing each parameter value's index field to its new position.
+    /// fixing each parameter value's index and region fields to its new
+    /// position.
     pub(crate) fn set_region_params(&mut self, region: RegionId, params: Vec<ValueId>) {
         for (position, &param) in params.iter().enumerate() {
             let Value {
-                kind: ValueKind::RegionParam { index, .. },
+                kind:
+                    ValueKind::RegionParam {
+                        index,
+                        region: param_region,
+                        ..
+                    },
                 ..
             } = &mut self.values[param.0 as usize]
             else {
                 unreachable!("region parameter lists hold only RegionParam values");
             };
             *index = position as u32;
+            *param_region = region;
         }
         self.regions[region.0 as usize].params = params;
     }
@@ -70,7 +77,9 @@ impl<'a> RegionBuilder<'a> {
         graph.regions.push(Region {
             params: Vec::new(),
             results: ValuesSpan { start: 0, len: 0 },
+            owner: ValueId::INVALID,
             entry_state,
+            exit_state: State::INVALID,
             nodes: vec![],
         });
         Self {
@@ -95,6 +104,7 @@ impl<'a> RegionBuilder<'a> {
                     kind: ValueKind::RegionParam {
                         index: i as u32,
                         ty,
+                        region,
                     },
                 });
             }
@@ -103,7 +113,9 @@ impl<'a> RegionBuilder<'a> {
 
         graph.regions.push(Region {
             params,
+            owner: ValueId::INVALID,
             entry_state,
+            exit_state: State::INVALID,
             results: ValuesSpan { start: 0, len: 0 },
             nodes: vec![],
         });
@@ -127,6 +139,7 @@ impl<'a> RegionBuilder<'a> {
                     kind: ValueKind::RegionParam {
                         index: i as u32,
                         ty,
+                        region,
                     },
                 });
             }
@@ -140,12 +153,15 @@ impl<'a> RegionBuilder<'a> {
             kind: ValueKind::RegionParam {
                 index: fn_params.len() as u32,
                 ty: TypeRef::State,
+                region,
             },
         });
 
         graph.regions.push(Region {
             params,
+            owner: ValueId::INVALID,
             entry_state,
+            exit_state: State::INVALID,
             results: ValuesSpan { start: 0, len: 0 },
             nodes: vec![],
         });
@@ -169,7 +185,9 @@ impl<'a> RegionBuilder<'a> {
     pub fn add_region(&mut self, state: State) -> RegionId {
         let id = RegionId(self.graph.regions.len() as u32);
         self.graph.regions.push(Region {
+            owner: ValueId::INVALID,
             entry_state: state,
+            exit_state: State::INVALID,
             params: Vec::new(),
             results: ValuesSpan { start: 0, len: 0 },
             nodes: vec![],

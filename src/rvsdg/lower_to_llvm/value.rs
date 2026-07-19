@@ -573,7 +573,7 @@ impl RVSDGMod {
                     *mapper.get_val(call)
                 }
             }
-            ValueKind::RegionParam { index: _, ty: _ } => {
+            ValueKind::RegionParam { .. } => {
                 bail!("RegionParam {value_id:?} was not pre-populated in the mapper")
             }
             ValueKind::RegionResult {

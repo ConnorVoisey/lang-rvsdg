@@ -327,7 +327,7 @@ impl<'m> Emitter<'m> {
             let region_id = lowerer.rb.add_region(state);
             arm_regions.push(region_id);
             lowerer.scopes.push_frame(region_id);
-            {
+            let arm_exit = {
                 let mut arm_rb = RegionBuilder::over(&mut *lowerer.rb.graph, region_id);
                 let mut arm_lowerer =
                     RegionLowerer::new(&mut arm_rb, &mut *lowerer.scopes, self.fn_ctx);
@@ -338,9 +338,14 @@ impl<'m> Emitter<'m> {
                         collapse: region.collapse,
                         body_of: region.body_of,
                     };
-                    self.emit_region(&mut arm_lowerer, &arm_region, arm.seed.target, state)?;
+                    Some(self.emit_region(&mut arm_lowerer, &arm_region, arm.seed.target, state)?)
+                } else {
+                    // Seed-only arm: nothing state-producing was emitted,
+                    // so the arm is pure and exits on its entry state.
+                    None
                 }
-            }
+            };
+            lowerer.rb.graph.regions[region_id.0 as usize].exit_state = arm_exit.unwrap_or(state);
             arm_frames.push(lowerer.scopes.pop_frame());
         }
 
@@ -547,7 +552,7 @@ impl<'m> Emitter<'m> {
 
         let body_region_id = lowerer.rb.add_region(state);
         lowerer.scopes.push_frame(body_region_id);
-        let condition = {
+        let (condition, body_exit) = {
             let mut body_rb = RegionBuilder::over(&mut *lowerer.rb.graph, body_region_id);
             let mut body_lowerer =
                 RegionLowerer::new(&mut body_rb, &mut *lowerer.scopes, self.fn_ctx);
@@ -556,7 +561,7 @@ impl<'m> Emitter<'m> {
                 collapse: &child_collapse,
                 body_of: Some(scc),
             };
-            self.emit_region(&mut body_lowerer, &body_region, entry, state)?;
+            let body_exit = self.emit_region(&mut body_lowerer, &body_region, entry, state)?;
 
             // A structured loop's hidden back edge still defines the
             // next-iteration values: apply its phi copies at the body's end.
@@ -571,7 +576,7 @@ impl<'m> Emitter<'m> {
             }
 
             // The repetition predicate: alternative 1 repeats.
-            if is_restructured {
+            let condition = if is_restructured {
                 let repeat = body_lowerer
                     .scopes
                     .resolve_aux(body_lowerer.rb.graph, repeat_var)
@@ -617,8 +622,10 @@ impl<'m> Emitter<'m> {
                     0,
                     2,
                 )
-            }
+            };
+            (condition, body_exit)
         };
+        lowerer.rb.graph.regions[body_region_id.0 as usize].exit_state = body_exit;
         let frame = lowerer.scopes.pop_frame();
 
         // Assembly, afterwards. Slots: the frame's captures in capture

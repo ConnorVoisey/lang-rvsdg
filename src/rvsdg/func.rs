@@ -392,6 +392,8 @@ impl RVSDGMod {
         let lambda_id = rb.add_value(lambda_val);
         self.functions[func_id.0 as usize].lambda_val = Some(lambda_id);
         self.regions[region_id.0 as usize].results = results;
+        self.regions[region_id.0 as usize].exit_state = fn_res.state;
+        self.regions[region_id.0 as usize].owner = lambda_id;
 
         // TODO: if in debug mode check that the return values match the declerations return types
         // Also consider if it is variadic
