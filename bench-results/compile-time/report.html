@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>RVSDG compile-time benchmark</title>
+
+    <!-- Pinned by content hash (SRI): the CDN may only serve these exact
+         bytes of these exact versions, or the browser refuses to load
+         them. No build step, no vendored copy, still reproducible. -->
+    <link
+      rel="stylesheet"
+      href="https://cdn.jsdelivr.net/npm/@picocss/pico@2.1.1/css/pico.classless.min.css"
+      integrity="sha384-NZhm4G1I7BpEGdjDKnzEfy3d78xvy7ECKUwwnKTYi036z42IyF056PbHfpQLIYgL"
+      crossorigin="anonymous"
+    />
+    <style>
+      main { max-width: 1200px; }
+      section { margin-block: 2.2rem; }
+      h2 { font-size: 1.05rem; margin-bottom: 0.6rem; }
+      .toolbar { display: flex; flex-wrap: wrap; gap: 1rem; align-items: end; position: sticky; top: 0; background: var(--pico-background-color); padding-block: 0.6rem; z-index: 5; border-bottom: 1px solid var(--pico-muted-border-color); }
+      .toolbar > label { margin: 0; }
+      .seg { display: inline-flex; gap: 0; }
+      .seg button { width: auto; margin: 0; border-radius: 0; padding: 0.4rem 0.9rem; }
+      .seg button:first-child { border-top-left-radius: var(--pico-border-radius); border-bottom-left-radius: var(--pico-border-radius); }
+      .seg button:last-child { border-top-right-radius: var(--pico-border-radius); border-bottom-right-radius: var(--pico-border-radius); }
+      .seg button[aria-current='true'] { font-weight: 700; }
+      .seg button:not([aria-current='true']) { background: transparent; color: var(--pico-color); border-color: var(--pico-muted-border-color); }
+
+      table.grid { font-size: 0.85rem; }
+      table.grid th, table.grid td { padding: 0.3rem 0.55rem; text-align: right; white-space: nowrap; }
+      table.grid th:first-child, table.grid td:first-child { text-align: left; position: sticky; left: 0; background: var(--pico-background-color); }
+      table.grid thead th { cursor: pointer; user-select: none; }
+      table.grid tbody tr { cursor: pointer; }
+      table.grid tbody tr.focus td:first-child { font-weight: 700; box-shadow: inset 3px 0 0 var(--pico-primary); }
+      table.grid tfoot td { font-weight: 700; border-top: 2px solid var(--pico-muted-border-color); }
+      table.grid tbody tr.failrow td:first-child { box-shadow: inset 3px 0 0 #f0ad4e; }
+      /* A focused failed row shows both markers (focus left, fail right). */
+      table.grid tbody tr.focus.failrow td:first-child { box-shadow: inset 3px 0 0 var(--pico-primary), inset -3px 0 0 #f0ad4e; }
+      .wrap { overflow-x: auto; }
+
+      .failures h2 { color: #f0ad4e; }
+      .failures td:last-child { text-align: left; white-space: normal; }
+      pre.err { margin: 0; font-size: 0.72rem; max-height: 8rem; overflow: auto; white-space: pre-wrap; color: var(--pico-muted-color); }
+
+      .trends { display: flex; flex-wrap: wrap; gap: 0.5rem; }
+      .trends .chart { flex: 1 1 300px; height: 240px; min-width: 260px; }
+      .chart { width: 100%; }
+      #chart-phases, #chart-clang { height: 440px; }
+      .meta { font-size: 0.8rem; color: var(--pico-muted-color); overflow-x: auto; }
+      .empty { padding: 3rem 0; text-align: center; color: var(--pico-muted-color); }
+      .hint { font-size: 0.78rem; color: var(--pico-muted-color); margin-top: 0.2rem; }
+    </style>
+  </head>
+  <body>
+    <main x-data="report">
+      <hgroup>
+        <h1>RVSDG compile-time benchmark</h1>
+        <p>Our compiler vs clang. Everything is derived in-page from the raw samples in <code>data.js</code>; deltas compare the current run to the baseline at the selected level.</p>
+      </hgroup>
+
+      <template x-if="empty">
+        <article class="empty">
+          <p>No runs found. Generate <code>data.js</code> with a benchmark run:</p>
+          <pre><code>compile_bench --sqlite &lt;dir&gt; [--polybench &lt;dir&gt; ...] [--wall]</code></pre>
+        </article>
+      </template>
+
+      <template x-if="!empty">
+        <div>
+          <div class="toolbar">
+            <label>
+              Current run
+              <select x-model.number="runIdx" @change="onFilterChange()">
+                <template x-for="(run, i) in runs" :key="i">
+                  <option :value="i" x-text="runLabelText(run)"></option>
+                </template>
+              </select>
+            </label>
+            <label>
+              Baseline
+              <select x-model.number="baselineIdx" @change="onFilterChange()">
+                <template x-for="(run, i) in runs" :key="i">
+                  <option :value="i" x-text="runLabelText(run)"></option>
+                </template>
+              </select>
+            </label>
+            <div>
+              <small>Level</small><br />
+              <span class="seg">
+                <template x-for="lv in levels" :key="lv">
+                  <button @click="setLevel(lv)" :aria-current="level === lv" x-text="lv.toUpperCase()"></button>
+                </template>
+              </span>
+            </div>
+          </div>
+
+          <section x-show="failures().length" class="failures">
+            <h2>⚠ Compile failures in this run</h2>
+            <div class="wrap">
+              <table class="grid">
+                <thead>
+                  <tr><th>program</th><th>config</th><th>status</th><th>error</th></tr>
+                </thead>
+                <tbody>
+                  <template x-for="(f, i) in failures()" :key="i">
+                    <tr>
+                      <td x-text="f.program"></td>
+                      <td x-text="f.config"></td>
+                      <td x-text="f.status"></td>
+                      <td><pre class="err" x-text="f.error"></pre></td>
+                    </tr>
+                  </template>
+                </tbody>
+              </table>
+            </div>
+            <p class="hint">Configs whose compile failed or timed out; all their metrics (wall, RSS, object, the Cachegrind counts, and any phase breakdown) are absent below and marked <em>fail</em>/<em>timeout</em>.</p>
+          </section>
+
+          <section>
+            <h2>Regression vs baseline &mdash; all programs, all metrics</h2>
+            <div class="wrap">
+              <table class="grid">
+                <thead>
+                  <tr>
+                    <th @click="setSort('__name')">program</th>
+                    <template x-for="key in gridMetrics" :key="key">
+                      <th @click="setSort(key)">
+                        <span x-text="metricLabel(key)"></span>
+                        <span x-show="sort.key === key" x-text="sort.dir < 0 ? ' ▼' : ' ▲'"></span>
+                      </th>
+                    </template>
+                  </tr>
+                </thead>
+                <tbody>
+                  <template x-for="row in matrixRows()" :key="row.name">
+                    <tr :class="{ focus: focus === row.name, failrow: row.failStatus }" @click="focusProgram(row.name)">
+                      <td x-text="row.name"></td>
+                      <template x-for="key in gridMetrics" :key="key">
+                        <td :style="cellStyle(row.cells[key], key)" :title="cellTitle(row.cells[key], key)" x-text="cellText(row.cells[key], key)"></td>
+                      </template>
+                    </tr>
+                  </template>
+                </tbody>
+                <tfoot>
+                  <tr>
+                    <td>geomean</td>
+                    <template x-for="key in gridMetrics" :key="key">
+                      <td x-text="geoText(key)"></td>
+                    </template>
+                  </tr>
+                </tfoot>
+              </table>
+            </div>
+            <p class="hint">Each cell is the change vs baseline (red worse, green better; intensity tracks magnitude). Columns: <strong>instr</strong> instructions executed &mdash; the primary deterministic signal; <strong>cache misses</strong> last-level miss <em>count</em> (thousands) &mdash; the deterministic locality signal (captures access patterns instruction count does not); <strong>cycles</strong> a cost-model roll-up (L1 + 5&times;LL + 35&times;RAM hits, generic latency weights &mdash; not real cycles, and ~instr&times;const on cache-friendly code); <strong>wall</strong> end-to-end compile time; <strong>RSS</strong> peak resident memory; <strong>obj</strong> object-file size. instr / cache misses / cycles are simulated Cachegrind figures for our pipeline + in-process backend (frontend excluded), so run-to-run noise is tiny (&lt;~0.05%, vs tens of percent for a hardware counter on a busy machine) and they are not clang-comparable (hence absent from the vs-clang panel); a delta above ~0.05% is a real change, anything smaller is noise (and left uncoloured). wall carries a ▲/▼ mark for a statistically significant difference from the baseline <em>run</em> (Mann-Whitney + bootstrap CI; a dim wall cell failed it) &mdash; but the two runs were taken at different times, so a mark is not by itself proof of a code change; wall / RSS are native and contention-sensitive (informational on a busy machine). Click a program to trace it in the charts below.</p>
+            <p class="hint" x-show="runIdx === baselineIdx">Only one run loaded (baseline is the current run): cells show absolute values, not deltas vs a baseline.</p>
+          </section>
+
+          <section>
+            <h2>Metric trends over runs <small x-show="focus" x-text="'&mdash; tracing ' + focus"></small></h2>
+            <div class="trends">
+              <template x-for="m in trendMetrics" :key="m">
+                <div :id="'chart-trend-' + m" class="chart"></div>
+              </template>
+            </div>
+            <p class="hint">Geomean over all programs (grey); the focused program overlays in orange when one is selected above.</p>
+          </section>
+
+          <section x-show="hasPhaseData()">
+            <h2>Phase breakdown &mdash; where our time goes</h2>
+            <label>
+              <input type="checkbox" role="switch" x-model="normalize" @change="onFilterChange()" />
+              Normalize by graph size
+            </label>
+            <div id="chart-phases" class="chart"></div>
+          </section>
+
+          <section x-show="hasClangData()">
+            <h2>Versus clang &mdash; the competitive gap</h2>
+            <div id="chart-clang" class="chart"></div>
+          </section>
+
+          <p class="hint" x-show="!hasPhaseData() &amp;&amp; !hasClangData()">Phase breakdown and vs-clang panels need a <code>--wall</code> run; this run recorded only the deterministic Cachegrind metrics.</p>
+
+          <footer class="meta">
+            <p x-text="'current: ' + runLabelText(currentRun()) + '  ' + runMetaLine(currentRun())"></p>
+            <p x-text="runs.length + ' run(s) loaded.' + (currentRun().meta && currentRun().meta.rss_available ? '' : ' peak RSS unavailable (no /usr/bin/time on the measuring host).')"></p>
+          </footer>
+        </div>
+      </template>
+    </main>
+
+    <!-- ECharts and the data pipeline load synchronously (they must exist
+         before Alpine boots and calls setOption); Alpine is deferred so it
+         initialises last, after report.js has registered its component. -->
+    <script
+      src="https://cdn.jsdelivr.net/npm/echarts@6.1.0/dist/echarts.min.js"
+      integrity="sha384-C2iskrW/uPW46KzOjrvJIQo4YkV8lkD+QS0CrDN18IIPIpT/g2USu8bTP3nvmIAD"
+      crossorigin="anonymous"
+    ></script>
+    <!-- Derived aggregate of runs/*.json; may be absent on a fresh
+         checkout, in which case the empty state shows. -->
+    <script src="data.js"></script>
+    <script src="report.js"></script>
+    <script
+      defer
+      src="https://cdn.jsdelivr.net/npm/alpinejs@3.15.12/dist/cdn.min.js"
+      integrity="sha384-pb6hrQvo4s23cEUFtj0CZkzGE3jyK3pj26RIupXXxhSrrcUA/Cn0lZgcCrGH0t6L"
+      crossorigin="anonymous"
+    ></script>
+  </body>
+</html>

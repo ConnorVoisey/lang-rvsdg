@@ -10,9 +10,10 @@ use inkwell::OptimizationLevel;
 use inkwell::context::Context;
 use inkwell::targets::{InitializationConfig, Target};
 use llvm_ir::Module;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 use tempfile::NamedTempFile;
 use tracing_chrome::{ChromeLayerBuilder, FlushGuard};
 use tracing_subscriber::Layer;
@@ -75,6 +76,21 @@ pub fn init_chrome_tracing(path: &str) -> color_eyre::Result<FlushGuard> {
     Ok(guard)
 }
 
+/// Parse an on-disk LLVM IR file into a module, choosing the parser by
+/// extension: text `.ll` via `from_ir_path`, anything else (bitcode `.bc`
+/// and staged `.bc` temp files) via `from_bc_path`. The single place that
+/// decides how an IR file is read, so the compiler and the benchmark can
+/// never disagree -- feeding a text `.ll` to the bitcode parser silently
+/// fails, which is exactly the divergence this prevents.
+pub fn ir_file_to_mod(path: &Path) -> color_eyre::Result<Module> {
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("ll") => Module::from_ir_path(path)
+            .map_err(|e| color_eyre::eyre::eyre!("failed to parse LLVM IR: {e}")),
+        _ => Module::from_bc_path(path)
+            .map_err(|e| color_eyre::eyre::eyre!("failed to parse LLVM bitcode: {e}")),
+    }
+}
+
 /// Parse an input (`.c` through the clang + mem2reg frontend, `.ll`/`.bc`
 /// directly) into an llvm-ir module. Public so the fidelity tests can
 /// parse the same inputs the compiler does -- one pipeline, not a copy.
@@ -92,30 +108,24 @@ pub fn c_file_to_mod(
     // Bitcode skips LLVM's text lexer, a modest win (sqlite3, 12MB of
     // text: 1.2s -> 1.0s whole-compile). A `.c` input runs the normal
     // clang + opt frontend below.
-    match c_file_path.extension().and_then(|e| e.to_str()) {
-        Some("ll") => {
-            let _parse_span = tracing::info_span!("llvm_ir_parse").entered();
-            return Module::from_ir_path(c_file_path)
-                .map_err(|e| color_eyre::eyre::eyre!("failed to parse LLVM IR: {e}"));
-        }
-        Some("bc") => {
-            let _parse_span = tracing::info_span!("llvm_ir_parse").entered();
-            return Module::from_bc_path(c_file_path)
-                .map_err(|e| color_eyre::eyre::eyre!("failed to parse LLVM bitcode: {e}"));
-        }
-        _ => {}
+    if matches!(
+        c_file_path.extension().and_then(|e| e.to_str()),
+        Some("ll") | Some("bc")
+    ) {
+        let _parse_span = tracing::info_span!("llvm_ir_parse").entered();
+        return ir_file_to_mod(c_file_path);
     }
 
     let bc_file = c_file_to_bc(c_file_path, include_dirs, defines)?;
     let bc_output = bc_file.path();
-    let bc_output_str = bc_output
-        .to_str()
-        .ok_or_else(|| color_eyre::eyre::eyre!("temporary .bc path is not valid UTF-8"))?;
 
     // Diagnostics go to stderr so a compiled program's own stdout (e.g. a
     // csmith checksum) is never mixed with compiler logging. The bitcode is
     // disassembled on demand; this path is for humans, not the pipeline.
     if !quiet {
+        let bc_output_str = bc_output
+            .to_str()
+            .ok_or_else(|| color_eyre::eyre::eyre!("temporary .bc path is not valid UTF-8"))?;
         let dis = Command::new("llvm-dis")
             .args([bc_output_str, "-o", "-"])
             .output()?;
@@ -126,10 +136,7 @@ pub fn c_file_to_mod(
     }
 
     let _parse_span = tracing::info_span!("llvm_ir_parse").entered();
-    let module = Module::from_bc_path(bc_output)
-        .map_err(|e| color_eyre::eyre::eyre!("failed to parse LLVM bitcode: {e}"))?;
-
-    Ok(module)
+    ir_file_to_mod(bc_output)
 }
 
 /// Run the scaffold C frontend -- clang generating IR with every LLVM
@@ -225,6 +232,110 @@ pub fn c_file_to_bc_with(
     Ok(bc_file)
 }
 
+/// A program input staged to LLVM bitcode for measurement. A `.c` input is
+/// run through the shared clang + mem2reg frontend once (see
+/// [`stage_to_bitcode`]); a `.ll`/`.bc` input is used in place. Holding this
+/// keeps the temp bitcode alive, so both the RVSDG compiler and clang can be
+/// timed on `path()` without either being charged for the shared frontend.
+#[derive(Debug)]
+pub struct StagedInput {
+    // Keeps the temp `.bc` on disk until dropped; `None` when the input was
+    // already IR and is compiled in place.
+    _holder: Option<NamedTempFile>,
+    path: PathBuf,
+    frontend: Option<Duration>,
+}
+
+impl StagedInput {
+    /// The bitcode/IR path to compile.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Wall time of the shared clang + mem2reg frontend, or `None` when the
+    /// input was already IR (no frontend ran).
+    pub fn frontend_time(&self) -> Option<Duration> {
+        self.frontend
+    }
+}
+
+/// Stage a program input to LLVM bitcode: a `.c` file goes through the
+/// shared clang + mem2reg frontend ([`c_file_to_bc`]); a `.ll`/`.bc` input
+/// is used in place. Producing one bitcode and compiling both the RVSDG
+/// compiler and clang from it keeps the shared frontend out of either side's
+/// measured work -- the differential tester and the compile-time benchmark
+/// both rely on this for a fair comparison.
+pub fn stage_to_bitcode(
+    input: &Path,
+    include_dirs: &[String],
+    defines: &[String],
+) -> color_eyre::Result<StagedInput> {
+    match input.extension().and_then(|e| e.to_str()) {
+        Some("ll") | Some("bc") => Ok(StagedInput {
+            _holder: None,
+            path: input.to_path_buf(),
+            frontend: None,
+        }),
+        _ => {
+            let start = Instant::now();
+            let holder = c_file_to_bc(input, include_dirs, defines)?;
+            let frontend = start.elapsed();
+            let path = holder.path().to_path_buf();
+            Ok(StagedInput {
+                _holder: Some(holder),
+                path,
+                frontend: Some(frontend),
+            })
+        }
+    }
+}
+
+/// The LLVM backend codegen level. This sets only the backend (isel /
+/// scheduling / regalloc) effort; our mid-end runs regardless, so it
+/// trades codegen time against generated-code quality, nothing else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum CodegenLevel {
+    #[value(name = "o0")]
+    O0,
+    #[value(name = "o1")]
+    O1,
+    #[value(name = "o2")]
+    O2,
+    #[value(name = "o3")]
+    O3,
+}
+
+impl CodegenLevel {
+    pub fn to_inkwell(self) -> OptimizationLevel {
+        match self {
+            CodegenLevel::O0 => OptimizationLevel::None,
+            CodegenLevel::O1 => OptimizationLevel::Less,
+            CodegenLevel::O2 => OptimizationLevel::Default,
+            CodegenLevel::O3 => OptimizationLevel::Aggressive,
+        }
+    }
+
+    /// The `--codegen-opt` value: `o0`..`o3`.
+    pub fn flag(self) -> &'static str {
+        match self {
+            CodegenLevel::O0 => "o0",
+            CodegenLevel::O1 => "o1",
+            CodegenLevel::O2 => "o2",
+            CodegenLevel::O3 => "o3",
+        }
+    }
+
+    /// The clang `-O` flag: `-O0`..`-O3`.
+    pub fn clang_flag(self) -> &'static str {
+        match self {
+            CodegenLevel::O0 => "-O0",
+            CodegenLevel::O1 => "-O1",
+            CodegenLevel::O2 => "-O2",
+            CodegenLevel::O3 => "-O3",
+        }
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "RVSDG_CC")]
 #[command(version = "0.0")]
@@ -242,6 +353,16 @@ pub struct Cli {
     #[arg(long, short, default_value_t = false)]
     pub(crate) run: bool,
 
+    /// Compile to an object file and stop, skipping the link step (cc's
+    /// `-c`). Object goes to `-o PATH` if given, else `<input-stem>.o`.
+    #[arg(
+        long = "compile-only",
+        short = 'c',
+        default_value_t = false,
+        conflicts_with = "run"
+    )]
+    pub(crate) compile_only: bool,
+
     /// Disable the optimisation pipeline (which is on by default), for
     /// A/B measurement of the passes themselves.
     #[arg(long = "no-optimise", default_value_t = false)]
@@ -253,6 +374,11 @@ pub struct Cli {
     /// after construction).
     #[arg(long = "verify-all", default_value_t = false)]
     pub(crate) verify_all: bool,
+
+    /// LLVM backend codegen level (O0/O1/O2/O3). Backend effort only;
+    /// our mid-end is unaffected.
+    #[arg(long = "codegen-opt", value_enum, default_value = "o3")]
+    pub(crate) codegen_opt: CodegenLevel,
 
     /// Print compile statistics to stderr: graph censuses before and
     /// after the pass pipeline, per-pass reports, and emitted-IR counts.
@@ -325,7 +451,9 @@ impl Cli {
         Self {
             output: Some(output),
             run: false,
+            compile_only: false,
             no_optimise: false,
+            codegen_opt: CodegenLevel::O3,
             // Fixture graphs are tiny; per-pass verification is free
             // coverage that names the guilty pass on failure.
             verify_all: true,
@@ -345,7 +473,9 @@ impl Cli {
         Self {
             output: None,
             run: true,
+            compile_only: false,
             no_optimise: false,
+            codegen_opt: CodegenLevel::O3,
             verify_all: true,
             stats: false,
             stats_json: None,
@@ -492,7 +622,7 @@ pub fn run_cli(cli: &Cli) -> color_eyre::Result<Option<u8>> {
             }
             jit_engine = Some(
                 module
-                    .create_jit_execution_engine(OptimizationLevel::None)
+                    .create_jit_execution_engine(cli.codegen_opt.to_inkwell())
                     .map_err(|e| color_eyre::eyre::eyre!("failed to create JIT engine: {e}"))?,
             );
         } else {
@@ -502,16 +632,22 @@ pub fn run_cli(cli: &Cli) -> color_eyre::Result<Option<u8>> {
             // and a successful link once overwrote its own input IR.
             let output = match &cli.output {
                 Some(v) => v.clone(),
-                None => c_file_path
-                    .file_stem()
-                    .and_then(|stem| stem.to_str())
-                    .map(str::to_owned)
-                    .ok_or_else(|| {
-                        color_eyre::eyre::eyre!(
-                            "cannot derive an output name from input path {}; pass -o",
-                            cli.input
-                        )
-                    })?,
+                None => {
+                    let stem = c_file_path
+                        .file_stem()
+                        .and_then(|stem| stem.to_str())
+                        .ok_or_else(|| {
+                            color_eyre::eyre::eyre!(
+                                "cannot derive an output name from input path {}; pass -o",
+                                cli.input
+                            )
+                        })?;
+                    if cli.compile_only {
+                        format!("{stem}.o")
+                    } else {
+                        stem.to_owned()
+                    }
+                }
             };
             // Defense in depth behind the stem default: never write the
             // executable over the input file, whatever the paths resolve to.
@@ -525,13 +661,16 @@ pub fn run_cli(cli: &Cli) -> color_eyre::Result<Option<u8>> {
             // A --link-arg value with embedded whitespace that is not a file is
             // almost always several linker flags squeezed into one argument
             // (e.g. '-luring -lpq'); cc receives it as a single unknown option
-            // and the resulting linker error does not point back here.
-            for arg in &cli.link_arg {
-                if arg.contains(char::is_whitespace) && !Path::new(arg).exists() {
-                    eprintln!(
-                        "warning: --link-arg value {arg:?} contains whitespace and is not a file; \
-                         linker flags must be passed one per --link-arg"
-                    );
+            // and the resulting linker error does not point back here. Only
+            // relevant when we actually link.
+            if !cli.compile_only {
+                for arg in &cli.link_arg {
+                    if arg.contains(char::is_whitespace) && !Path::new(arg).exists() {
+                        eprintln!(
+                            "warning: --link-arg value {arg:?} contains whitespace and is not a file; \
+                             linker flags must be passed one per --link-arg"
+                        );
+                    }
                 }
             }
             let emitted_ir = match stats_collection.as_mut() {
@@ -548,6 +687,8 @@ pub fn run_cli(cli: &Cli) -> color_eyre::Result<Option<u8>> {
                 &cli.define,
                 cli.quiet,
                 emitted_ir,
+                cli.codegen_opt.to_inkwell(),
+                cli.compile_only,
             )?;
             // Non-zero only when the binary installs the counting allocator
             // (main does); the rest of RSS is LLVM's C++ heap and the

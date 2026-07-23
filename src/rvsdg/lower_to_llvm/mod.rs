@@ -149,6 +149,30 @@ impl RVSDGMod {
         Ok(module)
     }
 
+    /// Build a target machine at codegen level `codegen`. This is the
+    /// LLVM backend (isel / scheduling / regalloc) opt level ONLY; it
+    /// never runs the mid-level IR optimizer, which we drive ourselves,
+    /// so varying it changes backend effort and nothing else.
+    pub fn target_machine(
+        &self,
+        codegen: OptimizationLevel,
+    ) -> color_eyre::Result<inkwell::targets::TargetMachine> {
+        crate::init_llvm_native()?;
+        let llvm_triple = TargetTriple::create(&self.target.to_string());
+        let target = Target::from_triple(&llvm_triple)
+            .map_err(|e| eyre!("failed to get target for triple {}: {e}", self.target))?;
+        target
+            .create_target_machine(
+                &llvm_triple,
+                "generic",
+                "",
+                codegen,
+                RelocMode::PIC,
+                CodeModel::Default,
+            )
+            .ok_or_else(|| eyre!("failed to create target machine for triple {}", self.target))
+    }
+
     pub fn output_with_llvm(
         &self,
         output: &str,
@@ -158,11 +182,9 @@ impl RVSDGMod {
         defines: &[String],
         quiet: bool,
         emitted_stats: Option<&mut crate::stats::EmittedIrStats>,
+        codegen: OptimizationLevel,
+        compile_only: bool,
     ) -> color_eyre::Result<()> {
-        // initialise things (guarded so concurrent callers don't race the
-        // process-global target registry)
-        crate::init_llvm_native()?;
-
         let context = Context::create();
         let module = self.lower_to_llvm_module(&context)?;
         if let Some(stats) = emitted_stats {
@@ -173,37 +195,15 @@ impl RVSDGMod {
             eprintln!("{}", module.print_to_string().to_string());
         }
 
-        // more output things
-        let llvm_triple = TargetTriple::create(&self.target.to_string());
-        let target = Target::from_triple(&llvm_triple)
-            .map_err(|e| eyre!("failed to get target for triple {}: {e}", self.target))?;
+        let machine = self.target_machine(codegen)?;
 
-        // This opt level is the LLVM *CodeGenOptLevel* only -- `write_to_file`
-        // runs the backend pipeline (instruction selection, scheduling,
-        // register allocation, machine-level opts), never the mid-level IR
-        // optimizer (instcombine/GVN/LICM/vectorize), which is only run via a
-        // PassBuilder pipeline we deliberately don't invoke. So the mid level
-        // is "-O0" (RVSDG owns those optimizations) at every setting here.
-        //
-        // TEMPORARY: `None` (-O0 codegen: fast instruction selection, basic
-        // register allocator) so compile-time comparisons against the
-        // difftest's `clang -O0` reference measure our pipeline like for
-        // like instead of charging us for LLVM's -O3 backend. Restore
-        // `Aggressive` -- or make it a CLI flag -- when output quality
-        // matters again: runtime benchmarks (polybench charts) are
-        // meaningless at `None`.
-        let machine = target
-            .create_target_machine(
-                &llvm_triple,
-                "generic",
-                "",
-                OptimizationLevel::None,
-                RelocMode::PIC,
-                CodeModel::Default,
-            )
-            .ok_or_else(|| eyre!("failed to create target machine for triple {}", self.target))?;
-
-        let obj_file = format!("{}.o", output);
+        // In compile-only mode `output` IS the object path; otherwise it
+        // names the executable and the object sits next to it as `.o`.
+        let obj_file = if compile_only {
+            output.to_string()
+        } else {
+            format!("{}.o", output)
+        };
         let obj_path = Path::new(&obj_file);
         {
             // Codegen scales with the SIZE OF OUR OUTPUT (phi count above
@@ -218,6 +218,10 @@ impl RVSDGMod {
         // Status/diagnostics go to stderr so the compiler never writes to
         // stdout -- that belongs to the compiled program when it runs.
         eprintln!("Wrote object file: {}", obj_path.display());
+
+        if compile_only {
+            return Ok(());
+        }
 
         let obj_arg = obj_path
             .to_str()

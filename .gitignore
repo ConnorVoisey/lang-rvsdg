@@ -4,3 +4,11 @@
 !/bench-results/poly-bench
 /bench-results/poly-bench/*
 !/bench-results/poly-bench/plot.gp
+# The report is a checked-in static asset; its data (data.js) and the
+# run store (runs/) are generated and stay ignored.
+!/bench-results/compile-time
+/bench-results/compile-time/*
+!/bench-results/compile-time/report.html
+!/bench-results/compile-time/report.js
+!/bench-results/compile-time/jsconfig.json
+!/bench-results/compile-time/globals.d.ts

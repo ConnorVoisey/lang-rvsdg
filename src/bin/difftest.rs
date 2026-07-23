@@ -269,30 +269,17 @@ fn differential_test(
     // scaffolding both compilers build on) and time both compiles from
     // it, so neither side is charged for the frontend and the compile
     // comparison measures the parts each compiler actually owns.
-    // Caller-supplied .ll/.bc inputs skip the frontend entirely.
-    let already_ir = matches!(
-        c_file.extension().and_then(|e| e.to_str()),
-        Some("ll") | Some("bc")
-    );
-    let (bc_holder, input_path, frontend_compile) = if already_ir {
-        (None, c_file.to_path_buf(), Duration::ZERO)
-    } else {
-        let frontend_start = Instant::now();
-        match lang_rvsdg::c_file_to_bc(c_file, &args.include, &[]) {
-            Ok(bc) => {
-                let path = bc.path().to_path_buf();
-                (Some(bc), path, frontend_start.elapsed())
-            }
-            // The shared frontend is clang; if it cannot build the
-            // input, that is the input's problem, same as the old
-            // reference-compile failure.
-            Err(_) => return Ok(Outcome::ClangCompileFail),
-        }
+    // Caller-supplied .ll/.bc inputs skip the frontend entirely. The
+    // shared frontend is clang; if it cannot build the input, that is the
+    // input's problem, same as the old reference-compile failure.
+    let staged = match lang_rvsdg::stage_to_bitcode(c_file, &args.include, &[]) {
+        Ok(staged) => staged,
+        Err(_) => return Ok(Outcome::ClangCompileFail),
     };
-    // Hold the temp bitcode alive across both compiles.
-    let _bc_holder = bc_holder;
+    let input_path = staged.path();
+    let frontend_compile = staged.frontend_time().unwrap_or(Duration::ZERO);
 
-    let rvsdg = compile_rvsdg(cc, &input_path, &rvsdg_bin, args, tmp)?;
+    let rvsdg = compile_rvsdg(cc, input_path, &rvsdg_bin, args, tmp)?;
     let rvsdg_compile = match &rvsdg {
         Compile::Timeout { elapsed } => return Ok(Outcome::CompileSlow { elapsed: *elapsed }),
         Compile::Ice { elapsed, stderr } => {
@@ -307,7 +294,7 @@ fn differential_test(
     // Reference compile from the same bitcode. If clang can't build it,
     // the input is not our bug.
     let clang_start = Instant::now();
-    if !compile_clang(&input_path, &clang_bin, args)? {
+    if !compile_clang(input_path, &clang_bin, args)? {
         return Ok(Outcome::ClangCompileFail);
     }
     let clang_compile = clang_start.elapsed();

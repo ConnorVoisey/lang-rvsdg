@@ -1,0 +1,18 @@
+{
+  "compilerOptions": {
+    "checkJs": true,
+    "allowJs": true,
+    "noEmit": true,
+    "strict": true,
+    // Keep strictNullChecks (it catches real null-flow); relax
+    // noImplicitAny so untyped Alpine-glue callbacks are not ceremony.
+    "noImplicitAny": false,
+    "target": "ES2020",
+    "module": "ES2020",
+    "moduleResolution": "bundler",
+    "lib": ["ES2020", "DOM"],
+    "types": [],
+    "skipLibCheck": true
+  },
+  "include": ["report.js", "globals.d.ts"]
+}
