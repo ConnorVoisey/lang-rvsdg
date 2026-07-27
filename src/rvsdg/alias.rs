@@ -78,7 +78,7 @@ impl RVSDGMod {
         let mut all_const = true;
         let mut cursor = addr;
         loop {
-            match &self.values[cursor.0 as usize].kind {
+            match self.get_value_kind(cursor) {
                 ValueKind::GlobalRef(global) => {
                     return self.finish(BaseObject::Global(*global), steps, all_const);
                 }
@@ -93,7 +93,7 @@ impl RVSDGMod {
                 } => {
                     let mut path = Vec::new();
                     for &index in self.value_pool.get(*indices) {
-                        match self.values[index.0 as usize].kind {
+                        match *self.get_value_kind(index) {
                             ValueKind::Const(ConstValue::Int(k)) => path.push(k),
                             _ => {
                                 all_const = false;
@@ -114,8 +114,7 @@ impl RVSDGMod {
                 // through a cast is sound for base identity.
                 ValueKind::Cast { value, .. } | ValueKind::Freeze { value } => cursor = *value,
                 ValueKind::Project { call, index } => {
-                    if *index == 0
-                        && matches!(self.values[call.0 as usize].kind, ValueKind::Alloca { .. })
+                    if *index == 0 && matches!(self.get_value_kind(*call), ValueKind::Alloca { .. })
                     {
                         return self.finish(BaseObject::Alloca(*call), steps, all_const);
                     }

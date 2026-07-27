@@ -375,13 +375,11 @@ impl RVSDGMod {
         let state = rb.graph.regions[region_id.0 as usize].entry_state;
         let fn_res = rb_fn(&mut rb, state)?;
         let results = rb.graph.value_pool.push_slice(&fn_res.values);
-        rb.graph.values.push(Value {
-            ty: TypeRef::Scalar(ScalarType::Void),
-            kind: ValueKind::RegionResult {
-                values: results,
-                state: fn_res.state,
-            },
+        rb.graph.value_kinds.push(ValueKind::RegionResult {
+            values: results,
+            state: fn_res.state,
         });
+        rb.graph.value_types.push(TypeRef::Scalar(ScalarType::Void));
         let lambda_val = Value {
             ty: TypeRef::Scalar(ScalarType::Void),
             kind: ValueKind::Lambda {

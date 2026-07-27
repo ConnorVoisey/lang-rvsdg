@@ -82,7 +82,7 @@ pub struct ValueMapper<'ctx> {
 impl<'ctx> ValueMapper<'ctx> {
     fn new(rvsdg_mod: &RVSDGMod) -> Self {
         Self {
-            values: vec![None; rvsdg_mod.values.len()],
+            values: vec![None; rvsdg_mod.value_kinds.len()],
             fns: vec![None; rvsdg_mod.functions.len()],
             globals: vec![None; rvsdg_mod.globals.len()],
             in_progress: rustc_hash::FxHashSet::default(),
@@ -627,8 +627,8 @@ impl RVSDGMod {
                 rvsdg_func.name
             )
         })?;
-        let lambda_val = &self.values[fn_val.0 as usize];
-        match &lambda_val.kind {
+        let lambda_val = self.get_value_kind(fn_val);
+        match lambda_val {
             ValueKind::Lambda {
                 region: region_id,
                 func_id: _,

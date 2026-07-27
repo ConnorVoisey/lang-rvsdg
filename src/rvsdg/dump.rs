@@ -145,7 +145,7 @@ impl Function {
 
         match self.lambda_val {
             Some(lambda_id) => {
-                let region_id = match m.get(lambda_id).kind {
+                let region_id = match m.get_value_kind(lambda_id) {
                     ValueKind::Lambda { region, .. } => region,
                     // A function's lambda_val must be a Lambda; anything else
                     // is a construction bug, so surface it rather than hide it.
@@ -158,7 +158,7 @@ impl Function {
                         return Ok(());
                     }
                 };
-                fmt_region_body(f, m, region_id, 4, false, true, None, Terminator::Return)?;
+                fmt_region_body(f, m, *region_id, 4, false, true, None, Terminator::Return)?;
             }
             None => pad(f, 4).and_then(|_| f.write_str("; external (no body)\n"))?,
         }
@@ -203,9 +203,9 @@ fn fmt_region_body(
             if i != 0 {
                 f.write_str(", ")?;
             }
-            let param = m.get(param_id);
+            let param = m.get_value_type(param_id);
             write!(f, "a{i}: ")?;
-            param.ty.fmt(f, &m.types)?;
+            param.fmt(f, &m.types)?;
         }
         f.write_str(" ]\n")?;
     }
@@ -215,7 +215,7 @@ fn fmt_region_body(
         // this region, region params are shown in `args`, projects are folded
         // into `%vNODE#K` references, and the region result is the terminator.
         if matches!(
-            m.get(node_id).kind,
+            m.get_value_kind(node_id),
             ValueKind::Lambda { .. }
                 | ValueKind::Project { .. }
                 | ValueKind::RegionParam { .. }
@@ -258,8 +258,8 @@ fn fmt_node(
     node_id: ValueId,
     indent: usize,
 ) -> std::fmt::Result {
-    let value = m.get(node_id);
-    match &value.kind {
+    let value = m.get_value_kind(node_id);
+    match value {
         ValueKind::Const(const_value) => write!(f, "const {const_value}"),
         ValueKind::ConstPoolRef(const_id) => fmt_const_ref(f, m, *const_id),
         ValueKind::GlobalRef(global_id) => write!(f, "global_ref {global_id}"),
@@ -400,7 +400,7 @@ fn fmt_struct_outputs(
             f.write_str(", ")?;
         }
         write!(f, "%v{}#{i}: ", node_id.0)?;
-        m.get(result).ty.fmt(f, &m.types)?;
+        m.get_value_type(result).fmt(f, &m.types)?;
     }
     f.write_str(" )")
 }
@@ -424,7 +424,7 @@ fn fmt_value_list(
 /// Resolve a value reference to its origin and print it: a region argument as
 /// `aN`, a folded project output as `%vNODE#K`, everything else as `%vN`.
 fn fmt_value_ref(f: &mut std::fmt::Formatter<'_>, m: &RVSDGMod, id: ValueId) -> std::fmt::Result {
-    match m.get(id).kind {
+    match m.get_value_kind(id) {
         ValueKind::RegionParam { index, .. } => write!(f, "a{index}"),
         ValueKind::Project { call, index } => write!(f, "%v{}#{}", call.0, index),
         // Region-free values have no defining line in any region (they
@@ -432,7 +432,7 @@ fn fmt_value_ref(f: &mut std::fmt::Formatter<'_>, m: &RVSDGMod, id: ValueId) -> 
         ValueKind::Const(const_value) => write!(f, "const {const_value}"),
         ValueKind::GlobalRef(global_id) => write!(f, "global_addr {global_id}"),
         ValueKind::FuncAddr(func_id) => write!(f, "func_addr {func_id}"),
-        ValueKind::ConstPoolRef(const_id) => fmt_const_ref(f, m, const_id),
+        ValueKind::ConstPoolRef(const_id) => fmt_const_ref(f, m, *const_id),
         _ => write!(f, "{id}"),
     }
 }

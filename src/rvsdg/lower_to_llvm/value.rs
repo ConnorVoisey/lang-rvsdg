@@ -24,10 +24,11 @@ impl RVSDGMod {
             return Ok(Some(*val));
         }
 
-        let value = &self.values[value_id.0 as usize];
-        let lowered_val = match value.kind {
+        let value_kind = *self.get_value_kind(value_id);
+        let value_type = *self.get_value_type(value_id);
+        let lowered_val = match value_kind {
             ValueKind::Const(const_value) => {
-                Some(self.lower_const_value(llvm_builder, &const_value, value.ty)?)
+                Some(self.lower_const_value(llvm_builder, &const_value, value_type)?)
             }
             ValueKind::ConstPoolRef(const_id) => {
                 Some(self.lower_const_id(llvm_builder, mapper, const_id)?)
@@ -143,7 +144,7 @@ impl RVSDGMod {
                 )?)
             }
             ValueKind::Cast { op, value: operand } => {
-                Some(self.lower_cast(llvm_builder, mapper, rvsdg_func, op, operand, value)?)
+                Some(self.lower_cast(llvm_builder, mapper, rvsdg_func, op, operand, value_type)?)
             }
 
             ValueKind::ExtractLane { .. }
@@ -620,7 +621,7 @@ impl RVSDGMod {
         rvsdg_func: &Function,
         result_id: ValueId,
     ) -> color_eyre::Result<Option<BasicValueEnum<'ctx>>> {
-        if self.values[result_id.0 as usize].kind.is_region_free() {
+        if self.get_value_kind(result_id).is_region_free() {
             return self.lower_value(llvm_builder, mapper, rvsdg_func, result_id);
         }
         Ok(*mapper.get_val(result_id))

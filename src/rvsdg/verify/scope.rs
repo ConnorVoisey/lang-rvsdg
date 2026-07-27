@@ -43,7 +43,7 @@ impl RVSDGMod {
         &self,
         errs: &mut Vec<RVSDGVerificationError>,
     ) -> Vec<Owner> {
-        let mut owner = vec![Owner::Unowned; self.values.len()];
+        let mut owner = vec![Owner::Unowned; self.value_kinds.len()];
         for (region_index, region) in self.regions.iter().enumerate() {
             for (position, &value) in region.nodes.iter().enumerate() {
                 if owner[value.0 as usize] != Owner::Unowned {
@@ -72,7 +72,7 @@ impl RVSDGMod {
         // A value visible everywhere: constants and symbol references
         // denote the same thing in any region, so they are exempt from
         // ownership (the emitter materialises them where needed).
-        let region_free = |value: ValueId| self.values[value.0 as usize].kind.is_region_free();
+        let region_free = |value: ValueId| self.get_value_kind(value).is_region_free();
 
         let check = |errs: &mut Vec<RVSDGVerificationError>,
                      user: ValueId,
@@ -111,7 +111,7 @@ impl RVSDGMod {
                 // deliberately never visited here (the state pass covers
                 // them); spans are expanded through the pools like the
                 // other verifiers.
-                match &self.values[user.0 as usize].kind {
+                match self.get_value_kind(user) {
                     ValueKind::Unary { operand, .. }
                     | ValueKind::Cast { value: operand, .. }
                     | ValueKind::Freeze { value: operand }

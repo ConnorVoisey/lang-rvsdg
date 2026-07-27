@@ -32,8 +32,8 @@ impl RVSDGMod {
     pub(super) fn verify_predicate_form(&self, errs: &mut Vec<RVSDGVerificationError>) {
         // The match values, each with a use tally.
         let mut matches: FxHashMap<ValueId, MatchUses> = FxHashMap::default();
-        for (index, value) in self.values.iter().enumerate() {
-            if matches!(value.kind, ValueKind::Match { .. }) {
+        for (index, value) in self.value_kinds.iter().enumerate() {
+            if matches!(value, ValueKind::Match { .. }) {
                 matches.insert(ValueId(index as u32), MatchUses::default());
             }
         }
@@ -52,8 +52,8 @@ impl RVSDGMod {
                 }
             };
 
-        for value in &self.values {
-            match &value.kind {
+        for value in &self.value_kinds {
+            match &value {
                 // The two legal condition slots.
                 ValueKind::Gamma {
                     condition, inputs, ..

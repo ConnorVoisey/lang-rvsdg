@@ -3,6 +3,8 @@ mod arithmetic;
 mod control_flow;
 mod memory;
 
+use smallvec::SmallVec;
+
 use crate::rvsdg::{
     FuncId, RVSDGMod, Region, RegionId, State, Value, ValueId, ValueKind, ValuesSpan,
     types::TypeRef,
@@ -23,11 +25,10 @@ impl RVSDGMod {
     /// is an explicit list).
     pub(crate) fn append_region_param(&mut self, region: RegionId, ty: TypeRef) -> ValueId {
         let index = self.regions[region.0 as usize].params.len() as u32;
-        let id = ValueId(self.values.len() as u32);
-        self.values.push(Value {
-            ty,
-            kind: ValueKind::RegionParam { index, ty, region },
-        });
+        let id = ValueId(self.value_kinds.len() as u32);
+        self.value_kinds
+            .push(ValueKind::RegionParam { index, ty, region });
+        self.value_types.push(ty);
         self.regions[region.0 as usize].params.push(id);
         id
     }
@@ -36,24 +37,20 @@ impl RVSDGMod {
     /// aligns every alternative's parameters to one canonical input order),
     /// fixing each parameter value's index and region fields to its new
     /// position.
-    pub(crate) fn set_region_params(&mut self, region: RegionId, params: Vec<ValueId>) {
+    pub(crate) fn set_region_params(&mut self, region: RegionId, params: &[ValueId]) {
         for (position, &param) in params.iter().enumerate() {
-            let Value {
-                kind:
-                    ValueKind::RegionParam {
-                        index,
-                        region: param_region,
-                        ..
-                    },
+            let ValueKind::RegionParam {
+                index,
+                region: param_region,
                 ..
-            } = &mut self.values[param.0 as usize]
+            } = &mut self.value_kinds[param.0 as usize]
             else {
                 unreachable!("region parameter lists hold only RegionParam values");
             };
             *index = position as u32;
             *param_region = region;
         }
-        self.regions[region.0 as usize].params = params;
+        self.regions[region.0 as usize].params = params.into();
     }
 
     /// Set `region`'s results (construct assembly runs after the region's
@@ -75,7 +72,7 @@ impl<'a> RegionBuilder<'a> {
     pub fn new_empty(graph: &'a mut RVSDGMod, entry_state: State) -> Self {
         let region = RegionId(graph.regions.len() as u32);
         graph.regions.push(Region {
-            params: Vec::new(),
+            params: SmallVec::new(),
             results: ValuesSpan { start: 0, len: 0 },
             owner: ValueId::INVALID,
             entry_state,
@@ -96,17 +93,15 @@ impl<'a> RegionBuilder<'a> {
         let region = RegionId(graph.regions.len() as u32);
 
         let params = {
-            let mut params = Vec::with_capacity(param_types.len());
+            let mut params = SmallVec::with_capacity(param_types.len());
             for (i, &ty) in param_types.iter().enumerate() {
-                params.push(ValueId(graph.values.len() as u32));
-                graph.values.push(Value {
+                params.push(ValueId(graph.value_kinds.len() as u32));
+                graph.value_kinds.push(ValueKind::RegionParam {
+                    index: i as u32,
                     ty,
-                    kind: ValueKind::RegionParam {
-                        index: i as u32,
-                        ty,
-                        region,
-                    },
+                    region,
                 });
+                graph.value_types.push(ty);
             }
             params
         };
@@ -131,31 +126,27 @@ impl<'a> RegionBuilder<'a> {
 
         let params = {
             let fn_param_tys: Vec<TypeRef> = fn_params.iter().map(|param| param.ty).collect();
-            let mut params = Vec::with_capacity(fn_param_tys.len());
+            let mut params = SmallVec::with_capacity(fn_param_tys.len());
             for (i, &ty) in fn_param_tys.iter().enumerate() {
-                params.push(ValueId(graph.values.len() as u32));
-                graph.values.push(Value {
+                params.push(ValueId(graph.value_kinds.len() as u32));
+                graph.value_kinds.push(ValueKind::RegionParam {
+                    index: i as u32,
                     ty,
-                    kind: ValueKind::RegionParam {
-                        index: i as u32,
-                        ty,
-                        region,
-                    },
+                    region,
                 });
+                graph.value_types.push(ty);
             }
             params
         };
 
         // add state node after all params, this is not recorded in the result ValuesSpan
-        let entry_state = State(ValueId(graph.values.len() as u32));
-        graph.values.push(Value {
+        let entry_state = State(ValueId(graph.value_kinds.len() as u32));
+        graph.value_kinds.push(ValueKind::RegionParam {
+            index: fn_params.len() as u32,
             ty: TypeRef::State,
-            kind: ValueKind::RegionParam {
-                index: fn_params.len() as u32,
-                ty: TypeRef::State,
-                region,
-            },
+            region,
         });
+        graph.value_types.push(TypeRef::State);
 
         graph.regions.push(Region {
             params,
@@ -188,7 +179,7 @@ impl<'a> RegionBuilder<'a> {
             owner: ValueId::INVALID,
             entry_state: state,
             exit_state: State::INVALID,
-            params: Vec::new(),
+            params: SmallVec::new(),
             results: ValuesSpan { start: 0, len: 0 },
             nodes: vec![],
         });
@@ -197,8 +188,9 @@ impl<'a> RegionBuilder<'a> {
 
     #[inline]
     pub(crate) fn add_value(&mut self, data: Value) -> ValueId {
-        let id = ValueId(self.graph.values.len() as u32);
-        self.graph.values.push(data);
+        let id = ValueId(self.graph.value_kinds.len() as u32);
+        self.graph.value_kinds.push(data.kind);
+        self.graph.value_types.push(data.ty);
         let region = self.graph.get_region_mut(self.region_id());
         region.nodes.push(id);
         id

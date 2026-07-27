@@ -18,6 +18,7 @@ pub use ops::{
     UnaryOp,
 };
 use rustc_hash::FxHashMap;
+use smallvec::SmallVec;
 pub use target_lexicon::Triple;
 use types::{TypeArena, TypeRef};
 pub use value::{ConstValue, Value, ValueKind};
@@ -38,7 +39,8 @@ pub struct RVSDGMod {
     /// Interned ABI signatures for indirect call sites (see
     /// [`func::Signature`]).
     pub signatures: func::SignatureTable,
-    pub values: Vec<Value>,
+    pub value_kinds: Vec<ValueKind>,
+    pub value_types: Vec<TypeRef>,
     pub regions: Vec<Region>,
     pub functions: Vec<Function>,
     pub globals: Vec<GlobalDef>,
@@ -66,7 +68,8 @@ impl RVSDGMod {
             module_asm: String::new(),
             types: TypeArena::default(),
             signatures: func::SignatureTable::default(),
-            values: vec![],
+            value_kinds: vec![],
+            value_types: vec![],
             regions: vec![],
             functions: vec![],
             globals: vec![],
@@ -87,8 +90,13 @@ impl RVSDGMod {
     }
 
     #[inline]
-    pub fn get(&self, value: ValueId) -> &Value {
-        &self.values[value.0 as usize]
+    pub fn get_value_kind(&self, value: ValueId) -> &ValueKind {
+        &self.value_kinds[value.0 as usize]
+    }
+
+    #[inline]
+    pub fn get_value_type(&self, value: ValueId) -> &TypeRef {
+        &self.value_types[value.0 as usize]
     }
 
     #[inline]
@@ -147,8 +155,9 @@ impl RVSDGMod {
         if let Some(&id) = self.interned_values.get(&value) {
             return id;
         }
-        let id = ValueId(self.values.len() as u32);
-        self.values.push(value.clone());
+        let id = ValueId(self.value_kinds.len() as u32);
+        self.value_kinds.push(value.kind);
+        self.value_types.push(value.ty);
         self.interned_values.insert(value, id);
         id
     }
@@ -176,7 +185,7 @@ impl RVSDGMod {
     /// over `ValueKind`, so adding a variant forces a decision here.
     #[inline(always)]
     pub fn for_each_value_operand(&self, value: ValueId, mut f: impl FnMut(ValueId)) {
-        match &self.values[value.0 as usize].kind {
+        match self.get_value_kind(value) {
             ValueKind::Unary { operand, .. }
             | ValueKind::Cast { value: operand, .. }
             | ValueKind::Freeze { value: operand }
@@ -304,10 +313,8 @@ impl RVSDGMod {
     #[inline]
     pub fn projection_of(&self, node: ValueId, index: u16) -> ValueId {
         let id = ValueId(node.0 + 1 + index as u32);
-        match self.values.get(id.0 as usize).map(|value| &value.kind) {
-            Some(&ValueKind::Project { call, index: found }) if call == node && found == index => {
-                id
-            }
+        match self.get_value_kind(id) {
+            ValueKind::Project { call, index: found } if *call == node && *found == index => id,
             other => panic!(
                 "projection layout violated: expected Project {{ call: {node:?}, index: {index} }} \
                  at {id:?}, found {other:?}"
@@ -497,7 +504,7 @@ pub struct Region {
     /// being built, so parameter values interleave with body values in the
     /// global value array. Consumers identify a parameter by its position
     /// here, never by value-id arithmetic.
-    pub params: Vec<ValueId>,
+    pub params: SmallVec<[ValueId; 8]>,
     /// The lambda/gamma/theta/phi value this region belongs to. The
     /// graph only stores the forward direction during emission (the
     /// construct value does not exist until its regions are finished),

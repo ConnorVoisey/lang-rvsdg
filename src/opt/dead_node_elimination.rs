@@ -34,9 +34,9 @@ impl RVSDGMod {
         // would tear the construct apart. Refuse loudly rather than
         // reconstruct wrongly.
         if self
-            .values
+            .value_kinds
             .iter()
-            .any(|value| matches!(value.kind, ValueKind::Phi { .. }))
+            .any(|value| matches!(value, ValueKind::Phi { .. }))
         {
             return Err(eyre!(
                 "dead node elimination does not support phi constructs yet"
@@ -44,7 +44,7 @@ impl RVSDGMod {
         }
 
         let mut effects = DneEffects::default();
-        let mut alive = vec![false; self.values.len()];
+        let mut alive = vec![false; self.value_kinds.len()];
         self.mark_all_alive_nodes(&mut alive, &mut effects)?;
 
         self.remove_dead_nodes(&alive, &mut effects)?;
@@ -69,10 +69,10 @@ impl RVSDGMod {
         // projections are per-slot and stay dead with their slot. A
         // projection's only operand is its node, so this sweep never
         // creates new work for the mark loop.
-        for index in 0..self.values.len() {
-            if let ValueKind::Project { call, .. } = self.values[index].kind {
+        for index in 0..self.value_kinds.len() {
+            if let ValueKind::Project { call, .. } = self.value_kinds[index] {
                 let slotted = matches!(
-                    self.values[call.0 as usize].kind,
+                    self.get_value_kind(call),
                     ValueKind::Gamma { .. } | ValueKind::Theta { .. } | ValueKind::Phi { .. }
                 );
                 if !slotted && alive[call.0 as usize] && !alive[index] {
@@ -90,8 +90,8 @@ impl RVSDGMod {
             None => return Ok(()),
         };
 
-        let lambda = &self.values[lambda_id.0 as usize];
-        let region_id = match &lambda.kind {
+        let lambda = &self.get_value_kind(lambda_id);
+        let region_id = match &lambda {
             ValueKind::Lambda { region, func_id: _ } => region,
             t => Err(eyre!("function lambda value was not a lambda, got: {t:?}"))?,
         };
@@ -113,7 +113,7 @@ impl RVSDGMod {
             // require a custom walker to traverse operands,
             // need state and to visit regions, theta and gamma must be handled specially to remove
             // redundant pass through
-            match &self.values[value_id.0 as usize].kind {
+            match self.get_value_kind(value_id) {
                 ValueKind::Fence { state, .. } => {
                     stack.push(state.0);
                 }
@@ -210,7 +210,7 @@ impl RVSDGMod {
                 ValueKind::Project { call, index } => {
                     stack.push(*call);
                     let index = *index;
-                    match &self.values[call.0 as usize].kind {
+                    match self.get_value_kind(*call) {
                         ValueKind::Gamma { regions, .. } => {
                             for &arm in self.region_pool.get(*regions) {
                                 let arm_results = self.regions[arm.0 as usize].results;
@@ -232,7 +232,7 @@ impl RVSDGMod {
                 ValueKind::RegionParam { index, region, .. } => {
                     let index = *index;
                     let owner = self.regions[region.0 as usize].owner;
-                    match &self.values[owner.0 as usize].kind {
+                    match self.get_value_kind(owner) {
                         // Function parameters are fed by callers, not by
                         // graph edges; nothing to demand.
                         ValueKind::Lambda { .. } => {}
@@ -280,7 +280,7 @@ impl RVSDGMod {
             loop_vars,
             region_id,
             ..
-        } = &self.values[theta.0 as usize].kind
+        } = self.get_value_kind(theta)
         else {
             unreachable!("theta slot faces requested for non-theta value");
         };
@@ -297,12 +297,12 @@ impl RVSDGMod {
         alive: &[bool],
         effects: &mut DneEffects,
     ) -> color_eyre::Result<()> {
-        debug_assert_eq!(alive.len(), self.values.len());
+        debug_assert_eq!(alive.len(), self.value_kinds.len());
 
         // Both mappers are plain prefix sums of the mark, complete
         // before any rewriting starts. Dead entries stay poisoned so a
         // remap through one panics instead of aliasing id 0.
-        let mut value_mapper = vec![u32::MAX; self.values.len()];
+        let mut value_mapper = vec![u32::MAX; self.value_kinds.len()];
         let mut live_values: u32 = 0;
         for (old, &is_alive) in alive.iter().enumerate() {
             if is_alive {
@@ -330,13 +330,13 @@ impl RVSDGMod {
         // pools, holes and all, are dropped when the new ones swap in.
         let mut fresh = FreshPools::default();
         let mut scratch: Vec<ValueId> = Vec::new();
-        for old in 0..self.values.len() {
+        for old in 0..self.value_kinds.len() {
             if !alive[old] {
                 continue;
             }
-            let mut value = self.values[old].clone();
+            let mut value = self.value_kinds[old].clone();
             remap_kind(
-                &mut value.kind,
+                &mut value,
                 ValueId(old as u32),
                 &mut RemapContext {
                     value_mapper: &value_mapper,
@@ -348,9 +348,11 @@ impl RVSDGMod {
                     effects,
                 },
             )?;
-            self.values[value_mapper[old] as usize] = value;
+            self.value_kinds[value_mapper[old] as usize] = value;
+            self.value_types[value_mapper[old] as usize] = self.value_types[old];
         }
-        self.values.truncate(live_values as usize);
+        self.value_kinds.truncate(live_values as usize);
+        self.value_types.truncate(live_values as usize);
 
         // Slide live regions the same way. This runs after the value
         // pass because remap_kind reads the OLD regions: parameter
@@ -372,7 +374,7 @@ impl RVSDGMod {
             let owner_old = self.regions[new as usize].owner;
             let owner_new = value_mapper[owner_old.0 as usize];
             let keep_all_results = matches!(
-                self.values[owner_new as usize].kind,
+                self.value_kinds[owner_new as usize],
                 ValueKind::Lambda { .. }
             );
             let results = self.regions[new as usize].results;
@@ -788,7 +790,7 @@ mod tests {
         m.regions
             .iter()
             .flat_map(|region| region.nodes.iter())
-            .filter(|id| pred(&m.values[id.0 as usize].kind))
+            .filter(|id| pred(m.get_value_kind(**id)))
             .count()
     }
 
@@ -810,7 +812,7 @@ mod tests {
         let mut found = None;
         for region in &m.regions {
             for &id in &region.nodes {
-                if pred(&m.values[id.0 as usize].kind) {
+                if pred(m.get_value_kind(id)) {
                     assert!(found.is_none(), "expected exactly one matching node");
                     found = Some(id);
                 }
@@ -834,7 +836,7 @@ mod tests {
     }
 
     fn mark_alive(m: &RVSDGMod) -> Vec<bool> {
-        let mut alive = vec![false; m.values.len()];
+        let mut alive = vec![false; m.value_kinds.len()];
         for func in &m.functions {
             m.mark_alive_nodes(&mut alive, func).unwrap();
         }
@@ -1048,11 +1050,11 @@ mod tests {
         // the region's results), so a valid crafted slice excludes
         // them too.
         let alive: Vec<bool> = m
-            .values
+            .value_kinds
             .iter()
             .map(|v| {
                 !matches!(
-                    v.kind,
+                    v,
                     ValueKind::Binary {
                         op: BinaryOp::Mul,
                         ..
@@ -1094,9 +1096,9 @@ mod tests {
         .unwrap();
         let nodes_before = count_nodes(&m, |_| true);
         let alive: Vec<bool> = m
-            .values
+            .value_kinds
             .iter()
-            .map(|v| !matches!(v.kind, ValueKind::RegionResult { .. }))
+            .map(|v| !matches!(v, ValueKind::RegionResult { .. }))
             .collect();
 
         m.remove_dead_nodes(&alive, &mut DneEffects::default())
@@ -1567,10 +1569,10 @@ mod tests {
 
         assert_verified(&m);
         let gamma = single_node(&m, |k| matches!(k, ValueKind::Gamma { .. }));
-        let ValueKind::Gamma { regions, .. } = &m.values[gamma.0 as usize].kind else {
+        let ValueKind::Gamma { regions, .. } = *m.get_value_kind(gamma) else {
             unreachable!();
         };
-        for &arm in m.region_pool.get(*regions) {
+        for &arm in m.region_pool.get(regions) {
             assert_eq!(
                 m.value_pool.get(m.regions[arm.0 as usize].results).len(),
                 1,
@@ -1632,7 +1634,7 @@ mod tests {
         let gamma = single_node(&m, |k| matches!(k, ValueKind::Gamma { .. }));
         let ValueKind::Gamma {
             inputs, regions, ..
-        } = &m.values[gamma.0 as usize].kind
+        } = m.get_value_kind(gamma)
         else {
             unreachable!();
         };
@@ -1693,12 +1695,12 @@ mod tests {
             loop_vars,
             region_id,
             ..
-        } = &m.values[theta.0 as usize].kind
+        } = *m.get_value_kind(theta)
         else {
             unreachable!();
         };
         assert_eq!(
-            m.value_pool.get(*loop_vars).len(),
+            m.value_pool.get(loop_vars).len(),
             1,
             "pass-through loop variable removed from the theta inputs"
         );
@@ -1749,11 +1751,11 @@ mod tests {
 
         assert_verified(&m);
         let theta = single_node(&m, |k| matches!(k, ValueKind::Theta { .. }));
-        let ValueKind::Theta { loop_vars, .. } = &m.values[theta.0 as usize].kind else {
+        let ValueKind::Theta { loop_vars, .. } = *m.get_value_kind(theta) else {
             unreachable!();
         };
         assert_eq!(
-            m.value_pool.get(*loop_vars).len(),
+            m.value_pool.get(loop_vars).len(),
             1,
             "self-feeding but externally unread loop variable removed"
         );

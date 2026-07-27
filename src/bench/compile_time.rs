@@ -462,7 +462,7 @@ fn probe_program(program: &Program) -> color_eyre::Result<Probed> {
     let rvsdg = RVSDGMod::from_llvm_mod(crate::ir_file_to_mod(staged.path())?)?;
     Ok(Probed {
         name: program.name.clone(),
-        values: rvsdg.values.len(),
+        values: rvsdg.value_kinds.len(),
         verified: rvsdg.verify().is_empty(),
         staged,
         io: tempfile::tempdir()?,
@@ -750,7 +750,14 @@ fn augment_one(
     let bc = prog.staged.path();
     for &level in levels {
         // Our in-process phases (mid+backend from the staged IR).
-        let run = measure_phases(bc, &prog.name, level.to_inkwell(), opts.warmup, opts.iters, counters)?;
+        let run = measure_phases(
+            bc,
+            &prog.name,
+            level.to_inkwell(),
+            opts.warmup,
+            opts.iters,
+            counters,
+        )?;
         let phases = phase_records(&run);
         let passes = pass_records(&run);
         if record.emitted_ir.is_none() {
@@ -763,8 +770,16 @@ fn augment_one(
         let ours_args = ours_compile_args(level, &ours_obj, bc);
         let ours = {
             let label = format!("ours {}", level.flag());
-            let mut on_iter = |i, t| bar.set_message(format!("{} | {label} | iter {i}/{t}", prog.name));
-            measure_end_to_end(ours_bin, &ours_args, opts, &ours_obj, io.path(), &mut on_iter)?
+            let mut on_iter =
+                |i, t| bar.set_message(format!("{} | {label} | iter {i}/{t}", prog.name));
+            measure_end_to_end(
+                ours_bin,
+                &ours_args,
+                opts,
+                &ours_obj,
+                io.path(),
+                &mut on_iter,
+            )?
         };
         merge_wall(record, level, ours, phases, passes);
 
@@ -773,14 +788,26 @@ fn augment_one(
         let clang_args = clang_compile_args(level, &clang_out, bc);
         let clang = {
             let label = format!("clang {}", level.flag());
-            let mut on_iter = |i, t| bar.set_message(format!("{} | {label} | iter {i}/{t}", prog.name));
-            measure_end_to_end("clang", &clang_args, opts, &clang_out, io.path(), &mut on_iter)?
+            let mut on_iter =
+                |i, t| bar.set_message(format!("{} | {label} | iter {i}/{t}", prog.name));
+            measure_end_to_end(
+                "clang",
+                &clang_args,
+                opts,
+                &clang_out,
+                io.path(),
+                &mut on_iter,
+            )?
         };
         // Pushed as each level completes (not batched), so a later level's
         // error keeps the clang lines already measured for earlier levels.
-        record
-            .configs
-            .push(config_record(Compiler::Clang, level, clang, Vec::new(), Vec::new()));
+        record.configs.push(config_record(
+            Compiler::Clang,
+            level,
+            clang,
+            Vec::new(),
+            Vec::new(),
+        ));
     }
     Ok(())
 }
@@ -971,9 +998,16 @@ mod tests {
         merge_wall(&mut record, CodegenLevel::O0, failed_wall, vec![], vec![]);
         let cfg = &record.configs[0];
         assert!(matches!(cfg.status, ConfigStatus::Measured));
-        assert_eq!(cfg.cachegrind_ir, Some(5), "deterministic counts survive a failed wall");
+        assert_eq!(
+            cfg.cachegrind_ir,
+            Some(5),
+            "deterministic counts survive a failed wall"
+        );
         assert_eq!(cfg.object_size_bytes, Some(4096));
-        assert!(cfg.end_to_end.wall_ms.is_empty(), "no wall added from a failure");
+        assert!(
+            cfg.end_to_end.wall_ms.is_empty(),
+            "no wall added from a failure"
+        );
 
         // A measured wall compile fills wall + RSS while keeping the counts.
         let good_wall = EndToEnd {
@@ -987,7 +1021,11 @@ mod tests {
         let cfg = &record.configs[0];
         assert_eq!(cfg.end_to_end.wall_ms.len(), 1);
         assert_eq!(cfg.peak_rss_bytes, Some(2048));
-        assert_eq!(cfg.cachegrind_ir, Some(5), "counts still intact after a good wall");
+        assert_eq!(
+            cfg.cachegrind_ir,
+            Some(5),
+            "counts still intact after a good wall"
+        );
     }
 
     #[test]
@@ -997,7 +1035,10 @@ mod tests {
         let failed = failed_config(
             Compiler::Ours,
             CodegenLevel::O0,
-            &SampleFailure { timed_out: false, stderr: "det boom".to_string() },
+            &SampleFailure {
+                timed_out: false,
+                stderr: "det boom".to_string(),
+            },
             vec![],
             vec![],
         );
@@ -1017,8 +1058,14 @@ mod tests {
         };
         merge_wall(&mut record, CodegenLevel::O0, good_wall, vec![], vec![]);
         let cfg = &record.configs[0];
-        assert!(matches!(cfg.status, ConfigStatus::Failed), "status stays Failed");
+        assert!(
+            matches!(cfg.status, ConfigStatus::Failed),
+            "status stays Failed"
+        );
         assert!(cfg.error.is_some());
-        assert!(cfg.end_to_end.wall_ms.is_empty(), "no wall attached to a failed config");
+        assert!(
+            cfg.end_to_end.wall_ms.is_empty(),
+            "no wall attached to a failed config"
+        );
     }
 }

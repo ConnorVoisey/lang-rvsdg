@@ -21,7 +21,7 @@ pub struct Value {
 // driven by the memory-op variants; most variants are 4-16 bytes, but
 // boxing the large ones would add pointer chases on the most frequently
 // accessed operations -- not worth the tradeoff.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ValueKind {
     Const(ConstValue),
     /// Reference to a constant in the constant pool (aggregates, strings, etc.)

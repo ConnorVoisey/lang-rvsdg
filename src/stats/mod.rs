@@ -436,7 +436,7 @@ impl<'m> Collector<'m> {
             cursor += 1;
             let depth = info.own_depth.get(&region_id.0).copied();
             for &node in &self.m.regions[region_id.0 as usize].nodes {
-                match &self.m.values[node.0 as usize].kind {
+                match self.m.get_value_kind(node) {
                     ValueKind::Gamma { regions, .. } => {
                         for &arm in self.m.region_pool.get(*regions) {
                             if info.set.insert(arm.0) {
@@ -487,10 +487,10 @@ impl<'m> Collector<'m> {
             if let Some(position) = r.params.iter().position(|&param| param == value) {
                 break 'walk Some(position);
             }
-            if let ValueKind::Project { call, index } = &self.m.values[value.0 as usize].kind
+            if let ValueKind::Project { call, index } = self.m.get_value_kind(value)
                 && let ValueKind::Gamma {
                     inputs, regions, ..
-                } = &self.m.values[call.0 as usize].kind
+                } = self.m.get_value_kind(*call)
             {
                 let arms = self.m.region_pool.get(*regions);
                 let Some(inner_position) = self.gamma_slot_passthrough(arms, *index as usize)
@@ -560,12 +560,12 @@ impl<'m> Collector<'m> {
             return hit;
         }
         let result = 'walk: {
-            let ValueKind::Project { call, index } = &self.m.values[value.0 as usize].kind else {
+            let ValueKind::Project { call, index } = self.m.get_value_kind(value) else {
                 break 'walk false;
             };
             let ValueKind::Gamma {
                 inputs, regions, ..
-            } = &self.m.values[call.0 as usize].kind
+            } = self.m.get_value_kind(*call)
             else {
                 break 'walk false;
             };
@@ -611,7 +611,7 @@ impl<'m> Collector<'m> {
         // Break recursion through redirection cycles (a loop var whose
         // invariance is being decided must not consult itself).
         memo.insert(value, false);
-        let kind = &self.m.values[value.0 as usize].kind;
+        let kind = self.m.get_value_kind(value);
         let result = if is_const_family(kind) {
             true
         } else {
@@ -629,8 +629,7 @@ impl<'m> Collector<'m> {
                         let index = *index as usize;
                         match info.roles.get(&region) {
                             Some(RegionRole::GammaArm { gamma }) => {
-                                let ValueKind::Gamma { inputs, .. } =
-                                    &self.m.values[gamma.0 as usize].kind
+                                let ValueKind::Gamma { inputs, .. } = self.m.get_value_kind(*gamma)
                                 else {
                                     return false;
                                 };
@@ -639,7 +638,7 @@ impl<'m> Collector<'m> {
                             }
                             Some(RegionRole::ThetaBody { theta }) => {
                                 let ValueKind::Theta { loop_vars, .. } =
-                                    &self.m.values[theta.0 as usize].kind
+                                    self.m.get_value_kind(*theta)
                                 else {
                                     return false;
                                 };
@@ -677,7 +676,7 @@ impl<'m> Collector<'m> {
             FxHashMap::default();
         for &region_id in &info.all {
             for &node in &self.m.regions[region_id.0 as usize].nodes {
-                match &self.m.values[node.0 as usize].kind {
+                match self.m.get_value_kind(node) {
                     ValueKind::Load { addr, .. }
                     | ValueKind::Store { addr, .. }
                     | ValueKind::AtomicLoad { addr, .. }
@@ -709,10 +708,10 @@ impl<'m> Collector<'m> {
         // the invariant-motion dry run.
         for &(region_id, _depth) in &info.own {
             for &node in &self.m.regions[region_id.0 as usize].nodes {
-                let kind = &self.m.values[node.0 as usize].kind;
+                let kind = self.m.get_value_kind(node);
                 match kind {
                     ValueKind::Load { addr, .. } | ValueKind::Store { addr, .. } => {
-                        let external = is_const_family(&self.m.values[addr.0 as usize].kind)
+                        let external = is_const_family(self.m.get_value_kind(*addr))
                             || owner_region(&self.owner, *addr)
                                 .is_some_and(|region| !info.set.contains(&region));
                         if external {
@@ -745,7 +744,7 @@ impl<'m> Collector<'m> {
         // a source-level conditional and counts as nested.
         for &(store_region, store_depth) in &info.own {
             for &store in &self.m.regions[store_region.0 as usize].nodes {
-                let (cell_addr, cell_volatile) = match &self.m.values[store.0 as usize].kind {
+                let (cell_addr, cell_volatile) = match self.m.get_value_kind(store) {
                     ValueKind::Store { addr, volatile, .. } => (*addr, *volatile),
                     _ => continue,
                 };
@@ -764,7 +763,7 @@ impl<'m> Collector<'m> {
                         if node == store {
                             continue;
                         }
-                        match &self.m.values[node.0 as usize].kind {
+                        match self.m.get_value_kind(node) {
                             ValueKind::Call { fn_id, .. } => {
                                 if !effects_are_readonly(&self.m.get_function(*fn_id).attrs) {
                                     call = true;
@@ -831,7 +830,7 @@ impl<'m> Collector<'m> {
             ..Default::default()
         };
         let mut theta_bodies: Vec<(ValueId, RegionId)> = Vec::new();
-        let mut cross_region_seen: FxHashMap<&Value, u32> = FxHashMap::default();
+        let mut cross_region_seen: FxHashMap<Value, u32> = FxHashMap::default();
 
         // Visited guard: a function's Lambda node sits INSIDE its own
         // region, so the walk would otherwise revisit the root forever.
@@ -846,10 +845,10 @@ impl<'m> Collector<'m> {
             fc.max_depth = fc.max_depth.max(depth);
             fc.max_loop_depth = fc.max_loop_depth.max(loop_depth);
 
-            let mut in_region_seen: FxHashSet<&Value> = FxHashSet::default();
+            let mut in_region_seen: FxHashSet<Value> = FxHashSet::default();
             for &node in &region.nodes {
-                let value = &self.m.values[node.0 as usize];
-                match &value.kind {
+                let value_kind = self.m.get_value_kind(node);
+                match value_kind {
                     ValueKind::Gamma { regions, .. } => {
                         let arms = self.m.region_pool.get(*regions);
                         fc.gammas += 1;
@@ -874,7 +873,7 @@ impl<'m> Collector<'m> {
                             for &result in self.m.value_pool.get(arm_region.results) {
                                 fc.gamma_result_entries += 1;
                                 if matches!(
-                                    self.m.values[result.0 as usize].kind,
+                                    self.m.get_value_kind(result),
                                     ValueKind::Const(ConstValue::Poison)
                                 ) {
                                     fc.gamma_poison_results += 1;
@@ -921,8 +920,13 @@ impl<'m> Collector<'m> {
                 // CNE dry run: identical pure/constant values. Spans are
                 // compared by id, so structurally equal nodes with
                 // separately pooled spans undercount; conservative.
-                if is_pure_compute(&value.kind) || is_const_family(&value.kind) {
-                    if !in_region_seen.insert(value) {
+                if is_pure_compute(value_kind) || is_const_family(value_kind) {
+                    let ty = self.m.get_value_type(node);
+                    let value = Value {
+                        ty: *ty,
+                        kind: *value_kind,
+                    };
+                    if !in_region_seen.insert(value.clone()) {
                         fc.dup_pure_in_region += 1;
                     }
                     let seen = cross_region_seen.entry(value).or_insert(0);
@@ -934,7 +938,7 @@ impl<'m> Collector<'m> {
 
                 // Fold dry run: pure compute over constants only.
                 if matches!(
-                    value.kind,
+                    value_kind,
                     ValueKind::Unary { .. }
                         | ValueKind::Binary { .. }
                         | ValueKind::ICmp { .. }
@@ -945,7 +949,7 @@ impl<'m> Collector<'m> {
                     let mut all_const = true;
                     self.m.for_each_value_operand(node, |op| {
                         all_const &= matches!(
-                            self.m.values[op.0 as usize].kind,
+                            self.m.get_value_kind(op),
                             ValueKind::Const(_) | ValueKind::ConstPoolRef(_)
                         );
                     });
@@ -982,7 +986,7 @@ pub fn collect(m: &RVSDGMod) -> ModuleCensus {
 
     let mut census = ModuleCensus {
         mod_name: m.mod_name.clone(),
-        total_values: m.values.len() as u64,
+        total_values: m.value_kinds.len() as u64,
         value_pool_len: m.value_pool.len(),
         region_pool_len: m.region_pool.len(),
         u32_pool_len: m.u32_pool.len(),
@@ -995,22 +999,19 @@ pub fn collect(m: &RVSDGMod) -> ModuleCensus {
     };
 
     // Kind histogram + projection parents.
-    for value in &m.values {
-        *census
-            .kind_counts
-            .entry(kind_name(&value.kind))
-            .or_insert(0) += 1;
-        if let ValueKind::Project { call, .. } = &value.kind {
-            let parent = kind_name(&m.values[call.0 as usize].kind);
+    for value in &m.value_kinds {
+        *census.kind_counts.entry(kind_name(&value)).or_insert(0) += 1;
+        if let ValueKind::Project { call, .. } = &value {
+            let parent = kind_name(&m.get_value_kind(*call));
             *census.projections_by_parent.entry(parent).or_insert(0) += 1;
         }
     }
 
     // Fan-out: value-operand uses plus region results (skipping
     // RegionResult values, whose span IS the owning region's results).
-    census.fanout = vec![0u32; m.values.len()];
-    for (index, value) in m.values.iter().enumerate() {
-        if matches!(value.kind, ValueKind::RegionResult { .. }) {
+    census.fanout = vec![0u32; m.value_kinds.len()];
+    for (index, value) in m.value_kinds.iter().enumerate() {
+        if matches!(value, ValueKind::RegionResult { .. }) {
             continue;
         }
         m.for_each_value_operand(ValueId(index as u32), |op| {
@@ -1023,18 +1024,18 @@ pub fn collect(m: &RVSDGMod) -> ModuleCensus {
         }
     }
     census.dead_projections = m
-        .values
+        .value_kinds
         .iter()
         .enumerate()
         .filter(|(index, value)| {
-            matches!(value.kind, ValueKind::Project { .. }) && census.fanout[*index] == 0
+            matches!(value, ValueKind::Project { .. }) && census.fanout[*index] == 0
         })
         .count() as u64;
     census.value_references = census.fanout.iter().map(|&uses| uses as u64).sum();
 
     // Byte budget of the backing arrays.
     census.memory_budget = MemoryBudget {
-        values_bytes: m.values.len() * size_of::<Value>(),
+        values_bytes: m.value_kinds.len() * size_of::<Value>(),
         value_pool_bytes: m.value_pool.len() * size_of::<ValueId>(),
         region_structs_bytes: m.regions.len() * size_of::<crate::rvsdg::Region>(),
         region_lists_bytes: m
@@ -1049,8 +1050,8 @@ pub fn collect(m: &RVSDGMod) -> ModuleCensus {
 
     // value_pool composition: which span kinds fill it.
     let mut spans = SpanComposition::default();
-    for value in &m.values {
-        match &value.kind {
+    for value in &m.value_kinds {
+        match &value {
             ValueKind::Gamma { inputs, .. } => spans.gamma_inputs += inputs.len as usize,
             ValueKind::Theta { loop_vars, .. } => spans.theta_loop_vars += loop_vars.len as usize,
             ValueKind::Call { args, .. }
@@ -1076,7 +1077,7 @@ pub fn collect(m: &RVSDGMod) -> ModuleCensus {
     );
     census.span_composition = spans;
 
-    let mut ranked: Vec<usize> = (0..m.values.len()).collect();
+    let mut ranked: Vec<usize> = (0..m.value_kinds.len()).collect();
     ranked.sort_unstable_by_key(|&index| std::cmp::Reverse(census.fanout[index]));
     census.top_fanout = ranked
         .into_iter()
@@ -1085,7 +1086,7 @@ pub fn collect(m: &RVSDGMod) -> ModuleCensus {
         .map(|index| {
             (
                 ValueId(index as u32),
-                kind_name(&m.values[index].kind),
+                kind_name(&m.value_kinds[index]),
                 census.fanout[index],
             )
         })
@@ -1093,7 +1094,7 @@ pub fn collect(m: &RVSDGMod) -> ModuleCensus {
 
     // Liveness: region membership seeds a value-operand closure. The gap
     // to total_values is the husk fraction passes leave behind.
-    let mut live = vec![false; m.values.len()];
+    let mut live = vec![false; m.value_kinds.len()];
     let mut worklist: Vec<ValueId> = Vec::new();
     let mark = |live: &mut Vec<bool>, worklist: &mut Vec<ValueId>, value: ValueId| {
         if !live[value.0 as usize] {
@@ -1113,8 +1114,8 @@ pub fn collect(m: &RVSDGMod) -> ModuleCensus {
             mark(&mut live, &mut worklist, result);
         }
     }
-    for (index, value) in m.values.iter().enumerate() {
-        if matches!(value.kind, ValueKind::RegionResult { .. }) {
+    for (index, value) in m.value_kinds.iter().enumerate() {
+        if matches!(value, ValueKind::RegionResult { .. }) {
             mark(&mut live, &mut worklist, ValueId(index as u32));
         }
     }
@@ -1133,7 +1134,7 @@ pub fn collect(m: &RVSDGMod) -> ModuleCensus {
         let Some(lambda) = function.lambda_val else {
             continue;
         };
-        let ValueKind::Lambda { region, .. } = &m.values[lambda.0 as usize].kind else {
+        let ValueKind::Lambda { region, .. } = m.get_value_kind(lambda) else {
             continue;
         };
         census

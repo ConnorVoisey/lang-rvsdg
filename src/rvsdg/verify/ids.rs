@@ -7,7 +7,7 @@ impl RVSDGMod {
 
     #[inline(always)]
     fn valid_val(&self, errs: &mut Vec<RVSDGVerificationError>, val_id: ValueId) {
-        if (val_id.0 as usize) >= self.values.len() {
+        if (val_id.0 as usize) >= self.value_kinds.len() {
             errs.push(RVSDGVerificationError::InvalidValueId(val_id));
         }
     }
@@ -20,8 +20,8 @@ impl RVSDGMod {
     }
 
     fn verify_value_ids(&self, errs: &mut Vec<RVSDGVerificationError>) {
-        for val in self.values.iter() {
-            match val.kind {
+        for val in self.value_kinds.iter() {
+            match *val {
                 // Leaf values reference nothing.
                 ValueKind::Const(_) | ValueKind::RegionParam { .. } => (),
                 ValueKind::ConstPoolRef(const_id) => {

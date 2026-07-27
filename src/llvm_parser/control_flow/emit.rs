@@ -410,7 +410,7 @@ impl<'m> Emitter<'m> {
                     .map(|binding| binding.value)
             });
             let value = written.expect("every output symbol comes from a write");
-            output_types.push(lowerer.rb.graph.values[value.0 as usize].ty);
+            output_types.push(*lowerer.rb.graph.get_value_type(value));
         }
 
         // Align every region's parameters to the canonical input order and
@@ -426,12 +426,12 @@ impl<'m> Emitter<'m> {
                     .find(|capture| capture.symbol == symbol)
                     .map(|capture| capture.param);
                 let param = existing.unwrap_or_else(|| {
-                    let ty = graph.values[input_values[i].0 as usize].ty;
-                    graph.append_region_param(region_id, ty)
+                    let ty = graph.get_value_type(input_values[i]);
+                    graph.append_region_param(region_id, *ty)
                 });
                 params.push(param);
             }
-            graph.set_region_params(region_id, params.clone());
+            graph.set_region_params(region_id, &params);
 
             results.clear();
             for (o, &symbol) in outputs.iter().enumerate() {
@@ -676,7 +676,7 @@ impl<'m> Emitter<'m> {
                     // binding (a value that already existed before the
                     // loop), or poison when there is none (for example
                     // another entry vertex's phis on the entering path).
-                    let ty = lowerer.rb.graph.values[final_value.0 as usize].ty;
+                    let ty = *lowerer.rb.graph.get_value_type(final_value);
                     let init = match lowerer.scopes.resolve_id(lowerer.rb.graph, symbol) {
                         Some(value) => value,
                         None => lowerer.rb.constant(ty, ConstValue::Poison),
@@ -686,7 +686,7 @@ impl<'m> Emitter<'m> {
                 }
             }
         }
-        lowerer.rb.graph.set_region_params(body_region_id, params);
+        lowerer.rb.graph.set_region_params(body_region_id, &params);
         lowerer
             .rb
             .graph

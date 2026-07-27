@@ -421,7 +421,7 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
         // aggregate value in the RVSDG; its fields are the node's two
         // projections, which the builder lays out directly after the node.
         if matches!(
-            self.rb.graph.values[aggregate.0 as usize].kind,
+            self.rb.graph.get_value_kind(aggregate),
             crate::rvsdg::ValueKind::CompareAndSwap { .. }
         ) {
             let &[index] = inst.indices.as_slice() else {
@@ -605,7 +605,7 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
         let addr = self.operand(&inst.address)?;
         let expected = self.operand(&inst.expected)?;
         let desired = self.operand(&inst.replacement)?;
-        let value_type = self.rb.graph.values[expected.0 as usize].ty;
+        let value_type = self.rb.graph.get_value_type(expected);
         // `inst.weak` is deliberately dropped: the node is always a strong
         // compare-and-swap, which never fails spuriously and is therefore a
         // valid implementation of the weak form -- ALWAYS CORRECT, but not
@@ -623,7 +623,7 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
             desired,
             convert_mem_ordering(inst.atomicity.mem_ordering),
             convert_mem_ordering(inst.failure_memory_ordering),
-            value_type,
+            *value_type,
             inst.volatile,
         );
         // The instruction produces an `{old value, success flag}` pair
@@ -644,7 +644,7 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
     ) -> color_eyre::Result<State> {
         let addr = self.operand(&inst.address)?;
         let value = self.operand(&inst.value)?;
-        let value_type = self.rb.graph.values[value.0 as usize].ty;
+        let value_type = self.rb.graph.get_value_type(value);
         let op = convert_atomic_read_modify_write_op(inst.operation)?;
         let result = self.rb.atomic_read_modify_write(
             state,
@@ -652,7 +652,7 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
             value,
             op,
             convert_mem_ordering(inst.atomicity.mem_ordering),
-            value_type,
+            *value_type,
             inst.volatile,
         );
         self.scopes.bind_name(&inst.dest, result.value);

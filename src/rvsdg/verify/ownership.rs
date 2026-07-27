@@ -23,15 +23,12 @@ impl RVSDGMod {
             if region.owner == ValueId::INVALID {
                 errs.push(RVSDGVerificationError::RegionOwnerUnset(region_id));
             } else {
-                let names_region_back = match self
-                    .values
-                    .get(region.owner.0 as usize)
-                    .map(|value| &value.kind)
-                {
-                    Some(ValueKind::Lambda { region: r, .. })
-                    | Some(ValueKind::Phi { region: r, .. }) => *r == region_id,
-                    Some(ValueKind::Theta { region_id: r, .. }) => *r == region_id,
-                    Some(ValueKind::Gamma { regions, .. }) => {
+                let names_region_back = match self.get_value_kind(region.owner) {
+                    ValueKind::Lambda { region: r, .. } | ValueKind::Phi { region: r, .. } => {
+                        *r == region_id
+                    }
+                    ValueKind::Theta { region_id: r, .. } => *r == region_id,
+                    ValueKind::Gamma { regions, .. } => {
                         self.region_pool.get(*regions).contains(&region_id)
                     }
                     _ => false,
@@ -46,8 +43,8 @@ impl RVSDGMod {
 
             for &param in &region.params {
                 let names_region_back = matches!(
-                    self.values.get(param.0 as usize).map(|value| &value.kind),
-                    Some(ValueKind::RegionParam { region: r, .. }) if *r == region_id
+                    self.get_value_kind(param),
+                    ValueKind::RegionParam { region: r, .. } if *r == region_id
                 );
                 if !names_region_back {
                     errs.push(RVSDGVerificationError::RegionParamLinkInvalid {
@@ -132,12 +129,12 @@ mod tests {
 
         // Spot-check the links resolve to the right constructs.
         let lambda = m.functions[0].lambda_val.unwrap();
-        let ValueKind::Lambda { region, .. } = &m.values[lambda.0 as usize].kind else {
+        let ValueKind::Lambda { region, .. } = &m.get_value_kind(lambda) else {
             unreachable!();
         };
         assert_eq!(m.regions[region.0 as usize].owner, lambda);
         for &param in &m.regions[region.0 as usize].params {
-            let ValueKind::RegionParam { region: r, .. } = &m.values[param.0 as usize].kind else {
+            let ValueKind::RegionParam { region: r, .. } = &m.get_value_kind(param) else {
                 unreachable!();
             };
             assert_eq!(*r, *region);
@@ -165,7 +162,7 @@ mod tests {
             .regions
             .iter()
             .flat_map(|r| r.nodes.iter())
-            .find(|id| matches!(m.values[id.0 as usize].kind, ValueKind::Binary { .. }))
+            .find(|id| matches!(m.get_value_kind(**id), ValueKind::Binary { .. }))
             .copied()
             .unwrap();
         m.regions[0].owner = add;
@@ -181,7 +178,7 @@ mod tests {
     fn param_naming_wrong_region_is_caught() {
         let mut m = build_gamma_theta_module();
         let param = m.regions[0].params[0];
-        let ValueKind::RegionParam { region, .. } = &mut m.values[param.0 as usize].kind else {
+        let ValueKind::RegionParam { region, .. } = &mut m.value_kinds[param.0 as usize] else {
             unreachable!();
         };
         *region = RegionId(region.0 + 1);

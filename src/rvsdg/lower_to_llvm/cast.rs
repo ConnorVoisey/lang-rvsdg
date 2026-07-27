@@ -1,7 +1,8 @@
 use crate::rvsdg::{
-    CastOp, RVSDGMod, Value, ValueId,
+    CastOp, RVSDGMod, ValueId,
     func::Function,
     lower_to_llvm::{LLVMBuilderCtx, ValueMapper},
+    types::TypeRef,
 };
 use inkwell::values::BasicValueEnum;
 
@@ -14,10 +15,10 @@ impl RVSDGMod {
         rvsdg_func: &Function,
         op: CastOp,
         operand: ValueId,
-        value: &Value,
+        ty: TypeRef,
     ) -> color_eyre::Result<BasicValueEnum<'ctx>> {
         let src = self.expect_value(llvm_builder, mapper, rvsdg_func, operand)?;
-        let dst_type = self.type_to_basic_type_llvm(llvm_builder.context, value.ty)?;
+        let dst_type = self.type_to_basic_type_llvm(llvm_builder.context, ty)?;
         let b = &llvm_builder.builder;
         Ok(match op {
             CastOp::SignExtend => BasicValueEnum::IntValue(b.build_int_s_extend(

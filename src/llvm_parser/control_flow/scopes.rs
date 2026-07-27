@@ -314,8 +314,8 @@ impl SymbolScopes {
         let mut value = top.binding.value;
         for depth in top.depth + 1..=current {
             let region = self.frames[depth as usize].region;
-            let ty = graph.values[value.0 as usize].ty;
-            let param = graph.append_region_param(region, ty);
+            let ty = graph.get_value_type(value);
+            let param = graph.append_region_param(region, *ty);
             self.frames[depth as usize].captures.push(Capture {
                 symbol: id,
                 outer: value,

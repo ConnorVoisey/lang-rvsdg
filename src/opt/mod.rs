@@ -59,7 +59,7 @@ pub struct GraphShape {
 impl GraphShape {
     pub fn measure(module: &RVSDGMod) -> Self {
         Self {
-            values: module.values.len(),
+            values: module.value_kinds.len(),
             regions: module.regions.len(),
             value_pool_entries: module.value_pool.len(),
             region_pool_entries: module.region_pool.len(),

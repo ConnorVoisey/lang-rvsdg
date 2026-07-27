@@ -32,7 +32,7 @@ impl<'a> RegionBuilder<'a> {
 
         let param_types: Vec<TypeRef> = inputs
             .iter()
-            .map(|&id| self.graph.values[id.0 as usize].ty)
+            .map(|&id| *self.graph.get_value_type(id))
             .collect();
 
         for branch in branches {
@@ -70,13 +70,13 @@ impl<'a> RegionBuilder<'a> {
         }
         let out_state = State(gamma_val);
 
-        let first_result = ValueId(self.graph.values.len() as u32);
+        let first_result = ValueId(self.graph.value_kinds.len() as u32);
         let first_region = branch_regions[0];
         let first_results = self.graph.regions[first_region.0 as usize].results;
         for i in 0..result_count {
-            let ty = self.graph.values
-                [self.graph.value_pool.get(first_results)[i as usize].0 as usize]
-                .ty;
+            let ty = *self
+                .graph
+                .get_value_type(self.graph.value_pool.get(first_results)[i as usize]);
             self.add_value(Value {
                 ty,
                 kind: ValueKind::Project {
@@ -128,13 +128,13 @@ impl<'a> RegionBuilder<'a> {
         }
         let out_state = State(gamma_val);
 
-        let first_result = ValueId(self.graph.values.len() as u32);
+        let first_result = ValueId(self.graph.value_kinds.len() as u32);
         let first_region = branch_regions[0];
         let first_results = self.graph.regions[first_region.0 as usize].results;
         for i in 0..result_count {
-            let ty = self.graph.values
-                [self.graph.value_pool.get(first_results)[i as usize].0 as usize]
-                .ty;
+            let ty = *self
+                .graph
+                .get_value_type(self.graph.value_pool.get(first_results)[i as usize]);
             self.add_value(Value {
                 ty,
                 kind: ValueKind::Project {
@@ -178,9 +178,9 @@ impl<'a> RegionBuilder<'a> {
         self.graph.regions[body_region.0 as usize].owner = theta_val;
         let out_state = State(theta_val);
 
-        let first_result = ValueId(self.graph.values.len() as u32);
+        let first_result = ValueId(self.graph.value_kinds.len() as u32);
         for i in 0..result_count {
-            let ty = self.graph.values[loop_vars[i as usize].0 as usize].ty;
+            let ty = *self.graph.get_value_type(loop_vars[i as usize]);
             self.add_value(Value {
                 ty,
                 kind: ValueKind::Project {
@@ -277,7 +277,7 @@ impl<'a> RegionBuilder<'a> {
 
         let param_types: Vec<TypeRef> = loop_vars
             .iter()
-            .map(|&id| self.graph.values[id.0 as usize].ty)
+            .map(|id| *self.graph.get_value_type(*id))
             .collect();
 
         let (region, condition) = {
@@ -306,9 +306,9 @@ impl<'a> RegionBuilder<'a> {
         self.graph.regions[region.0 as usize].owner = theta_val;
         let out_state = State(theta_val);
 
-        let first_result = ValueId(self.graph.values.len() as u32);
+        let first_result = ValueId(self.graph.value_kinds.len() as u32);
         for i in 0..result_count {
-            let ty = self.graph.values[loop_vars[i as usize].0 as usize].ty;
+            let ty = *self.graph.get_value_type(loop_vars[i as usize]);
             self.add_value(Value {
                 ty,
                 kind: ValueKind::Project {
@@ -342,16 +342,14 @@ impl<'a> RegionBuilder<'a> {
         let region = rb.region_id;
 
         // Create recursion variable params inside the phi region
-        let rv_start = ValueId(rb.graph.values.len() as u32);
+        let rv_start = ValueId(rb.graph.value_kinds.len() as u32);
         for i in 0..rv_count {
-            let id = ValueId(rb.graph.values.len() as u32);
-            rb.graph.values.push(Value {
+            let id = ValueId(rb.graph.value_kinds.len() as u32);
+            rb.graph.value_types.push(TypeRef::Scalar(ScalarType::Void));
+            rb.graph.value_kinds.push(ValueKind::RegionParam {
+                index: i as u32,
                 ty: TypeRef::Scalar(ScalarType::Void),
-                kind: ValueKind::RegionParam {
-                    index: i as u32,
-                    ty: TypeRef::Scalar(ScalarType::Void),
-                    region,
-                },
+                region,
             });
             rb.graph.regions[region.0 as usize].nodes.push(id);
         }
@@ -377,7 +375,7 @@ impl<'a> RegionBuilder<'a> {
         });
         self.graph.regions[region.0 as usize].owner = phi_val;
 
-        let first_result = ValueId(self.graph.values.len() as u32);
+        let first_result = ValueId(self.graph.value_kinds.len() as u32);
         for i in 0..rv_count {
             self.add_value(Value {
                 ty: TypeRef::Scalar(ScalarType::Void),
@@ -434,7 +432,7 @@ impl<'a> RegionBuilder<'a> {
         });
         let out_state = State(call_val);
 
-        let first_res = ValueId(self.graph.values.len() as u32);
+        let first_res = ValueId(self.graph.value_kinds.len() as u32);
         let result_count = self.graph.functions[fn_id.0 as usize].return_types.len() as u16;
         for i in 0..result_count {
             let ty = self.graph.functions[fn_id.0 as usize].return_types[i as usize];
@@ -480,7 +478,7 @@ impl<'a> RegionBuilder<'a> {
         });
         let out_state = State(call_val);
 
-        let first_res = ValueId(self.graph.values.len() as u32);
+        let first_res = ValueId(self.graph.value_kinds.len() as u32);
         let ret = self
             .graph
             .types

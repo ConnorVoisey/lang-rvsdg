@@ -39,7 +39,7 @@ impl RVSDGMod {
         // is a legal source for a later node's state operand.
         let produces_state = |value: ValueId| {
             matches!(
-                self.values[value.0 as usize].kind,
+                self.get_value_kind(value),
                 ValueKind::Load { .. }
                     | ValueKind::Store { .. }
                     | ValueKind::Alloca { .. }
@@ -84,7 +84,7 @@ impl RVSDGMod {
                 // Exhaustive over ValueKind: every variant either names its
                 // state operand or is listed as pure, so adding a variant
                 // forces a decision here.
-                let state: State = match &self.values[user.0 as usize].kind {
+                let state: State = match self.get_value_kind(user) {
                     ValueKind::Load { state, .. }
                     | ValueKind::Store { state, .. }
                     | ValueKind::Alloca { state, .. }
@@ -161,8 +161,8 @@ impl RVSDGMod {
         // state must be SOME region's entry state or a state-producing
         // node. Wrong-region chains through a valid state node pass here;
         // garbage (a Binary, a dangling id) does not.
-        for (index, value) in self.values.iter().enumerate() {
-            if let ValueKind::RegionResult { state, .. } = &value.kind {
+        for (index, value) in self.value_kinds.iter().enumerate() {
+            if let ValueKind::RegionResult { state, .. } = value {
                 let valid =
                     self.regions.iter().any(|r| r.entry_state == *state) || produces_state(state.0);
                 if !valid {
