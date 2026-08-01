@@ -6,9 +6,7 @@ use crate::rvsdg::{
     types::{ScalarType, TypeRef, VOID},
 };
 
-use super::{
-    BranchResult, GammaResult, LoopResult, PhiBody, PhiResult, RegionBuilder, ThetaResult,
-};
+use super::{BranchResult, GammaResult, LoopResult, RegionBuilder, ThetaResult};
 
 impl<'a> RegionBuilder<'a> {
     /// N-way conditional branch. Condition value selects which region executes:
@@ -36,7 +34,8 @@ impl<'a> RegionBuilder<'a> {
             .collect();
 
         for branch in branches {
-            let mut rb = RegionBuilder::new_with_params(self.graph, state, &param_types);
+            let mut rb =
+                RegionBuilder::new_with_params(self.graph, self.module_tables, state, &param_types);
             let res = branch(&mut rb)?;
             let count = res.values.len() as u16;
             match result_count {
@@ -47,8 +46,8 @@ impl<'a> RegionBuilder<'a> {
                 ),
             }
             let results = rb.graph.value_pool.push_slice(&res.values);
-            rb.graph.regions[rb.region_id.0 as usize].results = results;
-            rb.graph.regions[rb.region_id.0 as usize].exit_state = res.state;
+            rb.graph.get_region_mut(rb.region_id).results = results;
+            rb.graph.get_region_mut(rb.region_id).exit_state = res.state;
             branch_regions.push(rb.region_id);
         }
 
@@ -66,13 +65,13 @@ impl<'a> RegionBuilder<'a> {
             },
         });
         for &arm in &branch_regions {
-            self.graph.regions[arm.0 as usize].owner = gamma_val;
+            self.graph.get_region_mut(arm).owner = gamma_val;
         }
         let out_state = State(gamma_val);
 
         let first_result = ValueId(self.graph.value_kinds.len() as u32);
         let first_region = branch_regions[0];
-        let first_results = self.graph.regions[first_region.0 as usize].results;
+        let first_results = self.graph.get_region(first_region).results;
         for i in 0..result_count {
             let ty = *self
                 .graph
@@ -124,13 +123,13 @@ impl<'a> RegionBuilder<'a> {
             },
         });
         for &arm in branch_regions {
-            self.graph.regions[arm.0 as usize].owner = gamma_val;
+            self.graph.get_region_mut(arm).owner = gamma_val;
         }
         let out_state = State(gamma_val);
 
         let first_result = ValueId(self.graph.value_kinds.len() as u32);
         let first_region = branch_regions[0];
-        let first_results = self.graph.regions[first_region.0 as usize].results;
+        let first_results = self.graph.get_region(first_region).results;
         for i in 0..result_count {
             let ty = *self
                 .graph
@@ -175,7 +174,7 @@ impl<'a> RegionBuilder<'a> {
                 region_id: body_region,
             },
         });
-        self.graph.regions[body_region.0 as usize].owner = theta_val;
+        self.graph.get_region_mut(body_region).owner = theta_val;
         let out_state = State(theta_val);
 
         let first_result = ValueId(self.graph.value_kinds.len() as u32);
@@ -281,7 +280,8 @@ impl<'a> RegionBuilder<'a> {
             .collect();
 
         let (region, condition) = {
-            let mut rb = RegionBuilder::new_with_params(self.graph, state, &param_types);
+            let mut rb =
+                RegionBuilder::new_with_params(self.graph, self.module_tables, state, &param_types);
             let res = loop_body(&mut rb)?;
             debug_assert_eq!(
                 res.next_vars.len() as u16,
@@ -289,8 +289,8 @@ impl<'a> RegionBuilder<'a> {
                 "theta body must return the same number of loop vars"
             );
             let results = rb.graph.value_pool.push_slice(&res.next_vars);
-            rb.graph.regions[rb.region_id.0 as usize].results = results;
-            rb.graph.regions[rb.region_id.0 as usize].exit_state = res.next_state;
+            rb.graph.get_region_mut(rb.region_id).results = results;
+            rb.graph.get_region_mut(rb.region_id).exit_state = res.next_state;
             (rb.region_id, res.condition)
         };
 
@@ -303,7 +303,7 @@ impl<'a> RegionBuilder<'a> {
                 region_id: region,
             },
         });
-        self.graph.regions[region.0 as usize].owner = theta_val;
+        self.graph.get_region_mut(region).owner = theta_val;
         let out_state = State(theta_val);
 
         let first_result = ValueId(self.graph.value_kinds.len() as u32);
@@ -325,73 +325,6 @@ impl<'a> RegionBuilder<'a> {
         })
     }
 
-    /// Build a phi node for mutually recursive function definitions.
-    ///
-    /// `rv_count` is the number of recursion variables (one per mutually recursive function).
-    /// The closure receives a `RegionBuilder` whose first `rv_count` params are the recursion
-    /// variables -- handles the body can use to refer to the functions being defined.
-    /// The closure must return `PhiBody` containing the lambda values produced inside.
-    #[inline]
-    pub fn phi(
-        &mut self,
-        state: State,
-        rv_count: u16,
-        body: impl FnOnce(&mut RegionBuilder, &[ValueId]) -> PhiBody,
-    ) -> PhiResult {
-        let mut rb = RegionBuilder::new_empty(self.graph, state);
-        let region = rb.region_id;
-
-        // Create recursion variable params inside the phi region
-        let rv_start = ValueId(rb.graph.value_kinds.len() as u32);
-        for i in 0..rv_count {
-            let id = ValueId(rb.graph.value_kinds.len() as u32);
-            rb.graph.value_types.push(TypeRef::Scalar(ScalarType::Void));
-            rb.graph.value_kinds.push(ValueKind::RegionParam {
-                index: i as u32,
-                ty: TypeRef::Scalar(ScalarType::Void),
-                region,
-            });
-            rb.graph.regions[region.0 as usize].nodes.push(id);
-        }
-
-        let rvs: Vec<ValueId> = (0..rv_count)
-            .map(|i| ValueId(rv_start.0 + i as u32))
-            .collect();
-
-        let phi_body = body(&mut rb, &rvs);
-        debug_assert_eq!(
-            phi_body.values.len() as u16,
-            rv_count,
-            "phi body must return exactly one lambda per recursion variable"
-        );
-        let results = rb.graph.value_pool.push_slice(&phi_body.values);
-        rb.graph.regions[region.0 as usize].results = results;
-        // A phi region only defines lambdas, so it is always pure.
-        rb.graph.regions[region.0 as usize].exit_state = state;
-
-        let phi_val = self.add_value(Value {
-            ty: TypeRef::Scalar(ScalarType::Void),
-            kind: ValueKind::Phi { region, rv_count },
-        });
-        self.graph.regions[region.0 as usize].owner = phi_val;
-
-        let first_result = ValueId(self.graph.value_kinds.len() as u32);
-        for i in 0..rv_count {
-            self.add_value(Value {
-                ty: TypeRef::Scalar(ScalarType::Void),
-                kind: ValueKind::Project {
-                    call: phi_val,
-                    index: i,
-                },
-            });
-        }
-
-        PhiResult {
-            first_result,
-            result_count: rv_count,
-        }
-    }
-
     /// Call a known function with an ABI signature derived from its
     /// declaration. Exact for hand-built graphs and any non-variadic
     /// call; a parser lowering real call sites should use
@@ -401,7 +334,10 @@ impl<'a> RegionBuilder<'a> {
     /// about.
     #[inline]
     pub fn call(&mut self, fn_id: FuncId, state: State, args: &[ValueId]) -> CallResult {
-        let sig = self.graph.declaration_signature(fn_id);
+        let sig =
+            self.module_tables.get_function(fn_id).declared_sig.expect(
+                "multi-return function has no declaration signature; use call_with_signature",
+            );
         self.call_with_signature(fn_id, state, args, sig)
     }
 
@@ -433,9 +369,9 @@ impl<'a> RegionBuilder<'a> {
         let out_state = State(call_val);
 
         let first_res = ValueId(self.graph.value_kinds.len() as u32);
-        let result_count = self.graph.functions[fn_id.0 as usize].return_types.len() as u16;
+        let result_count = self.module_tables.get_function(fn_id).return_types.len() as u16;
         for i in 0..result_count {
-            let ty = self.graph.functions[fn_id.0 as usize].return_types[i as usize];
+            let ty = self.module_tables.get_function(fn_id).return_types[i as usize];
             self.add_value(Value {
                 ty,
                 kind: ValueKind::Project {
@@ -480,9 +416,9 @@ impl<'a> RegionBuilder<'a> {
 
         let first_res = ValueId(self.graph.value_kinds.len() as u32);
         let ret = self
-            .graph
+            .module_tables
             .types
-            .get_fn(self.graph.signatures.get(sig).func_type)
+            .get_fn(self.module_tables.signatures.get(sig).func_type)
             .ret;
         let result_count = u16::from(ret != VOID);
         for i in 0..result_count {

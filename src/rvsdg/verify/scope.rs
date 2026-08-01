@@ -17,7 +17,9 @@
 //!   the body's predicate slot), so it is checked against the body, not
 //!   against the theta node's own region.
 
-use crate::rvsdg::{RVSDGMod, RegionId, ValueId, ValueKind, verify::RVSDGVerificationError};
+use crate::rvsdg::{
+    RegionId, ValueId, ValueKind, function_graph::FunctionGraph, verify::RVSDGVerificationError,
+};
 
 /// Where a value lives, built once over the whole graph. Shared by the
 /// scope and state verifier passes and reused read-only by the census
@@ -33,7 +35,7 @@ pub(crate) enum Owner {
     Param { region: u32 },
 }
 
-impl RVSDGMod {
+impl FunctionGraph {
     /// Build the value-to-region ownership map the scope and state passes
     /// share. A value appearing in more than one region's node/param lists
     /// is reported here; ownership then stays with the FIRST region seen,
@@ -238,8 +240,6 @@ impl RVSDGMod {
                     | ValueKind::GlobalRef(_)
                     | ValueKind::FuncAddr(_)
                     | ValueKind::Fence { .. }
-                    | ValueKind::Lambda { .. }
-                    | ValueKind::Phi { .. }
                     | ValueKind::RegionParam { .. } => {}
                 }
             }

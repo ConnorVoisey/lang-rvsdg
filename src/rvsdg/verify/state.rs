@@ -29,11 +29,14 @@
 //! region's node list, so their owning region is unrepresented. Their
 //! state operand gets the weaker, region-less check at the bottom.
 
-use crate::rvsdg::{RVSDGMod, RegionId, State, ValueId, ValueKind, verify::RVSDGVerificationError};
+use crate::rvsdg::{
+    RegionId, State, ValueId, ValueKind, function_graph::FunctionGraph,
+    verify::RVSDGVerificationError,
+};
 
 use super::scope::Owner;
 
-impl RVSDGMod {
+impl FunctionGraph {
     pub(super) fn verify_state(&self, owner: &[Owner], errs: &mut Vec<RVSDGVerificationError>) {
         // Side-effecting kinds: the node itself is its output state, so it
         // is a legal source for a later node's state operand.
@@ -121,8 +124,6 @@ impl RVSDGMod {
                     | ValueKind::PtrOffset { .. }
                     | ValueKind::Freeze { .. }
                     | ValueKind::Match { .. }
-                    | ValueKind::Lambda { .. }
-                    | ValueKind::Phi { .. }
                     | ValueKind::Project { .. }
                     | ValueKind::RegionParam { .. } => continue,
                 };
@@ -284,14 +285,15 @@ mod tests {
         // Corrupt an arm's exit state to the FUNCTION region's first
         // fence: a state-producing node, but of the wrong region (and
         // not the arm's entry state, which is the second fence).
-        let arm = rvsdg
+        let graph = rvsdg.graphs[0].as_mut().unwrap();
+        let arm = graph
             .regions
             .iter()
             .position(|region| region.params.is_empty() && region.nodes.is_empty())
             .expect("gamma arm region exists");
-        rvsdg.regions[arm].exit_state = first_fence.get().unwrap();
+        graph.regions[arm].exit_state = first_fence.get().unwrap();
 
-        let errs = rvsdg.verify();
+        let errs = graph.verify(&rvsdg.tables);
         assert!(
             errs.iter()
                 .any(|e| matches!(e, RVSDGVerificationError::RegionExitStateInvalid { .. })),
@@ -316,9 +318,10 @@ mod tests {
             })
             .unwrap();
 
-        rvsdg.regions[0].exit_state = State::INVALID;
+        let graph = rvsdg.graphs[0].as_mut().unwrap();
+        graph.regions[0].exit_state = State::INVALID;
 
-        let errs = rvsdg.verify();
+        let errs = graph.verify(&rvsdg.tables);
         assert!(
             errs.iter()
                 .any(|e| matches!(e, RVSDGVerificationError::RegionExitStateUnset(_))),

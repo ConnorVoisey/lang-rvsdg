@@ -1,71 +1,67 @@
-use crate::rvsdg::{
-    RVSDGMod, RegionId, ValueId, ValuesSpan,
-    func::Function,
-    lower_to_llvm::{LLVMBuilderCtx, ValueMapper},
-};
+use crate::rvsdg::{RegionId, ValueId, ValuesSpan, lower_to_llvm::FunctionLowerer};
 use color_eyre::eyre::{bail, eyre};
 use inkwell::{
     IntPredicate,
     values::{BasicValue, BasicValueEnum},
 };
 
-impl RVSDGMod {
+impl<'m, 'a, 'ctx> FunctionLowerer<'m, 'a, 'ctx> {
     #[inline]
-    pub(crate) fn lower_theta<'a, 'ctx>(
-        &self,
-        llvm_builder: &LLVMBuilderCtx<'a, 'ctx>,
-        mapper: &mut ValueMapper<'ctx>,
-        rvsdg_func: &Function,
+    pub(crate) fn lower_theta(
+        &mut self,
         theta_id: ValueId,
         loop_vars: ValuesSpan,
         condition: ValueId,
         region_id: RegionId,
     ) -> color_eyre::Result<Option<BasicValueEnum<'ctx>>> {
-        let input_ids = self.value_pool.get(loop_vars).to_vec();
-        // This lookup is probably isn't required, I could just pass in the function instead,
-        // but this requires keeping track of it
-        let func = mapper.get_fn(rvsdg_func.id).ok_or_else(|| {
+        let graph = self.graph;
+        let input_ids = graph.value_pool.get(loop_vars);
+        let func = self.mod_lower.get_fn(self.func_id).ok_or_else(|| {
             eyre!(
                 "function `{}` was not registered before lowering its theta",
-                rvsdg_func.name
+                self.function().name
             )
         })?;
 
         // Create all basic blocks upfront
-        let entry_bb = llvm_builder
+        let entry_bb = self
             .builder
             .get_insert_block()
             .ok_or_else(|| eyre!("theta lowering started with no current basic block"))?;
-        let loop_bb = llvm_builder.context.append_basic_block(func, "theta.loop");
-        let exit_bb = llvm_builder.context.append_basic_block(func, "theta.exit");
+        let loop_bb = self
+            .mod_lower
+            .context
+            .append_basic_block(func, "theta.loop");
+        let exit_bb = self
+            .mod_lower
+            .context
+            .append_basic_block(func, "theta.exit");
 
-        llvm_builder.builder.build_unconditional_branch(loop_bb)?;
-        llvm_builder.builder.position_at_end(loop_bb);
+        self.builder.build_unconditional_branch(loop_bb)?;
+        self.builder.position_at_end(loop_bb);
 
         // Build phis at top of loop_bb, add initial incoming from entry
         let mut phis = Vec::with_capacity(input_ids.len());
-        for &id in &input_ids {
-            let val = self.expect_value(llvm_builder, mapper, rvsdg_func, id)?;
-            let phi = llvm_builder
-                .builder
-                .build_phi(val.get_type(), "theta.phi")?;
+        for &id in input_ids {
+            let val = self.expect_value(id)?;
+            let phi = self.builder.build_phi(val.get_type(), "theta.phi")?;
             phi.add_incoming(&[(&val as &dyn BasicValue, entry_bb)]);
             phis.push(phi);
         }
 
         // Bind region params to phi outputs (not initial values)
-        let region = self.get_region(region_id);
+        let region = graph.get_region(region_id);
         for (j, phi) in phis.iter().enumerate() {
             let param_id = region.params[j];
-            mapper.set_val(param_id, phi.as_basic_value());
+            self.set_val(param_id, phi.as_basic_value());
         }
 
         // Lower region, get results
-        self.lower_region(llvm_builder, mapper, rvsdg_func, region)?;
-        let result_ids = self.value_pool.get(region.results).to_vec();
+        self.lower_region(region)?;
+        let result_ids = graph.value_pool.get(region.results);
         let mut results: Vec<BasicValueEnum> = Vec::with_capacity(result_ids.len());
-        for &rid in &result_ids {
-            if let Some(value) = self.lowered_result(llvm_builder, mapper, rvsdg_func, rid)? {
+        for &rid in result_ids {
+            if let Some(value) = self.lowered_result(rid)? {
                 results.push(value);
             }
         }
@@ -87,34 +83,29 @@ impl RVSDGMod {
         // or a control/predicate value lowered to a wider int (the paper's
         // 2-valued `r`: 1 = repeat, 0 = exit). `build_conditional_branch`
         // requires an `i1`, so reduce a wider predicate with `!= 0` first.
-        let cond = self.expect_value(llvm_builder, mapper, rvsdg_func, condition)?;
+        let cond = self.expect_value(condition)?;
         let cond_int = cond.into_int_value();
         let repeat = if cond_int.get_type().get_bit_width() == 1 {
             cond_int
         } else {
             let zero = cond_int.get_type().const_int(0, false);
-            llvm_builder.builder.build_int_compare(
-                IntPredicate::NE,
-                cond_int,
-                zero,
-                "theta.repeat",
-            )?
+            self.builder
+                .build_int_compare(IntPredicate::NE, cond_int, zero, "theta.repeat")?
         };
-        let actual_bb = llvm_builder
+        let actual_bb = self
             .builder
             .get_insert_block()
             .ok_or_else(|| eyre!("theta loop body ended with no current basic block"))?;
-        llvm_builder
-            .builder
+        self.builder
             .build_conditional_branch(repeat, loop_bb, exit_bb)?;
 
         // Add back-edge incoming to phis
         for (i, (phi, result)) in phis.iter().zip(results.iter()).enumerate() {
             phi.add_incoming(&[(result as &dyn BasicValue, actual_bb)]);
-            let project_id = self.projection_of(theta_id, i as u16);
-            mapper.set_val(project_id, *result);
+            let project_id = graph.projection_of(theta_id, i as u16);
+            self.set_val(project_id, *result);
         }
-        llvm_builder.builder.position_at_end(exit_bb);
+        self.builder.position_at_end(exit_bb);
 
         Ok(None)
     }

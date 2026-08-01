@@ -215,10 +215,6 @@ pub enum ValueKind {
         state: State,
         args: ValuesSpan,
     },
-    Lambda {
-        region: RegionId,
-        func_id: FuncId,
-    },
     Theta {
         loop_vars: ValuesSpan,
         condition: ValueId,
@@ -233,12 +229,6 @@ pub enum ValueKind {
         state: State,
         /// One region per branch, all must produce the same number/types of results
         regions: RegionsSpan,
-    },
-    Phi {
-        /// The region containing the mutually recursive definitions
-        region: RegionId,
-        /// The recursion variables (function references available inside the phi body)
-        rv_count: u16,
     },
     /// Direct call to a known function. The call site carries its own
     /// interned ABI [`Signature`](crate::rvsdg::func::Signature), same as

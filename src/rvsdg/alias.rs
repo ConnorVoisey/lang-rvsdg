@@ -8,8 +8,10 @@
 //! this pointer point into".
 
 use crate::rvsdg::{
-    FuncId, GlobalId, RVSDGMod, ValueId, ValueKind,
+    FuncId, GlobalId, ValueId, ValueKind,
     constant::{ConstId, ConstantKind},
+    function_graph::FunctionGraph,
+    module_tables::ModuleTables,
     types::TypeRef,
     value::ConstValue,
 };
@@ -68,12 +70,12 @@ impl ResolvedAddress {
     }
 }
 
-impl RVSDGMod {
+impl FunctionGraph {
     /// Resolve an address to its base object and constant index path by
     /// walking through `PtrOffset` bases, casts, freezes, and
     /// constant-pool address expressions. Steps are collected outermost
     /// first (the order they would appear in nested source expressions).
-    pub fn resolve_address(&self, addr: ValueId) -> ResolvedAddress {
+    pub fn resolve_address(&self, module_tables: &ModuleTables, addr: ValueId) -> ResolvedAddress {
         let mut steps: Vec<ConstGepStep> = Vec::new();
         let mut all_const = true;
         let mut cursor = addr;
@@ -124,7 +126,7 @@ impl RVSDGMod {
                     return self.finish(BaseObject::Param(cursor), steps, all_const);
                 }
                 ValueKind::ConstPoolRef(id) => {
-                    return self.resolve_const_address(*id, steps, all_const);
+                    return self.resolve_const_address(module_tables, *id, steps, all_const);
                 }
                 _ => return ResolvedAddress::unknown(cursor),
             }
@@ -135,13 +137,14 @@ impl RVSDGMod {
     /// expressions in initialisers and interned constant GEPs).
     fn resolve_const_address(
         &self,
+        module_tables: &ModuleTables,
         id: ConstId,
         mut steps: Vec<ConstGepStep>,
         mut all_const: bool,
     ) -> ResolvedAddress {
         let mut cursor = id;
         loop {
-            let def = self.constants.get(cursor);
+            let def = module_tables.constants.get(cursor);
             match &def.kind {
                 ConstantKind::GlobalAddr(global) => {
                     return self.finish(BaseObject::Global(*global), steps, all_const);
@@ -156,8 +159,8 @@ impl RVSDGMod {
                     ..
                 } => {
                     let mut path = Vec::new();
-                    for &index in self.constants.id_pool.get(*indices) {
-                        match self.constants.get(index).kind {
+                    for &index in module_tables.constants.id_pool.get(*indices) {
+                        match module_tables.constants.get(index).kind {
                             ConstantKind::Scalar(ConstValue::Int(k)) => path.push(k),
                             _ => {
                                 all_const = false;
@@ -215,11 +218,14 @@ impl RVSDGMod {
     ///
     /// Same base with runtime offsets, differing GEP shapes, or any
     /// Param/Unknown provenance stays `true`.
-    pub fn may_alias(&self, a: ValueId, b: ValueId) -> bool {
+    pub fn may_alias(&self, module_tables: &ModuleTables, a: ValueId, b: ValueId) -> bool {
         if a == b {
             return true;
         }
-        may_alias_resolved(&self.resolve_address(a), &self.resolve_address(b))
+        may_alias_resolved(
+            &self.resolve_address(module_tables, a),
+            &self.resolve_address(module_tables, b),
+        )
     }
 }
 

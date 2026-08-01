@@ -1,4 +1,6 @@
-use crate::rvsdg::{GlobalId, Linkage, RVSDGMod, Visibility, constant::ConstId, types::TypeRef};
+use crate::rvsdg::{
+    GlobalId, Linkage, Visibility, constant::ConstId, module_tables::ModuleTables, types::TypeRef,
+};
 
 // TODO: `name` and `section` are heap-allocated Strings.
 // Consider string interning if profiling shows this is a bottleneck.
@@ -106,7 +108,7 @@ impl GlobalDef {
     }
 }
 
-impl RVSDGMod {
+impl ModuleTables {
     /// Register a global. Takes the complete definition -- there are no
     /// hidden defaults here, which is what kept alignment/section/
     /// visibility silently unpopulated for months under the old

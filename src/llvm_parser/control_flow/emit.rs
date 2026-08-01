@@ -48,8 +48,8 @@ use crate::{
         scc::SccTreeNodeId,
     },
     rvsdg::{
-        ConstValue, MatchArm, RVSDGMod, RegionId, State, ValueId, builder::RegionBuilder,
-        func::FnResult, types::TypeRef,
+        ConstValue, MatchArm, RegionId, State, ValueId, builder::RegionBuilder, func::FnResult,
+        function_graph::FunctionGraph, module_tables::ModuleTables, types::TypeRef,
     },
 };
 
@@ -106,7 +106,7 @@ pub(in crate::llvm_parser) fn emit_function_body(
                 // Every path diverges: the function result is unreachable.
                 let ret_ty = lowerer
                     .rb
-                    .graph
+                    .module_tables
                     .types
                     .convert_type_ref(&fn_ctx.func.return_type, fn_ctx.llvm_mod)?;
                 lowerer.rb.constant(ret_ty, ConstValue::Poison)
@@ -328,7 +328,11 @@ impl<'m> Emitter<'m> {
             arm_regions.push(region_id);
             lowerer.scopes.push_frame(region_id);
             let arm_exit = {
-                let mut arm_rb = RegionBuilder::over(&mut *lowerer.rb.graph, region_id);
+                let mut arm_rb = RegionBuilder::over(
+                    &mut *lowerer.rb.graph,
+                    &mut *lowerer.rb.module_tables,
+                    region_id,
+                );
                 let mut arm_lowerer =
                     RegionLowerer::new(&mut arm_rb, &mut *lowerer.scopes, self.fn_ctx);
                 seed_payloads[index].apply(self, &mut arm_lowerer)?;
@@ -417,7 +421,8 @@ impl<'m> Emitter<'m> {
         // set its results.
         for (index, frame) in arm_frames.iter().enumerate() {
             let region_id = arm_regions[index];
-            let graph: &mut RVSDGMod = lowerer.rb.graph;
+            let graph: &mut FunctionGraph = lowerer.rb.graph;
+            let module_tables: &mut ModuleTables = lowerer.rb.module_tables;
             let mut params: Vec<ValueId> = Vec::with_capacity(input_symbols.len());
             for (i, &symbol) in input_symbols.iter().enumerate() {
                 let existing = frame
@@ -440,7 +445,7 @@ impl<'m> Emitter<'m> {
                 } else if let Some(&i) = input_index.get(&symbol) {
                     params[i as usize]
                 } else {
-                    RegionBuilder::over(graph, region_id)
+                    RegionBuilder::over(graph, module_tables, region_id)
                         .constant(output_types[o], ConstValue::Poison)
                 };
                 results.push(value);
@@ -553,7 +558,11 @@ impl<'m> Emitter<'m> {
         let body_region_id = lowerer.rb.add_region(state);
         lowerer.scopes.push_frame(body_region_id);
         let (condition, body_exit) = {
-            let mut body_rb = RegionBuilder::over(&mut *lowerer.rb.graph, body_region_id);
+            let mut body_rb = RegionBuilder::over(
+                &mut *lowerer.rb.graph,
+                &mut *lowerer.rb.module_tables,
+                body_region_id,
+            );
             let mut body_lowerer =
                 RegionLowerer::new(&mut body_rb, &mut *lowerer.scopes, self.fn_ctx);
             let body_region = EmitRegion {

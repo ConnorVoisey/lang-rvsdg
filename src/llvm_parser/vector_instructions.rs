@@ -11,7 +11,7 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
         let llvm_ty = inst.get_type(&self.fn_ctx.llvm_mod.types);
         let element_type = self
             .rb
-            .graph
+            .module_tables
             .types
             .convert_type_ref(&llvm_ty, self.fn_ctx.llvm_mod)?;
         let val = self.rb.extract_lane(vector, index, element_type);
@@ -29,7 +29,7 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
         let llvm_ty = inst.get_type(&self.fn_ctx.llvm_mod.types);
         let vector_type = self
             .rb
-            .graph
+            .module_tables
             .types
             .convert_type_ref(&llvm_ty, self.fn_ctx.llvm_mod)?;
         let val = self.rb.insert_lane(vector, index, element, vector_type);

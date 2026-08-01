@@ -58,14 +58,23 @@ pub struct GraphShape {
 
 impl GraphShape {
     pub fn measure(module: &RVSDGMod) -> Self {
-        Self {
-            values: module.value_kinds.len(),
-            regions: module.regions.len(),
-            value_pool_entries: module.value_pool.len(),
-            region_pool_entries: module.region_pool.len(),
-            u32_pool_entries: module.u32_pool.len(),
-            match_arm_pool_entries: module.match_arm_pool.len(),
+        let mut shape = Self {
+            values: 0,
+            regions: 0,
+            value_pool_entries: 0,
+            region_pool_entries: 0,
+            u32_pool_entries: 0,
+            match_arm_pool_entries: 0,
+        };
+        for graph in module.graphs.iter().flatten() {
+            shape.values += graph.value_kinds.len();
+            shape.regions += graph.regions.len();
+            shape.value_pool_entries += graph.value_pool.len();
+            shape.region_pool_entries += graph.region_pool.len();
+            shape.u32_pool_entries += graph.u32_pool.len();
+            shape.match_arm_pool_entries += graph.match_arm_pool.len();
         }
+        shape
     }
 }
 

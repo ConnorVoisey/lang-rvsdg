@@ -1,8 +1,15 @@
-use crate::rvsdg::{RVSDGMod, RegionId, ValueId, ValueKind, verify::RVSDGVerificationError};
+use crate::rvsdg::{
+    RegionId, ValueId, ValueKind, function_graph::FunctionGraph, module_tables::ModuleTables,
+    verify::RVSDGVerificationError,
+};
 
-impl RVSDGMod {
-    pub(super) fn verify_ids(&self, errs: &mut Vec<RVSDGVerificationError>) {
-        self.verify_value_ids(errs);
+impl FunctionGraph {
+    pub(super) fn verify_ids(
+        &self,
+        module_tables: &ModuleTables,
+        errs: &mut Vec<RVSDGVerificationError>,
+    ) {
+        self.verify_value_ids(module_tables, errs);
     }
 
     #[inline(always)]
@@ -19,23 +26,27 @@ impl RVSDGMod {
         }
     }
 
-    fn verify_value_ids(&self, errs: &mut Vec<RVSDGVerificationError>) {
+    fn verify_value_ids(
+        &self,
+        module_tables: &ModuleTables,
+        errs: &mut Vec<RVSDGVerificationError>,
+    ) {
         for val in self.value_kinds.iter() {
             match *val {
                 // Leaf values reference nothing.
                 ValueKind::Const(_) | ValueKind::RegionParam { .. } => (),
                 ValueKind::ConstPoolRef(const_id) => {
-                    if (const_id.0 as usize) >= self.constants.entries.len() {
+                    if (const_id.0 as usize) >= module_tables.constants.entries.len() {
                         errs.push(RVSDGVerificationError::InvalidConstId(const_id));
                     }
                 }
                 ValueKind::GlobalRef(global_id) => {
-                    if (global_id.0 as usize) >= self.globals.len() {
+                    if (global_id.0 as usize) >= module_tables.globals.len() {
                         errs.push(RVSDGVerificationError::InvalidGlobalId(global_id));
                     }
                 }
                 ValueKind::FuncAddr(func_id) => {
-                    if (func_id.0 as usize) >= self.functions.len() {
+                    if (func_id.0 as usize) >= module_tables.functions.len() {
                         errs.push(RVSDGVerificationError::InvalidFnId(func_id));
                     }
                 }
@@ -163,12 +174,6 @@ impl RVSDGMod {
                         self.valid_val(errs, *val_id);
                     }
                 }
-                ValueKind::Lambda { region, func_id } => {
-                    self.valid_region(errs, region);
-                    if (func_id.0 as usize) >= self.functions.len() {
-                        errs.push(RVSDGVerificationError::InvalidFnId(func_id));
-                    }
-                }
                 ValueKind::Theta {
                     loop_vars,
                     condition,
@@ -197,9 +202,6 @@ impl RVSDGMod {
                         self.valid_region(errs, *region_id);
                     }
                 }
-                ValueKind::Phi { region, .. } => {
-                    self.valid_region(errs, region);
-                }
                 ValueKind::Call {
                     state,
                     fn_id,
@@ -207,7 +209,7 @@ impl RVSDGMod {
                     args,
                 } => {
                     self.valid_val(errs, state.0);
-                    if (fn_id.0 as usize) >= self.functions.len() {
+                    if (fn_id.0 as usize) >= module_tables.functions.len() {
                         errs.push(RVSDGVerificationError::InvalidFnId(fn_id));
                     }
                     for val_id in self.value_pool.get(args).iter() {

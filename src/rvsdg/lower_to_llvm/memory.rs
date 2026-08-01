@@ -1,9 +1,5 @@
 use crate::rvsdg::{
-    MemoryOrdering, RVSDGMod, ValueId,
-    func::Function,
-    lower_to_llvm::{LLVMBuilderCtx, ValueMapper},
-    ops::AtomicRMWOp,
-    types::TypeRef,
+    MemoryOrdering, ValueId, lower_to_llvm::FunctionLowerer, ops::AtomicRMWOp, types::TypeRef,
 };
 use color_eyre::eyre::{bail, eyre};
 use inkwell::{
@@ -11,25 +7,21 @@ use inkwell::{
     values::{BasicValue, BasicValueEnum},
 };
 
-impl RVSDGMod {
+impl<'m, 'a, 'ctx> FunctionLowerer<'m, 'a, 'ctx> {
     #[inline]
-    pub(crate) fn lower_load<'a, 'ctx>(
-        &self,
-        llvm_builder: &LLVMBuilderCtx<'a, 'ctx>,
-        mapper: &mut ValueMapper<'ctx>,
-        rvsdg_func: &Function,
+    pub(crate) fn lower_load(
+        &mut self,
         addr: ValueId,
         loaded_type: TypeRef,
         align: Option<u32>,
         volatile: bool,
         value_id: ValueId,
     ) -> color_eyre::Result<()> {
-        let ptr = self.expect_value(llvm_builder, mapper, rvsdg_func, addr)?;
-        let pointee_type = self.type_to_basic_type_llvm(llvm_builder.context, loaded_type)?;
-        let load =
-            llvm_builder
-                .builder
-                .build_load(pointee_type, ptr.into_pointer_value(), "load")?;
+        let ptr = self.expect_value(addr)?;
+        let pointee_type = self.mod_lower.type_to_basic_type_llvm(loaded_type)?;
+        let load = self
+            .builder
+            .build_load(pointee_type, ptr.into_pointer_value(), "load")?;
         // The returned value IS the load instruction; take its instruction
         // handle to set alignment/volatility.
         let inst = load
@@ -44,26 +36,23 @@ impl RVSDGMod {
                 .map_err(|e| eyre!("could not mark load volatile: {e}"))?;
         }
         // Load is a multi-output node (state + value). Write value to Project slot.
-        let project_id = self.projection_of(value_id, 0);
-        mapper.set_val(project_id, load);
+        let project_id = self.graph.projection_of(value_id, 0);
+        self.set_val(project_id, load);
 
         Ok(())
     }
 
     #[inline]
-    pub(crate) fn lower_store<'a, 'ctx>(
-        &self,
-        llvm_builder: &LLVMBuilderCtx<'a, 'ctx>,
-        mapper: &mut ValueMapper<'ctx>,
-        rvsdg_func: &Function,
+    pub(crate) fn lower_store(
+        &mut self,
         addr: ValueId,
         value: ValueId,
         align: Option<u32>,
         volatile: bool,
     ) -> color_eyre::Result<()> {
-        let ptr = self.expect_value(llvm_builder, mapper, rvsdg_func, addr)?;
-        let llvm_val = self.expect_value(llvm_builder, mapper, rvsdg_func, value)?;
-        let store = llvm_builder
+        let ptr = self.expect_value(addr)?;
+        let llvm_val = self.expect_value(value)?;
+        let store = self
             .builder
             .build_store(ptr.into_pointer_value(), llvm_val)?;
 
@@ -81,23 +70,18 @@ impl RVSDGMod {
         Ok(())
     }
     #[inline]
-    pub(crate) fn lower_alloca<'a, 'ctx>(
-        &self,
-        llvm_builder: &LLVMBuilderCtx<'a, 'ctx>,
-        mapper: &mut ValueMapper<'ctx>,
-        rvsdg_func: &Function,
+    pub(crate) fn lower_alloca(
+        &mut self,
         value_id: ValueId,
         elem_type: TypeRef,
         count: ValueId,
         align: Option<u32>,
     ) -> color_eyre::Result<()> {
-        let llvm_type = self.type_to_basic_type_llvm(llvm_builder.context, elem_type)?;
-        let count_val = self.expect_value(llvm_builder, mapper, rvsdg_func, count)?;
-        let alloca = llvm_builder.builder.build_array_alloca(
-            llvm_type,
-            count_val.into_int_value(),
-            "alloca",
-        )?;
+        let llvm_type = self.mod_lower.type_to_basic_type_llvm(elem_type)?;
+        let count_val = self.expect_value(count)?;
+        let alloca =
+            self.builder
+                .build_array_alloca(llvm_type, count_val.into_int_value(), "alloca")?;
         // The slot's alignment must be at least what the initialising
         // stores/memcpys claim (they carry the input's alignment), or
         // the backend's aligned-SSE expansions fault at runtime.
@@ -109,16 +93,14 @@ impl RVSDGMod {
                 .map_err(|e| eyre!("failed to set alloca alignment: {e}"))?;
         }
         let ptr_val = BasicValueEnum::PointerValue(alloca);
-        let project_id = self.projection_of(value_id, 0);
-        mapper.set_val(project_id, ptr_val);
+        let project_id = self.graph.projection_of(value_id, 0);
+        self.set_val(project_id, ptr_val);
         Ok(())
     }
 
-    pub(crate) fn lower_compare_and_swap<'a, 'ctx>(
-        &self,
-        llvm_builder: &LLVMBuilderCtx<'a, 'ctx>,
-        mapper: &mut ValueMapper<'ctx>,
-        rvsdg_func: &Function,
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn lower_compare_and_swap(
+        &mut self,
         value_id: ValueId,
         addr: ValueId,
         expected: ValueId,
@@ -127,11 +109,11 @@ impl RVSDGMod {
         failure_ordering: MemoryOrdering,
         volatile: bool,
     ) -> color_eyre::Result<()> {
-        let ptr = self.expect_value(llvm_builder, mapper, rvsdg_func, addr)?;
-        let cmp = self.expect_value(llvm_builder, mapper, rvsdg_func, expected)?;
-        let new = self.expect_value(llvm_builder, mapper, rvsdg_func, desired)?;
+        let ptr = self.expect_value(addr)?;
+        let cmp = self.expect_value(expected)?;
+        let new = self.expect_value(desired)?;
 
-        let result = llvm_builder.builder.build_cmpxchg(
+        let result = self.builder.build_cmpxchg(
             ptr.into_pointer_value(),
             cmp,
             new,
@@ -147,27 +129,20 @@ impl RVSDGMod {
         }
 
         // cmpxchg returns {T, i1}: old value and success flag
-        let old_val = llvm_builder
-            .builder
-            .build_extract_value(result, 0, "cas.old")?;
-        let success = llvm_builder
-            .builder
-            .build_extract_value(result, 1, "cas.ok")?;
+        let old_val = self.builder.build_extract_value(result, 0, "cas.old")?;
+        let success = self.builder.build_extract_value(result, 1, "cas.ok")?;
 
-        let project_0 = self.projection_of(value_id, 0);
-        let project_1 = self.projection_of(value_id, 1);
-        mapper.set_val(project_0, old_val);
-        mapper.set_val(project_1, success);
+        let project_0 = self.graph.projection_of(value_id, 0);
+        let project_1 = self.graph.projection_of(value_id, 1);
+        self.set_val(project_0, old_val);
+        self.set_val(project_1, success);
         Ok(())
     }
 
     #[inline]
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn lower_atomic_load<'a, 'ctx>(
-        &self,
-        llvm_builder: &LLVMBuilderCtx<'a, 'ctx>,
-        mapper: &mut ValueMapper<'ctx>,
-        rvsdg_func: &Function,
+    pub(crate) fn lower_atomic_load(
+        &mut self,
         addr: ValueId,
         loaded_type: TypeRef,
         ordering: MemoryOrdering,
@@ -175,13 +150,11 @@ impl RVSDGMod {
         volatile: bool,
         value_id: ValueId,
     ) -> color_eyre::Result<()> {
-        let ptr = self.expect_value(llvm_builder, mapper, rvsdg_func, addr)?;
-        let pointee_type = self.type_to_basic_type_llvm(llvm_builder.context, loaded_type)?;
-        let load = llvm_builder.builder.build_load(
-            pointee_type,
-            ptr.into_pointer_value(),
-            "atomic.load",
-        )?;
+        let ptr = self.expect_value(addr)?;
+        let pointee_type = self.mod_lower.type_to_basic_type_llvm(loaded_type)?;
+        let load =
+            self.builder
+                .build_load(pointee_type, ptr.into_pointer_value(), "atomic.load")?;
         // The returned value IS the load instruction; take its instruction
         // handle to set the atomic attributes.
         let inst = load
@@ -198,27 +171,24 @@ impl RVSDGMod {
         inst.set_atomic_ordering(ordering_to_llvm(ordering))
             .map_err(|e| eyre!("invalid atomic load ordering {ordering:?}: {e}"))?;
 
-        let project_id = self.projection_of(value_id, 0);
-        mapper.set_val(project_id, load);
+        let project_id = self.graph.projection_of(value_id, 0);
+        self.set_val(project_id, load);
         Ok(())
     }
 
     #[inline]
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn lower_atomic_store<'a, 'ctx>(
-        &self,
-        llvm_builder: &LLVMBuilderCtx<'a, 'ctx>,
-        mapper: &mut ValueMapper<'ctx>,
-        rvsdg_func: &Function,
+    pub(crate) fn lower_atomic_store(
+        &mut self,
         addr: ValueId,
         value: ValueId,
         ordering: MemoryOrdering,
         align: Option<u32>,
         volatile: bool,
     ) -> color_eyre::Result<()> {
-        let ptr = self.expect_value(llvm_builder, mapper, rvsdg_func, addr)?;
-        let llvm_val = self.expect_value(llvm_builder, mapper, rvsdg_func, value)?;
-        let store = llvm_builder
+        let ptr = self.expect_value(addr)?;
+        let llvm_val = self.expect_value(value)?;
+        let store = self
             .builder
             .build_store(ptr.into_pointer_value(), llvm_val)?;
 
@@ -240,11 +210,8 @@ impl RVSDGMod {
 
     #[inline]
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn lower_atomic_read_modify_write<'a, 'ctx>(
-        &self,
-        llvm_builder: &LLVMBuilderCtx<'a, 'ctx>,
-        mapper: &mut ValueMapper<'ctx>,
-        rvsdg_func: &Function,
+    pub(crate) fn lower_atomic_read_modify_write(
+        &mut self,
         value_id: ValueId,
         addr: ValueId,
         value: ValueId,
@@ -252,8 +219,8 @@ impl RVSDGMod {
         ordering: MemoryOrdering,
         volatile: bool,
     ) -> color_eyre::Result<()> {
-        let ptr = self.expect_value(llvm_builder, mapper, rvsdg_func, addr)?;
-        let operand = self.expect_value(llvm_builder, mapper, rvsdg_func, value)?;
+        let ptr = self.expect_value(addr)?;
+        let operand = self.expect_value(value)?;
         // inkwell's build_atomicrmw only accepts integer operands (its own
         // TODO acknowledges the gap), so float RMW (atomicrmw fadd/fsub/
         // fmax/fmin, common in parallel numeric code) and pointer-operand
@@ -270,7 +237,7 @@ impl RVSDGMod {
                  supported by inkwell's builder"
             );
         };
-        let old_value = llvm_builder.builder.build_atomicrmw(
+        let old_value = self.builder.build_atomicrmw(
             atomic_read_modify_write_op_to_llvm(op)?,
             ptr.into_pointer_value(),
             int_operand,
@@ -284,8 +251,8 @@ impl RVSDGMod {
                 .map_err(|e| eyre!("could not mark atomic read-modify-write volatile: {e}"))?;
         }
 
-        let project_id = self.projection_of(value_id, 0);
-        mapper.set_val(project_id, BasicValueEnum::IntValue(old_value));
+        let project_id = self.graph.projection_of(value_id, 0);
+        self.set_val(project_id, BasicValueEnum::IntValue(old_value));
         Ok(())
     }
 }
@@ -338,7 +305,7 @@ mod tests {
     };
 
     fn make_ptr_ty(rvsdg: &mut RVSDGMod, pointee: TypeRef) -> TypeRef {
-        let id = rvsdg.types.intern_ptr(PtrType {
+        let id = rvsdg.tables.types.intern_ptr(PtrType {
             pointee: Some(pointee),
             alias_set: None,
             no_escape: false,
@@ -352,8 +319,8 @@ mod tests {
     fn store_load_global() {
         // Mutable global initialized to 0, store 42, load it back
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
-        let init = rvsdg.constants.scalar(I32, ConstValue::Int(0));
-        let global_id = rvsdg.define_global_plain(
+        let init = rvsdg.tables.constants.scalar(I32, ConstValue::Int(0));
+        let global_id = rvsdg.tables.define_global_plain(
             String::from("val"),
             I32,
             GlobalInit::Init(init),
@@ -381,8 +348,8 @@ mod tests {
     fn store_overwrite_global() {
         // Store 10, then overwrite with 99, load should return 99
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
-        let init = rvsdg.constants.scalar(I32, ConstValue::Int(0));
-        let global_id = rvsdg.define_global_plain(
+        let init = rvsdg.tables.constants.scalar(I32, ConstValue::Int(0));
+        let global_id = rvsdg.tables.define_global_plain(
             String::from("val"),
             I32,
             GlobalInit::Init(init),
@@ -412,15 +379,15 @@ mod tests {
     fn store_load_two_globals() {
         // Two globals, store different values, load and add them
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
-        let init = rvsdg.constants.scalar(I32, ConstValue::Int(0));
-        let g_a = rvsdg.define_global_plain(
+        let init = rvsdg.tables.constants.scalar(I32, ConstValue::Int(0));
+        let g_a = rvsdg.tables.define_global_plain(
             String::from("a"),
             I32,
             GlobalInit::Init(init),
             false,
             Linkage::Internal,
         );
-        let g_b = rvsdg.define_global_plain(
+        let g_b = rvsdg.tables.define_global_plain(
             String::from("b"),
             I32,
             GlobalInit::Init(init),
@@ -574,8 +541,8 @@ mod tests {
         // Mutable global, increment it in a loop
         // g = 0; for i in 0..10 { g = g + 3 } => g = 30
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
-        let init = rvsdg.constants.scalar(I32, ConstValue::Int(0));
-        let global_id = rvsdg.define_global_plain(
+        let init = rvsdg.tables.constants.scalar(I32, ConstValue::Int(0));
+        let global_id = rvsdg.tables.define_global_plain(
             String::from("counter"),
             I32,
             GlobalInit::Init(init),
@@ -624,17 +591,17 @@ mod tests {
         // Global [4 x i32] = [10, 20, 30, 40], GEP to element 2, load => 30
         use crate::rvsdg::types::ArrayType;
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
-        let arr_ty_id = rvsdg.types.intern_array(ArrayType {
+        let arr_ty_id = rvsdg.tables.types.intern_array(ArrayType {
             element: I32,
             len: 4,
         });
         let arr_ty = TypeRef::Array(arr_ty_id);
         let elems: Vec<_> = [10, 20, 30, 40]
             .iter()
-            .map(|&v| rvsdg.constants.scalar(I32, ConstValue::Int(v)))
+            .map(|&v| rvsdg.tables.constants.scalar(I32, ConstValue::Int(v)))
             .collect();
-        let agg_id = rvsdg.constants.aggregate(arr_ty, &elems);
-        let global_id = rvsdg.define_global_plain(
+        let agg_id = rvsdg.tables.constants.aggregate(arr_ty, &elems);
+        let global_id = rvsdg.tables.define_global_plain(
             String::from("arr"),
             arr_ty,
             GlobalInit::Init(agg_id),
@@ -666,7 +633,7 @@ mod tests {
         // Alloca [3 x i32], store values via GEP, load them back and sum
         use crate::rvsdg::types::ArrayType;
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
-        let arr_ty_id = rvsdg.types.intern_array(ArrayType {
+        let arr_ty_id = rvsdg.tables.types.intern_array(ArrayType {
             element: I32,
             len: 3,
         });
@@ -722,16 +689,16 @@ mod tests {
         // Global [5 x i32] = [1, 2, 3, 4, 5], sum all elements via GEP in a loop => 15
         use crate::rvsdg::types::ArrayType;
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
-        let arr_ty_id = rvsdg.types.intern_array(ArrayType {
+        let arr_ty_id = rvsdg.tables.types.intern_array(ArrayType {
             element: I32,
             len: 5,
         });
         let arr_ty = TypeRef::Array(arr_ty_id);
         let elems: Vec<_> = (1..=5)
-            .map(|v| rvsdg.constants.scalar(I32, ConstValue::Int(v)))
+            .map(|v| rvsdg.tables.constants.scalar(I32, ConstValue::Int(v)))
             .collect();
-        let agg_id = rvsdg.constants.aggregate(arr_ty, &elems);
-        let global_id = rvsdg.define_global_plain(
+        let agg_id = rvsdg.tables.constants.aggregate(arr_ty, &elems);
+        let global_id = rvsdg.tables.define_global_plain(
             String::from("arr"),
             arr_ty,
             GlobalInit::Init(agg_id),
@@ -791,16 +758,16 @@ mod tests {
         // 1 + 99 + 3 = 103
         use crate::rvsdg::types::ArrayType;
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
-        let arr_ty_id = rvsdg.types.intern_array(ArrayType {
+        let arr_ty_id = rvsdg.tables.types.intern_array(ArrayType {
             element: I32,
             len: 3,
         });
         let arr_ty = TypeRef::Array(arr_ty_id);
         let elems: Vec<_> = [1, 2, 3]
             .iter()
-            .map(|&v| rvsdg.constants.scalar(I32, ConstValue::Int(v)))
+            .map(|&v| rvsdg.tables.constants.scalar(I32, ConstValue::Int(v)))
             .collect();
-        let agg_id = rvsdg.constants.aggregate(arr_ty, &elems);
+        let agg_id = rvsdg.tables.constants.aggregate(arr_ty, &elems);
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg
             .define_fn(func_id, |rb, state| {
@@ -826,9 +793,9 @@ mod tests {
         // Anonymous struct {i32, i32} = {10, 20}, replace field 0 with 50
         // Extract field 0 + field 1 = 50 + 20 = 70
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
-        let e0 = rvsdg.constants.scalar(I32, ConstValue::Int(10));
-        let e1 = rvsdg.constants.scalar(I32, ConstValue::Int(20));
-        let agg_id = rvsdg.constants.aggregate(TypeRef::State, &[e0, e1]);
+        let e0 = rvsdg.tables.constants.scalar(I32, ConstValue::Int(10));
+        let e1 = rvsdg.tables.constants.scalar(I32, ConstValue::Int(20));
+        let agg_id = rvsdg.tables.constants.aggregate(TypeRef::State, &[e0, e1]);
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg
             .define_fn(func_id, |rb, state| {
@@ -851,10 +818,13 @@ mod tests {
     fn insert_field_preserves_other_fields() {
         // {100, 200, 300}, insert 999 at index 2, verify index 0 and 1 unchanged
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
-        let e0 = rvsdg.constants.scalar(I32, ConstValue::Int(100));
-        let e1 = rvsdg.constants.scalar(I32, ConstValue::Int(200));
-        let e2 = rvsdg.constants.scalar(I32, ConstValue::Int(300));
-        let agg_id = rvsdg.constants.aggregate(TypeRef::State, &[e0, e1, e2]);
+        let e0 = rvsdg.tables.constants.scalar(I32, ConstValue::Int(100));
+        let e1 = rvsdg.tables.constants.scalar(I32, ConstValue::Int(200));
+        let e2 = rvsdg.tables.constants.scalar(I32, ConstValue::Int(300));
+        let agg_id = rvsdg
+            .tables
+            .constants
+            .aggregate(TypeRef::State, &[e0, e1, e2]);
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg
             .define_fn(func_id, |rb, state| {
@@ -879,9 +849,9 @@ mod tests {
         // Start with {0, 0}, insert 10 at field 0, then insert 20 at field 1
         // Extract and sum => 30
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
-        let e0 = rvsdg.constants.scalar(I32, ConstValue::Int(0));
-        let e1 = rvsdg.constants.scalar(I32, ConstValue::Int(0));
-        let agg_id = rvsdg.constants.aggregate(TypeRef::State, &[e0, e1]);
+        let e0 = rvsdg.tables.constants.scalar(I32, ConstValue::Int(0));
+        let e1 = rvsdg.tables.constants.scalar(I32, ConstValue::Int(0));
+        let agg_id = rvsdg.tables.constants.aggregate(TypeRef::State, &[e0, e1]);
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg
             .define_fn(func_id, |rb, state| {

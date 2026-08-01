@@ -369,7 +369,7 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
         let llvm_ty = inst.get_type(&self.fn_ctx.llvm_mod.types);
         let ty = self
             .rb
-            .graph
+            .module_tables
             .types
             .convert_type_ref(&llvm_ty, self.fn_ctx.llvm_mod)?;
         let dest = inst.get_result();
@@ -386,7 +386,7 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
         let llvm_ty = inst.get_type(&self.fn_ctx.llvm_mod.types);
         let ty = self
             .rb
-            .graph
+            .module_tables
             .types
             .convert_type_ref(&llvm_ty, self.fn_ctx.llvm_mod)?;
         let dest = inst.get_result();
@@ -403,7 +403,7 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
         let llvm_ty = inst.get_type(&self.fn_ctx.llvm_mod.types);
         let ty = self
             .rb
-            .graph
+            .module_tables
             .types
             .convert_type_ref(&llvm_ty, self.fn_ctx.llvm_mod)?;
         let dest = inst.get_result();
@@ -442,7 +442,7 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
         let llvm_ty = inst.get_type(&self.fn_ctx.llvm_mod.types);
         let field_type = self
             .rb
-            .graph
+            .module_tables
             .types
             .convert_type_ref(&llvm_ty, self.fn_ctx.llvm_mod)?;
         let val = self.rb.extract_field(aggregate, &inst.indices, field_type);
@@ -459,7 +459,7 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
         let llvm_ty = inst.get_type(&self.fn_ctx.llvm_mod.types);
         let aggregate_type = self
             .rb
-            .graph
+            .module_tables
             .types
             .convert_type_ref(&llvm_ty, self.fn_ctx.llvm_mod)?;
         let val = self
@@ -476,7 +476,7 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
         let base = self.operand(&inst.address)?;
         let base_type = self
             .rb
-            .graph
+            .module_tables
             .types
             .convert_type_ref(&inst.source_element_type, self.fn_ctx.llvm_mod)?;
         let indices = inst
@@ -487,7 +487,7 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
         let llvm_result_ty = inst.get_type(&self.fn_ctx.llvm_mod.types);
         let result_type = self
             .rb
-            .graph
+            .module_tables
             .types
             .convert_type_ref(&llvm_result_ty, self.fn_ctx.llvm_mod)?;
         let val = self
@@ -523,7 +523,7 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
         let addr = self.operand(&inst.address)?;
         let loaded_type = self
             .rb
-            .graph
+            .module_tables
             .types
             .convert_type_ref(&inst.loaded_ty, self.fn_ctx.llvm_mod)?;
         let align = (inst.alignment != 0).then_some(inst.alignment);
@@ -573,13 +573,13 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
         let count = self.operand(&inst.num_elements)?;
         let elem_type = self
             .rb
-            .graph
+            .module_tables
             .types
             .convert_type_ref(&inst.allocated_type, self.fn_ctx.llvm_mod)?;
         let llvm_ptr_ty = inst.get_type(&self.fn_ctx.llvm_mod.types);
         let ptr_type = self
             .rb
-            .graph
+            .module_tables
             .types
             .convert_type_ref(&llvm_ptr_ty, self.fn_ctx.llvm_mod)?;
 
@@ -666,7 +666,7 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
         let llvm_ty = inst.get_type(&self.fn_ctx.llvm_mod.types);
         let ty = self
             .rb
-            .graph
+            .module_tables
             .types
             .convert_type_ref(&llvm_ty, self.fn_ctx.llvm_mod)?;
         let val = self.rb.ternary(cond, t, f, ty);
@@ -682,7 +682,7 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
         let llvm_ty = inst.get_type(&self.fn_ctx.llvm_mod.types);
         let ty = self
             .rb
-            .graph
+            .module_tables
             .types
             .convert_type_ref(&llvm_ty, self.fn_ctx.llvm_mod)?;
         let dest = inst.get_result();
@@ -734,9 +734,9 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
             Operand::ConstantOperand(constant_ref) => {
                 let const_id = self
                     .rb
-                    .graph
+                    .module_tables
                     .convert_const_ref(constant_ref.clone(), self.fn_ctx.llvm_mod)?;
-                let ty = self.rb.graph.constants.get(const_id).ty;
+                let ty = self.rb.module_tables.constants.get(const_id).ty;
                 Ok(self.rb.const_pool_ref(const_id, ty))
             }
             Operand::MetadataOperand => {

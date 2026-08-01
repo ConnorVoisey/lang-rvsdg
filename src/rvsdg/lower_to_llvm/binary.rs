@@ -1,29 +1,22 @@
-use crate::rvsdg::{
-    ArithFlags, BinaryOp, RVSDGMod, ValueId,
-    func::Function,
-    lower_to_llvm::{LLVMBuilderCtx, ValueMapper},
-};
+use crate::rvsdg::{ArithFlags, BinaryOp, ValueId, lower_to_llvm::FunctionLowerer};
 use inkwell::values::BasicValueEnum;
 
-impl RVSDGMod {
+impl<'m, 'a, 'ctx> FunctionLowerer<'m, 'a, 'ctx> {
     #[inline]
-    pub(crate) fn lower_binary<'a, 'ctx>(
-        &self,
-        llvm_builder: &LLVMBuilderCtx<'a, 'ctx>,
-        mapper: &mut ValueMapper<'ctx>,
-        rvsdg_func: &Function,
+    pub(crate) fn lower_binary(
+        &mut self,
         op: BinaryOp,
         flags: ArithFlags,
         left: ValueId,
         right: ValueId,
     ) -> color_eyre::Result<BasicValueEnum<'ctx>> {
-        let lhs = self.expect_value(llvm_builder, mapper, rvsdg_func, left)?;
-        let rhs = self.expect_value(llvm_builder, mapper, rvsdg_func, right)?;
+        let lhs = self.expect_value(left)?;
+        let rhs = self.expect_value(right)?;
         let lhs_int = || lhs.into_int_value();
         let rhs_int = || rhs.into_int_value();
         let lhs_float = || lhs.into_float_value();
         let rhs_float = || rhs.into_float_value();
-        let b = &llvm_builder.builder;
+        let b = self.builder;
 
         Ok(match op {
             BinaryOp::Add => BasicValueEnum::IntValue(if flags.no_signed_wrap {

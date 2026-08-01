@@ -1,25 +1,17 @@
-use crate::rvsdg::{
-    CastOp, RVSDGMod, ValueId,
-    func::Function,
-    lower_to_llvm::{LLVMBuilderCtx, ValueMapper},
-    types::TypeRef,
-};
+use crate::rvsdg::{CastOp, ValueId, lower_to_llvm::FunctionLowerer, types::TypeRef};
 use inkwell::values::BasicValueEnum;
 
-impl RVSDGMod {
+impl<'m, 'a, 'ctx> FunctionLowerer<'m, 'a, 'ctx> {
     #[inline]
-    pub(crate) fn lower_cast<'a, 'ctx>(
-        &self,
-        llvm_builder: &LLVMBuilderCtx<'a, 'ctx>,
-        mapper: &mut ValueMapper<'ctx>,
-        rvsdg_func: &Function,
+    pub(crate) fn lower_cast(
+        &mut self,
         op: CastOp,
         operand: ValueId,
         ty: TypeRef,
     ) -> color_eyre::Result<BasicValueEnum<'ctx>> {
-        let src = self.expect_value(llvm_builder, mapper, rvsdg_func, operand)?;
-        let dst_type = self.type_to_basic_type_llvm(llvm_builder.context, ty)?;
-        let b = &llvm_builder.builder;
+        let src = self.expect_value(operand)?;
+        let dst_type = self.mod_lower.type_to_basic_type_llvm(ty)?;
+        let b = self.builder;
         Ok(match op {
             CastOp::SignExtend => BasicValueEnum::IntValue(b.build_int_s_extend(
                 src.into_int_value(),
@@ -320,14 +312,14 @@ mod tests {
         // alloca a pointer, convert to int, convert back, store through it, load
         use crate::rvsdg::GlobalInit;
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
-        let ptr_ty_id = rvsdg.types.intern_ptr(PtrType {
+        let ptr_ty_id = rvsdg.tables.types.intern_ptr(PtrType {
             pointee: Some(I32),
             alias_set: None,
             no_escape: false,
         });
         let ptr_ty = TypeRef::Ptr(ptr_ty_id);
-        let init = rvsdg.constants.scalar(I32, ConstValue::Int(0));
-        let global_id = rvsdg.define_global_plain(
+        let init = rvsdg.tables.constants.scalar(I32, ConstValue::Int(0));
+        let global_id = rvsdg.tables.define_global_plain(
             String::from("val"),
             I32,
             GlobalInit::Init(init),

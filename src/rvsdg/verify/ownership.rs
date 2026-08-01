@@ -13,20 +13,30 @@
 //! - every value in a region's `params` list is a `RegionParam` whose
 //!   `region` field names that region back.
 
-use crate::rvsdg::{RVSDGMod, RegionId, ValueId, ValueKind, verify::RVSDGVerificationError};
+use crate::rvsdg::{
+    RegionId, ValueId, ValueKind, function_graph::FunctionGraph, verify::RVSDGVerificationError,
+};
 
-impl RVSDGMod {
+impl FunctionGraph {
     pub(super) fn verify_region_ownership(&self, errs: &mut Vec<RVSDGVerificationError>) {
         for (region_index, region) in self.regions.iter().enumerate() {
             let region_id = RegionId(region_index as u32);
 
-            if region.owner == ValueId::INVALID {
+            // The body region (region 0) is the graph's root and is
+            // owner-less by construction; every other region must name
+            // its construct, and the root must NOT name one. Both
+            // directions of the convention are enforced.
+            if region_index == 0 {
+                if region.owner != ValueId::INVALID {
+                    errs.push(RVSDGVerificationError::RegionOwnerInvalid {
+                        region: region_id,
+                        owner: region.owner,
+                    });
+                }
+            } else if region.owner == ValueId::INVALID {
                 errs.push(RVSDGVerificationError::RegionOwnerUnset(region_id));
             } else {
                 let names_region_back = match self.get_value_kind(region.owner) {
-                    ValueKind::Lambda { region: r, .. } | ValueKind::Phi { region: r, .. } => {
-                        *r == region_id
-                    }
                     ValueKind::Theta { region_id: r, .. } => *r == region_id,
                     ValueKind::Gamma { regions, .. } => {
                         self.region_pool.get(*regions).contains(&region_id)
@@ -127,24 +137,27 @@ mod tests {
         let errs = m.verify();
         assert!(errs.is_empty(), "expected clean graph, got: {errs:?}");
 
-        // Spot-check the links resolve to the right constructs.
-        let lambda = m.functions[0].lambda_val.unwrap();
-        let ValueKind::Lambda { region, .. } = &m.get_value_kind(lambda) else {
-            unreachable!();
-        };
-        assert_eq!(m.regions[region.0 as usize].owner, lambda);
-        for &param in &m.regions[region.0 as usize].params {
-            let ValueKind::RegionParam { region: r, .. } = &m.get_value_kind(param) else {
-                unreachable!();
-            };
-            assert_eq!(*r, *region);
+        // Spot-check the links resolve to the right constructs: every
+        // parameter names the region whose params list holds it.
+        let graph = m.graphs[0].as_ref().unwrap();
+        for (index, reg) in graph.regions.iter().enumerate() {
+            let region = RegionId(index as u32);
+            for &param in &reg.params {
+                let ValueKind::RegionParam { region: r, .. } = &graph.get_value_kind(param) else {
+                    unreachable!();
+                };
+                assert_eq!(*r, region);
+            }
         }
     }
 
     #[test]
     fn unset_owner_is_caught() {
         let mut m = build_gamma_theta_module();
-        m.regions[0].owner = ValueId::INVALID;
+        let graph = m.graphs[0].as_mut().unwrap();
+        // Region 0 is the owner-less root by convention, so the unset
+        // check applies to construct regions; blank a gamma arm's owner.
+        graph.regions[1].owner = ValueId::INVALID;
         let errs = m.verify();
         assert!(
             errs.iter()
@@ -156,16 +169,17 @@ mod tests {
     #[test]
     fn owner_not_naming_region_back_is_caught() {
         let mut m = build_gamma_theta_module();
+        let graph = m.graphs[0].as_mut().unwrap();
         // Point the function region's owner at a value that is not a
         // construct owning it (the returned Add).
-        let add = m
+        let add = graph
             .regions
             .iter()
             .flat_map(|r| r.nodes.iter())
-            .find(|id| matches!(m.get_value_kind(**id), ValueKind::Binary { .. }))
+            .find(|id| matches!(graph.get_value_kind(**id), ValueKind::Binary { .. }))
             .copied()
             .unwrap();
-        m.regions[0].owner = add;
+        graph.regions[0].owner = add;
         let errs = m.verify();
         assert!(
             errs.iter()
@@ -177,8 +191,9 @@ mod tests {
     #[test]
     fn param_naming_wrong_region_is_caught() {
         let mut m = build_gamma_theta_module();
-        let param = m.regions[0].params[0];
-        let ValueKind::RegionParam { region, .. } = &mut m.value_kinds[param.0 as usize] else {
+        let graph = m.graphs[0].as_mut().unwrap();
+        let param = graph.regions[0].params[0];
+        let ValueKind::RegionParam { region, .. } = &mut graph.get_value_kind_mut(param) else {
             unreachable!();
         };
         *region = RegionId(region.0 + 1);

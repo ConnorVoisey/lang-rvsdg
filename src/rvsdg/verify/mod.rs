@@ -1,6 +1,10 @@
+use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use thiserror::Error;
 
-use crate::rvsdg::{ConstId, FuncId, GlobalId, RVSDGMod, RegionId, ValueId};
+use crate::rvsdg::{
+    ConstId, FuncId, GlobalId, RVSDGMod, RegionId, ValueId, function_graph::FunctionGraph,
+    module_tables::ModuleTables,
+};
 
 pub mod ids;
 pub mod ownership;
@@ -11,8 +15,21 @@ pub mod state;
 impl RVSDGMod {
     #[tracing::instrument(skip_all)]
     pub fn verify(&self) -> Vec<RVSDGVerificationError> {
+        self.graphs
+            .par_iter()
+            .map(|func| match func {
+                Some(func) => func.verify(&self.tables),
+                None => vec![],
+            })
+            // inefficient cloning, but this is the unhappy path
+            .reduce(|| vec![], |a, b| [a, b].concat())
+    }
+}
+impl FunctionGraph {
+    #[tracing::instrument(skip_all)]
+    pub fn verify(&self, module_tables: &ModuleTables) -> Vec<RVSDGVerificationError> {
         let mut errs = vec![];
-        self.verify_ids(&mut errs);
+        self.verify_ids(module_tables, &mut errs);
         let ownership = self.build_value_ownership(&mut errs);
         self.verify_scope(&ownership, &mut errs);
         self.verify_state(&ownership, &mut errs);
@@ -22,7 +39,7 @@ impl RVSDGMod {
     }
 }
 
-#[derive(Error, Debug)]
+#[derive(Error, Debug, Clone)]
 pub enum RVSDGVerificationError {
     #[error("invalid value id {0}")]
     InvalidValueId(ValueId),

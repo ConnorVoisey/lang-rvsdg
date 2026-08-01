@@ -1,43 +1,40 @@
-use crate::rvsdg::{
-    RVSDGMod, RegionsSpan, ValueId, ValuesSpan,
-    func::Function,
-    lower_to_llvm::{LLVMBuilderCtx, ValueMapper},
-};
+use crate::rvsdg::{RegionsSpan, ValueId, ValuesSpan, lower_to_llvm::FunctionLowerer};
 use color_eyre::eyre::{bail, eyre};
 use inkwell::{
     basic_block::BasicBlock,
     values::{BasicValue, BasicValueEnum},
 };
 
-impl RVSDGMod {
+impl<'m, 'a, 'ctx> FunctionLowerer<'m, 'a, 'ctx> {
     #[inline]
-    pub(crate) fn lower_gamma<'a, 'ctx>(
-        &self,
-        llvm_builder: &LLVMBuilderCtx<'a, 'ctx>,
-        mapper: &mut ValueMapper<'ctx>,
-        rvsdg_func: &Function,
+    pub(crate) fn lower_gamma(
+        &mut self,
         gamma_value_id: ValueId,
         condition: ValueId,
         inputs: ValuesSpan,
         regions: RegionsSpan,
     ) -> color_eyre::Result<Option<BasicValueEnum<'ctx>>> {
-        let cond = self.expect_value(llvm_builder, mapper, rvsdg_func, condition)?;
-        let region_ids = self.region_pool.get(regions).to_vec();
-        let input_ids = self.value_pool.get(inputs).to_vec();
-        let func = mapper.get_fn(rvsdg_func.id).ok_or_else(|| {
+        let cond = self.expect_value(condition)?;
+        let graph = self.graph;
+        let region_ids = graph.region_pool.get(regions);
+        let input_ids = graph.value_pool.get(inputs);
+        let func = self.mod_lower.get_fn(self.func_id).ok_or_else(|| {
             eyre!(
                 "function `{}` was not registered before lowering its gamma",
-                rvsdg_func.name
+                self.function().name
             )
         })?;
 
         // Create all basic blocks upfront
-        let merge_bb = llvm_builder.context.append_basic_block(func, "gamma.merge");
+        let merge_bb = self
+            .mod_lower
+            .context
+            .append_basic_block(func, "gamma.merge");
         let region_bbs: Vec<_> = region_ids
             .iter()
             .enumerate()
             .map(|(i, _)| {
-                llvm_builder
+                self.mod_lower
                     .context
                     .append_basic_block(func, &format!("gamma.{i}"))
             })
@@ -58,11 +55,8 @@ impl RVSDGMod {
                 2,
                 "an i1-conditioned gamma must have exactly two regions"
             );
-            llvm_builder.builder.build_conditional_branch(
-                cond_int,
-                region_bbs[0],
-                region_bbs[1],
-            )?;
+            self.builder
+                .build_conditional_branch(cond_int, region_bbs[0], region_bbs[1])?;
         } else {
             // The first block is the switch default; cases 1..N map value
             // `i` to region `i`.
@@ -72,9 +66,7 @@ impl RVSDGMod {
                 .skip(1)
                 .map(|(i, &bb)| (cond_int.get_type().const_int(i as u64, false), bb))
                 .collect();
-            llvm_builder
-                .builder
-                .build_switch(cond_int, region_bbs[0], &cases)?;
+            self.builder.build_switch(cond_int, region_bbs[0], &cases)?;
         }
 
         // Lower each region, collecting (result_values, basic_block) per region
@@ -84,43 +76,41 @@ impl RVSDGMod {
             Vec::with_capacity(region_ids.len());
         for (i, &region_id) in region_ids.iter().enumerate() {
             let bb = region_bbs[i];
-            llvm_builder.builder.position_at_end(bb);
+            self.builder.position_at_end(bb);
 
-            let region = self.get_region(region_id);
+            let region = graph.get_region(region_id);
 
             // Bind gamma inputs to this region's params
-            let params = region.params.clone();
-            for (j, &param_id) in params.iter().enumerate() {
+            for (j, &param_id) in region.params.iter().enumerate() {
                 if j < input_ids.len() {
-                    let input_val =
-                        self.expect_value(llvm_builder, mapper, rvsdg_func, input_ids[j])?;
-                    mapper.set_val(param_id, input_val);
+                    let input_val = self.expect_value(input_ids[j])?;
+                    self.set_val(param_id, input_val);
                 }
             }
 
-            self.lower_region(llvm_builder, mapper, rvsdg_func, region)?;
+            self.lower_region(region)?;
 
             // Collect result values from the region
-            let result_ids = self.value_pool.get(region.results).to_vec();
+            let result_ids = graph.value_pool.get(region.results);
             let mut results: Vec<BasicValueEnum<'ctx>> = Vec::with_capacity(result_ids.len());
-            for &rid in &result_ids {
-                if let Some(value) = self.lowered_result(llvm_builder, mapper, rvsdg_func, rid)? {
+            for &rid in result_ids {
+                if let Some(value) = self.lowered_result(rid)? {
                     results.push(value);
                 }
             }
 
             // lowering the region could insert a new basic block, so get the current basic block
             // here
-            let actual_bb = llvm_builder
+            let actual_bb = self
                 .builder
                 .get_insert_block()
                 .ok_or_else(|| eyre!("gamma arm ended with no current basic block"))?;
-            llvm_builder.builder.build_unconditional_branch(merge_bb)?;
+            self.builder.build_unconditional_branch(merge_bb)?;
             region_results.push((results, actual_bb));
         }
 
         // Build phi nodes in the merge block and write results to Project slots
-        llvm_builder.builder.position_at_end(merge_bb);
+        self.builder.position_at_end(merge_bb);
         let num_results = region_results.first().map(|(r, _)| r.len()).unwrap_or(0);
 
         // Every gamma region must produce the same number of value-results; the
@@ -139,15 +129,15 @@ impl RVSDGMod {
         // adding 1 to the gamma id and the index
         for result_idx in 0..num_results {
             let phi_type = region_results[0].0[result_idx].get_type();
-            let phi = llvm_builder.builder.build_phi(phi_type, "gamma.phi")?;
+            let phi = self.builder.build_phi(phi_type, "gamma.phi")?;
             let incoming: Vec<_> = region_results
                 .iter()
                 .map(|(vals, bb)| (&vals[result_idx] as &dyn BasicValue, *bb))
                 .collect();
             phi.add_incoming(&incoming);
 
-            let project_id = self.projection_of(gamma_value_id, result_idx as u16);
-            mapper.set_val(project_id, phi.as_basic_value());
+            let project_id = graph.projection_of(gamma_value_id, result_idx as u16);
+            self.set_val(project_id, phi.as_basic_value());
         }
 
         Ok(None)

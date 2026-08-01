@@ -1,7 +1,8 @@
 use crate::{
     llvm_parser::{global_name_string, int_bit_to_scalar, sign_extend_to_i64},
     rvsdg::{
-        ConstId, ConstValue, ConstantDef, ConstantKind, RVSDGMod,
+        ConstId, ConstValue, ConstantDef, ConstantKind,
+        module_tables::ModuleTables,
         ops::CastOp,
         types::{ArrayType, PtrType, ScalarType, TypeRef, VOID},
     },
@@ -9,7 +10,7 @@ use crate::{
 use color_eyre::eyre::eyre;
 use llvm_ir::{ConstantRef, Module};
 
-impl RVSDGMod {
+impl ModuleTables {
     pub(super) fn convert_const_ref(
         &mut self,
         const_ref: ConstantRef,

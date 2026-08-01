@@ -1,7 +1,5 @@
 use crate::rvsdg::{
-    ConstId, ConstValue, ConstantDef, ConstantKind, RVSDGMod,
-    lower_to_llvm::{LLVMBuilderCtx, ValueMapper},
-    ops::CastOp,
+    ConstId, ConstValue, ConstantDef, ConstantKind, lower_to_llvm::ModuleLowerer, ops::CastOp,
     types::TypeRef,
 };
 use color_eyre::eyre::eyre;
@@ -11,43 +9,39 @@ use inkwell::{
     values::{BasicValue, BasicValueEnum},
 };
 
-impl RVSDGMod {
+impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
     #[inline]
-    pub(crate) fn lower_const_id<'a, 'ctx>(
+    pub(crate) fn lower_const_id(
         &self,
-        llvm_builder: &LLVMBuilderCtx<'a, 'ctx>,
-        mapper: &mut ValueMapper<'ctx>,
         const_id: ConstId,
     ) -> color_eyre::Result<BasicValueEnum<'ctx>> {
-        let constant = self.constants.get(const_id);
-        self.lower_const_def(llvm_builder, mapper, constant)
+        let constant = self.tables.constants.get(const_id);
+        self.lower_const_def(constant)
     }
 
     #[inline]
-    pub(crate) fn lower_const_def<'a, 'ctx>(
+    pub(crate) fn lower_const_def(
         &self,
-        llvm_builder: &LLVMBuilderCtx<'a, 'ctx>,
-        mapper: &mut ValueMapper<'ctx>,
         constant: &ConstantDef,
     ) -> color_eyre::Result<BasicValueEnum<'ctx>> {
         let lowered = match &constant.kind {
             ConstantKind::Scalar(const_value) => {
-                self.lower_const_value(llvm_builder, const_value, constant.ty)?
+                self.lower_const_value(const_value, constant.ty)?
             }
-            ConstantKind::Zero => self
-                .type_to_basic_type_llvm(llvm_builder.context, constant.ty)?
-                .const_zero(),
+            ConstantKind::Zero => self.type_to_basic_type_llvm(constant.ty)?.const_zero(),
             ConstantKind::Aggregate(const_ids_span) => {
-                let element_ids = self.constants.get_aggregate_elements(*const_ids_span);
+                let element_ids = self
+                    .tables
+                    .constants
+                    .get_aggregate_elements(*const_ids_span);
                 let elements: Vec<BasicValueEnum<'ctx>> = element_ids
                     .iter()
-                    .map(|&id| self.lower_const_id(llvm_builder, mapper, id))
+                    .map(|&id| self.lower_const_id(id))
                     .collect::<color_eyre::Result<_>>()?;
                 match constant.ty {
                     TypeRef::Array(array_type_id) => {
-                        let arr = self.types.get_array(array_type_id);
-                        let elem_type =
-                            self.type_to_basic_type_llvm(llvm_builder.context, arr.element)?;
+                        let arr = self.tables.types.get_array(array_type_id);
+                        let elem_type = self.type_to_basic_type_llvm(arr.element)?;
                         BasicValueEnum::ArrayValue(match elem_type {
                             BasicTypeEnum::IntType(it) => {
                                 let vals: Vec<_> =
@@ -89,43 +83,41 @@ impl RVSDGMod {
                         })
                     }
                     TypeRef::Struct(struct_id) => {
-                        let def = self.types.get_struct(struct_id);
+                        let def = self.tables.types.get_struct(struct_id);
                         if def.name.is_some() {
                             // A NAMED struct's constant must have the named
                             // type (an anonymous literal constant fails the
                             // verifier's type match on the initialized
                             // global); build it through the named type.
                             let llvm_struct = self
-                                .type_to_basic_type_llvm(llvm_builder.context, constant.ty)?
+                                .type_to_basic_type_llvm(constant.ty)?
                                 .into_struct_type();
                             BasicValueEnum::StructValue(llvm_struct.const_named_struct(&elements))
                         } else {
                             BasicValueEnum::StructValue(
-                                llvm_builder.context.const_struct(&elements, def.packed),
+                                self.context.const_struct(&elements, def.packed),
                             )
                         }
                     }
                     _ => {
                         // Anonymous aggregate of some other shape.
-                        BasicValueEnum::StructValue(
-                            llvm_builder.context.const_struct(&elements, false),
-                        )
+                        BasicValueEnum::StructValue(self.context.const_struct(&elements, false))
                     }
                 }
             }
             ConstantKind::String(items) => {
-                BasicValueEnum::ArrayValue(llvm_builder.context.const_string(items, false))
+                BasicValueEnum::ArrayValue(self.context.const_string(items, false))
             }
-            ConstantKind::GlobalAddr(global_id) => mapper
+            ConstantKind::GlobalAddr(global_id) => self
                 .get_global(*global_id)
                 .ok_or_else(|| eyre!("global {global_id:?} was not set during lower_globals"))?
                 .as_basic_value_enum(),
             ConstantKind::Undef => {
-                let llvm_type = self.type_to_basic_type_llvm(llvm_builder.context, constant.ty)?;
+                let llvm_type = self.type_to_basic_type_llvm(constant.ty)?;
                 Self::get_undef(llvm_type)
             }
             ConstantKind::FuncAddr(func_id) => {
-                let func = mapper
+                let func = self
                     .get_fn(*func_id)
                     .ok_or_else(|| eyre!("function {func_id:?} was not declared before use"))?;
                 func.as_global_value()
@@ -138,17 +130,14 @@ impl RVSDGMod {
                 indices,
                 in_bounds,
             } => {
-                let base_ptr = self
-                    .lower_const_id(llvm_builder, mapper, *base)?
-                    .into_pointer_value();
-                let source = self.type_to_basic_type_llvm(llvm_builder.context, *source_type)?;
-                let index_ids = self.constants.get_aggregate_elements(*indices).to_vec();
-                let index_vals: Vec<inkwell::values::IntValue<'ctx>> = index_ids
+                let base_ptr = self.lower_const_id(*base)?.into_pointer_value();
+                let source = self.type_to_basic_type_llvm(*source_type)?;
+                let index_vals: Vec<inkwell::values::IntValue<'ctx>> = self
+                    .tables
+                    .constants
+                    .get_aggregate_elements(*indices)
                     .iter()
-                    .map(|&id| {
-                        self.lower_const_id(llvm_builder, mapper, id)
-                            .map(|v| v.into_int_value())
-                    })
+                    .map(|&id| self.lower_const_id(id).map(|v| v.into_int_value()))
                     .collect::<color_eyre::Result<_>>()?;
                 // SAFETY: inkwell marks every GEP constructor `unsafe`
                 // because mismatched indices/type are UB in LLVM. `source` is
@@ -168,8 +157,8 @@ impl RVSDGMod {
                 result.as_basic_value_enum()
             }
             ConstantKind::Cast { op, operand } => {
-                let src = self.lower_const_id(llvm_builder, mapper, *operand)?;
-                let dst = self.type_to_basic_type_llvm(llvm_builder.context, constant.ty)?;
+                let src = self.lower_const_id(*operand)?;
+                let dst = self.type_to_basic_type_llvm(constant.ty)?;
                 Self::lower_const_cast(*op, src, dst)?
             }
         };
@@ -181,7 +170,7 @@ impl RVSDGMod {
     /// valid inside a global initialiser). Mirrors the runtime cast lowering in
     /// `cast.rs`. Only the cast kinds that occur as LLVM constant expressions
     /// are handled; the others are runtime-only and never reach here.
-    fn lower_const_cast<'ctx>(
+    fn lower_const_cast(
         op: CastOp,
         src: BasicValueEnum<'ctx>,
         dst: BasicTypeEnum<'ctx>,
@@ -220,45 +209,37 @@ impl RVSDGMod {
     }
 
     #[inline]
-    pub(crate) fn lower_const_value<'a, 'ctx>(
+    pub(crate) fn lower_const_value(
         &self,
-        llvm_builder: &LLVMBuilderCtx<'a, 'ctx>,
         const_value: &ConstValue,
         ty: TypeRef,
     ) -> color_eyre::Result<BasicValueEnum<'ctx>> {
         let lowered = match const_value {
             ConstValue::Int(val) => BasicValueEnum::IntValue(
-                self.type_to_basic_type_llvm(llvm_builder.context, ty)?
+                self.type_to_basic_type_llvm(ty)?
                     .into_int_type()
                     .const_int(*val as u64, false),
             ),
             ConstValue::F32(val) => BasicValueEnum::FloatValue(
-                llvm_builder
-                    .context
+                self.context
                     .f32_type()
                     .const_float(f32::from_bits(*val) as f64),
             ),
             ConstValue::F64(val) => BasicValueEnum::FloatValue(
-                llvm_builder
-                    .context
-                    .f64_type()
-                    .const_float(f64::from_bits(*val)),
+                self.context.f64_type().const_float(f64::from_bits(*val)),
             ),
             ConstValue::NullPtr => BasicValueEnum::PointerValue(
-                llvm_builder
-                    .context
-                    .ptr_type(AddressSpace::default())
-                    .const_null(),
+                self.context.ptr_type(AddressSpace::default()).const_null(),
             ),
             ConstValue::Poison => {
-                let llvm_type = self.type_to_basic_type_llvm(llvm_builder.context, ty)?;
+                let llvm_type = self.type_to_basic_type_llvm(ty)?;
                 Self::get_poison(llvm_type)
             }
         };
         Ok(lowered)
     }
 
-    fn get_undef<'ctx>(llvm_type: BasicTypeEnum<'ctx>) -> BasicValueEnum<'ctx> {
+    fn get_undef(llvm_type: BasicTypeEnum<'ctx>) -> BasicValueEnum<'ctx> {
         match llvm_type {
             BasicTypeEnum::IntType(t) => BasicValueEnum::IntValue(t.get_undef()),
             BasicTypeEnum::FloatType(t) => BasicValueEnum::FloatValue(t.get_undef()),
@@ -272,7 +253,7 @@ impl RVSDGMod {
         }
     }
 
-    fn get_poison<'ctx>(llvm_type: BasicTypeEnum<'ctx>) -> BasicValueEnum<'ctx> {
+    fn get_poison(llvm_type: BasicTypeEnum<'ctx>) -> BasicValueEnum<'ctx> {
         match llvm_type {
             BasicTypeEnum::IntType(t) => BasicValueEnum::IntValue(t.get_poison()),
             BasicTypeEnum::FloatType(t) => BasicValueEnum::FloatValue(t.get_poison()),
@@ -562,12 +543,12 @@ mod tests {
     fn const_string_extract_bytes() {
         // Create a string constant "Hi" and extract each byte
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
-        let arr_ty_id = rvsdg.types.intern_array(ArrayType {
+        let arr_ty_id = rvsdg.tables.types.intern_array(ArrayType {
             element: I8,
             len: 2,
         });
         let arr_ty = TypeRef::Array(arr_ty_id);
-        let str_id = rvsdg.constants.string(arr_ty, b"Hi".to_vec());
+        let str_id = rvsdg.tables.constants.string(arr_ty, b"Hi".to_vec());
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg
             .define_fn(func_id, |rb, state| {
@@ -596,15 +577,15 @@ mod tests {
         // Define a global i32 constant initialized to 42, load it, return the value
         use crate::rvsdg::types::PtrType;
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
-        let init_id = rvsdg.constants.scalar(I32, ConstValue::Int(42));
-        let global_id = rvsdg.define_global_plain(
+        let init_id = rvsdg.tables.constants.scalar(I32, ConstValue::Int(42));
+        let global_id = rvsdg.tables.define_global_plain(
             String::from("my_global"),
             I32,
             GlobalInit::Init(init_id),
             true,
             Linkage::Internal,
         );
-        let ptr_ty_id = rvsdg.types.intern_ptr(PtrType {
+        let ptr_ty_id = rvsdg.tables.types.intern_ptr(PtrType {
             pointee: Some(I32),
             alias_set: None,
             no_escape: false,
@@ -626,7 +607,7 @@ mod tests {
 
     fn make_ptr_ty(rvsdg: &mut RVSDGMod, pointee: TypeRef) -> TypeRef {
         use crate::rvsdg::types::PtrType;
-        let id = rvsdg.types.intern_ptr(PtrType {
+        let id = rvsdg.tables.types.intern_ptr(PtrType {
             pointee: Some(pointee),
             alias_set: None,
             no_escape: false,
@@ -637,8 +618,11 @@ mod tests {
     #[test]
     fn const_global_load_i64() {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
-        let init_id = rvsdg.constants.scalar(I64, ConstValue::Int(9_000_000_000));
-        let global_id = rvsdg.define_global_plain(
+        let init_id = rvsdg
+            .tables
+            .constants
+            .scalar(I64, ConstValue::Int(9_000_000_000));
+        let global_id = rvsdg.tables.define_global_plain(
             String::from("big_val"),
             I64,
             GlobalInit::Init(init_id),
@@ -664,9 +648,10 @@ mod tests {
     fn const_global_load_f32() {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
         let init_id = rvsdg
+            .tables
             .constants
             .scalar(F32, ConstValue::f32_from_native(3.14));
-        let global_id = rvsdg.define_global_plain(
+        let global_id = rvsdg.tables.define_global_plain(
             String::from("pi_approx"),
             F32,
             GlobalInit::Init(init_id),
@@ -691,8 +676,8 @@ mod tests {
     #[test]
     fn const_global_load_negative() {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
-        let init_id = rvsdg.constants.scalar(I32, ConstValue::Int(-999));
-        let global_id = rvsdg.define_global_plain(
+        let init_id = rvsdg.tables.constants.scalar(I32, ConstValue::Int(-999));
+        let global_id = rvsdg.tables.define_global_plain(
             String::from("neg_val"),
             I32,
             GlobalInit::Init(init_id),
@@ -718,16 +703,16 @@ mod tests {
     fn const_global_load_add() {
         // Load two globals and add them
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
-        let init_a = rvsdg.constants.scalar(I32, ConstValue::Int(30));
-        let init_b = rvsdg.constants.scalar(I32, ConstValue::Int(12));
-        let global_a = rvsdg.define_global_plain(
+        let init_a = rvsdg.tables.constants.scalar(I32, ConstValue::Int(30));
+        let init_b = rvsdg.tables.constants.scalar(I32, ConstValue::Int(12));
+        let global_a = rvsdg.tables.define_global_plain(
             String::from("a"),
             I32,
             GlobalInit::Init(init_a),
             true,
             Linkage::Internal,
         );
-        let global_b = rvsdg.define_global_plain(
+        let global_b = rvsdg.tables.define_global_plain(
             String::from("b"),
             I32,
             GlobalInit::Init(init_b),
@@ -764,8 +749,8 @@ mod tests {
         // limit = 7; x = 0; do { x++ } while (x < limit) => 7
         use crate::rvsdg::builder::LoopResult;
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
-        let init_id = rvsdg.constants.scalar(I32, ConstValue::Int(7));
-        let global_id = rvsdg.define_global_plain(
+        let init_id = rvsdg.tables.constants.scalar(I32, ConstValue::Int(7));
+        let global_id = rvsdg.tables.define_global_plain(
             String::from("limit"),
             I32,
             GlobalInit::Init(init_id),
@@ -804,16 +789,16 @@ mod tests {
     fn const_aggregate_array_i32() {
         // Global [3 x i32] = [10, 20, 30], extract element at index 1 => 20
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
-        let arr_ty_id = rvsdg.types.intern_array(ArrayType {
+        let arr_ty_id = rvsdg.tables.types.intern_array(ArrayType {
             element: I32,
             len: 3,
         });
         let arr_ty = TypeRef::Array(arr_ty_id);
-        let e0 = rvsdg.constants.scalar(I32, ConstValue::Int(10));
-        let e1 = rvsdg.constants.scalar(I32, ConstValue::Int(20));
-        let e2 = rvsdg.constants.scalar(I32, ConstValue::Int(30));
-        let agg_id = rvsdg.constants.aggregate(arr_ty, &[e0, e1, e2]);
-        let global_id = rvsdg.define_global_plain(
+        let e0 = rvsdg.tables.constants.scalar(I32, ConstValue::Int(10));
+        let e1 = rvsdg.tables.constants.scalar(I32, ConstValue::Int(20));
+        let e2 = rvsdg.tables.constants.scalar(I32, ConstValue::Int(30));
+        let agg_id = rvsdg.tables.constants.aggregate(arr_ty, &[e0, e1, e2]);
+        let global_id = rvsdg.tables.define_global_plain(
             String::from("arr"),
             arr_ty,
             GlobalInit::Init(agg_id),
@@ -840,16 +825,16 @@ mod tests {
     fn const_aggregate_array_sum() {
         // Global [4 x i32] = [1, 2, 3, 4], sum all elements => 10
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
-        let arr_ty_id = rvsdg.types.intern_array(ArrayType {
+        let arr_ty_id = rvsdg.tables.types.intern_array(ArrayType {
             element: I32,
             len: 4,
         });
         let arr_ty = TypeRef::Array(arr_ty_id);
         let elems: Vec<_> = (1..=4)
-            .map(|v| rvsdg.constants.scalar(I32, ConstValue::Int(v)))
+            .map(|v| rvsdg.tables.constants.scalar(I32, ConstValue::Int(v)))
             .collect();
-        let agg_id = rvsdg.constants.aggregate(arr_ty, &elems);
-        let global_id = rvsdg.define_global_plain(
+        let agg_id = rvsdg.tables.constants.aggregate(arr_ty, &elems);
+        let global_id = rvsdg.tables.define_global_plain(
             String::from("arr"),
             arr_ty,
             GlobalInit::Init(agg_id),
@@ -882,19 +867,21 @@ mod tests {
     fn const_aggregate_array_f32() {
         // Global [2 x f32] = [1.5, 2.5], extract and add => 4.0
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
-        let arr_ty_id = rvsdg.types.intern_array(ArrayType {
+        let arr_ty_id = rvsdg.tables.types.intern_array(ArrayType {
             element: F32,
             len: 2,
         });
         let arr_ty = TypeRef::Array(arr_ty_id);
         let e0 = rvsdg
+            .tables
             .constants
             .scalar(F32, ConstValue::f32_from_native(1.5));
         let e1 = rvsdg
+            .tables
             .constants
             .scalar(F32, ConstValue::f32_from_native(2.5));
-        let agg_id = rvsdg.constants.aggregate(arr_ty, &[e0, e1]);
-        let global_id = rvsdg.define_global_plain(
+        let agg_id = rvsdg.tables.constants.aggregate(arr_ty, &[e0, e1]);
+        let global_id = rvsdg.tables.define_global_plain(
             String::from("arr"),
             arr_ty,
             GlobalInit::Init(agg_id),
@@ -924,11 +911,11 @@ mod tests {
         // Anonymous struct { i32, i32 } = { 100, 200 }
         // Extract field 0 + field 1 => 300
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
-        let e0 = rvsdg.constants.scalar(I32, ConstValue::Int(100));
-        let e1 = rvsdg.constants.scalar(I32, ConstValue::Int(200));
+        let e0 = rvsdg.tables.constants.scalar(I32, ConstValue::Int(100));
+        let e1 = rvsdg.tables.constants.scalar(I32, ConstValue::Int(200));
         // Use State as a placeholder type since we don't have struct types wired up yet;
         // the lowering falls into the `_ =>` branch which uses context.const_struct
-        let agg_id = rvsdg.constants.aggregate(TypeRef::State, &[e0, e1]);
+        let agg_id = rvsdg.tables.constants.aggregate(TypeRef::State, &[e0, e1]);
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg
             .define_fn(func_id, |rb, state| {
@@ -948,7 +935,7 @@ mod tests {
     #[test]
     fn const_zero_i32() {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
-        let zero_id = rvsdg.constants.zero(I32);
+        let zero_id = rvsdg.tables.constants.zero(I32);
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg
             .define_fn(func_id, |rb, state| {
@@ -965,7 +952,7 @@ mod tests {
     #[test]
     fn const_zero_f32() {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
-        let zero_id = rvsdg.constants.zero(F32);
+        let zero_id = rvsdg.tables.constants.zero(F32);
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[F32], Linkage::External);
         rvsdg
             .define_fn(func_id, |rb, state| {
@@ -984,13 +971,13 @@ mod tests {
         // Zero-initialized [3 x i32], all elements should be 0
         // Extract element 0 + element 2 => 0
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
-        let arr_ty_id = rvsdg.types.intern_array(ArrayType {
+        let arr_ty_id = rvsdg.tables.types.intern_array(ArrayType {
             element: I32,
             len: 3,
         });
         let arr_ty = TypeRef::Array(arr_ty_id);
-        let zero_id = rvsdg.constants.zero(arr_ty);
-        let global_id = rvsdg.define_global_plain(
+        let zero_id = rvsdg.tables.constants.zero(arr_ty);
+        let global_id = rvsdg.tables.define_global_plain(
             String::from("zeroed"),
             arr_ty,
             GlobalInit::Init(zero_id),
@@ -1019,7 +1006,7 @@ mod tests {
     fn const_zero_add_nonzero() {
         // zero(i32) + 42 => 42
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
-        let zero_id = rvsdg.constants.zero(I32);
+        let zero_id = rvsdg.tables.constants.zero(I32);
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg
             .define_fn(func_id, |rb, state| {
@@ -1039,7 +1026,7 @@ mod tests {
     fn const_undef_i32_compiles() {
         // undef i32 used in an add -- the result is undef but should not crash
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
-        let undef_id = rvsdg.constants.intern(crate::rvsdg::ConstantDef {
+        let undef_id = rvsdg.tables.constants.intern(crate::rvsdg::ConstantDef {
             ty: I32,
             kind: crate::rvsdg::ConstantKind::Undef,
         });
@@ -1063,7 +1050,7 @@ mod tests {
     #[test]
     fn const_undef_f32_compiles() {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
-        let undef_id = rvsdg.constants.intern(crate::rvsdg::ConstantDef {
+        let undef_id = rvsdg.tables.constants.intern(crate::rvsdg::ConstantDef {
             ty: F32,
             kind: crate::rvsdg::ConstantKind::Undef,
         });
@@ -1144,7 +1131,7 @@ mod tests {
     fn const_undef_overwritten() {
         // Start with undef, overwrite with 42 via ternary(true, 42, undef)
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
-        let undef_id = rvsdg.constants.intern(crate::rvsdg::ConstantDef {
+        let undef_id = rvsdg.tables.constants.intern(crate::rvsdg::ConstantDef {
             ty: I32,
             kind: crate::rvsdg::ConstantKind::Undef,
         });

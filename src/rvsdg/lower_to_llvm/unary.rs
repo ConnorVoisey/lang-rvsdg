@@ -1,8 +1,4 @@
-use crate::rvsdg::{
-    RVSDGMod, UnaryOp, ValueId,
-    func::Function,
-    lower_to_llvm::{LLVMBuilderCtx, ValueMapper},
-};
+use crate::rvsdg::{UnaryOp, ValueId, lower_to_llvm::FunctionLowerer};
 use color_eyre::eyre::{bail, eyre};
 use inkwell::{
     intrinsics::Intrinsic,
@@ -10,18 +6,15 @@ use inkwell::{
     values::{BasicMetadataValueEnum, BasicValueEnum, ValueKind},
 };
 
-impl RVSDGMod {
+impl<'m, 'a, 'ctx> FunctionLowerer<'m, 'a, 'ctx> {
     #[inline]
-    pub(crate) fn lower_unary<'a, 'ctx>(
-        &self,
-        llvm_builder: &LLVMBuilderCtx<'a, 'ctx>,
-        mapper: &mut ValueMapper<'ctx>,
-        rvsdg_func: &Function,
+    pub(crate) fn lower_unary(
+        &mut self,
         op: UnaryOp,
         operand: ValueId,
     ) -> color_eyre::Result<BasicValueEnum<'ctx>> {
-        let val = self.expect_value(llvm_builder, mapper, rvsdg_func, operand)?;
-        let b = &llvm_builder.builder;
+        let val = self.expect_value(operand)?;
+        let b = self.builder;
         let val_int = || val.into_int_value();
         let val_float = || val.into_float_value();
 
@@ -33,9 +26,8 @@ impl RVSDGMod {
             UnaryOp::CountLeadingZeros => {
                 let int_val = val_int();
                 let int_type = BasicTypeEnum::IntType(int_val.get_type());
-                let is_zero_poison = llvm_builder.context.bool_type().const_zero();
+                let is_zero_poison = self.mod_lower.context.bool_type().const_zero();
                 self.call_overloaded_intrinsic(
-                    llvm_builder,
                     "llvm.ctlz",
                     &[int_type],
                     &[int_val.into(), is_zero_poison.into()],
@@ -45,9 +37,8 @@ impl RVSDGMod {
             UnaryOp::CountTrailingZeros => {
                 let int_val = val_int();
                 let int_type = BasicTypeEnum::IntType(int_val.get_type());
-                let is_zero_poison = llvm_builder.context.bool_type().const_zero();
+                let is_zero_poison = self.mod_lower.context.bool_type().const_zero();
                 self.call_overloaded_intrinsic(
-                    llvm_builder,
                     "llvm.cttz",
                     &[int_type],
                     &[int_val.into(), is_zero_poison.into()],
@@ -58,7 +49,6 @@ impl RVSDGMod {
                 let int_val = val_int();
                 let int_type = BasicTypeEnum::IntType(int_val.get_type());
                 self.call_overloaded_intrinsic(
-                    llvm_builder,
                     "llvm.ctpop",
                     &[int_type],
                     &[int_val.into()],
@@ -69,7 +59,6 @@ impl RVSDGMod {
                 let int_val = val_int();
                 let int_type = BasicTypeEnum::IntType(int_val.get_type());
                 self.call_overloaded_intrinsic(
-                    llvm_builder,
                     "llvm.bswap",
                     &[int_type],
                     &[int_val.into()],
@@ -80,7 +69,6 @@ impl RVSDGMod {
                 let int_val = val_int();
                 let int_type = BasicTypeEnum::IntType(int_val.get_type());
                 self.call_overloaded_intrinsic(
-                    llvm_builder,
                     "llvm.bitreverse",
                     &[int_type],
                     &[int_val.into()],
@@ -91,7 +79,6 @@ impl RVSDGMod {
                 let float_val = val_float();
                 let float_type = BasicTypeEnum::FloatType(float_val.get_type());
                 self.call_overloaded_intrinsic(
-                    llvm_builder,
                     "llvm.fabs",
                     &[float_type],
                     &[float_val.into()],
@@ -102,7 +89,6 @@ impl RVSDGMod {
                 let float_val = val_float();
                 let float_type = BasicTypeEnum::FloatType(float_val.get_type());
                 self.call_overloaded_intrinsic(
-                    llvm_builder,
                     "llvm.floor",
                     &[float_type],
                     &[float_val.into()],
@@ -113,7 +99,6 @@ impl RVSDGMod {
                 let float_val = val_float();
                 let float_type = BasicTypeEnum::FloatType(float_val.get_type());
                 self.call_overloaded_intrinsic(
-                    llvm_builder,
                     "llvm.ceil",
                     &[float_type],
                     &[float_val.into()],
@@ -124,7 +109,6 @@ impl RVSDGMod {
                 let float_val = val_float();
                 let float_type = BasicTypeEnum::FloatType(float_val.get_type());
                 self.call_overloaded_intrinsic(
-                    llvm_builder,
                     "llvm.round",
                     &[float_type],
                     &[float_val.into()],
@@ -135,7 +119,6 @@ impl RVSDGMod {
                 let float_val = val_float();
                 let float_type = BasicTypeEnum::FloatType(float_val.get_type());
                 self.call_overloaded_intrinsic(
-                    llvm_builder,
                     "llvm.sqrt",
                     &[float_type],
                     &[float_val.into()],
@@ -145,9 +128,8 @@ impl RVSDGMod {
         })
     }
 
-    pub(crate) fn call_overloaded_intrinsic<'a, 'ctx>(
+    pub(crate) fn call_overloaded_intrinsic(
         &self,
-        llvm_builder: &LLVMBuilderCtx<'a, 'ctx>,
         intrinsic_name: &str,
         param_types: &[BasicTypeEnum<'ctx>],
         args: &[BasicMetadataValueEnum<'ctx>],
@@ -156,9 +138,9 @@ impl RVSDGMod {
         let intrinsic = Intrinsic::find(intrinsic_name)
             .ok_or_else(|| eyre!("intrinsic `{intrinsic_name}` not found"))?;
         let func = intrinsic
-            .get_declaration(llvm_builder.module, param_types)
+            .get_declaration(self.mod_lower.module, param_types)
             .ok_or_else(|| eyre!("failed to get declaration for intrinsic `{intrinsic_name}`"))?;
-        match llvm_builder
+        match self
             .builder
             .build_call(func, args, name)?
             .try_as_basic_value()

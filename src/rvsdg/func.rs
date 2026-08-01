@@ -1,6 +1,7 @@
 use crate::rvsdg::{
-    FuncId, InlineHint, Linkage, RVSDGMod, State, Value, ValueId, ValueKind, Visibility,
+    FuncId, InlineHint, Linkage, RVSDGMod, State, ValueId, ValueKind, Visibility,
     builder::RegionBuilder,
+    function_graph::FunctionGraph,
     global::DllStorageClass,
     types::{FuncTypeId, ScalarType, TypeRef},
 };
@@ -15,7 +16,15 @@ pub struct Function {
     pub params: Vec<Param>,
     pub return_types: Vec<TypeRef>,
     pub return_attrs: ParamAttrs,
-    pub lambda_val: Option<ValueId>,
+    /// The ABI signature a call site has when it copies this declaration
+    /// verbatim: one attribute set per DECLARED parameter, the declared
+    /// return attributes, the declared calling convention. Interned at
+    /// declaration time so body construction reads it without touching
+    /// the tables. Exact for non-variadic calls; a variadic call site
+    /// has more actual arguments than this signature has entries, so
+    /// parsers intern the signature from the site instead. None when the
+    /// declaration has no LLVM-expressible signature (multi-return).
+    pub declared_sig: Option<SignatureId>,
 
     // Metadata
     pub is_exported: bool,
@@ -269,7 +278,9 @@ impl SignatureTable {
 }
 
 impl RVSDGMod {
-    /// Simple declaration with default attributes and C calling convention.
+    /// Simple declaration with default attributes and C calling
+    /// convention; delegates to the tables and keeps `graphs` FuncId-
+    /// indexed by pushing the body slot. See [`ModuleTables::declare_fn`].
     pub fn declare_fn(
         &mut self,
         name: String,
@@ -277,100 +288,39 @@ impl RVSDGMod {
         ret_types: &[TypeRef],
         linkage_type: Linkage,
     ) -> FuncId {
-        self.declare_fn_full(FnDecl {
-            name,
-            params: params
-                .iter()
-                .map(|&ty| Param {
-                    ty,
-                    flags: ParamAttrFlags::empty(),
-                    extra: None,
-                })
-                .collect(),
-            return_types: ret_types.to_vec(),
-            return_attrs: ParamAttrs::default(),
-            linkage_type,
-            calling_convention: CallingConvention::default(),
-            is_var_arg: false,
-            is_exported: false,
-            inline_hint: InlineHint::Auto,
-            visibility: Visibility::default(),
-            attrs: FnAttrs::default(),
-            dll_storage_class: DllStorageClass::default(),
-        })
-    }
-
-    /// Intern the ABI signature a call site would have if it copied the
-    /// callee's declaration verbatim: one attribute set per DECLARED
-    /// parameter, the declared return attributes, the declared calling
-    /// convention. Exact for non-variadic calls; a variadic call site has
-    /// more actual arguments than this signature has entries, so parsers
-    /// must intern the signature from the site instead (see
-    /// [`ValueKind::Call`](crate::rvsdg::ValueKind::Call)).
-    pub fn declaration_signature(&mut self, fn_id: FuncId) -> SignatureId {
-        let function = &self.functions[fn_id.0 as usize];
-        let func_type = self.types.intern_fn(crate::rvsdg::types::FuncType {
-            params: function.params.iter().map(|p| p.ty).collect(),
-            // FuncType models LLVM's single return slot; a multi-return
-            // RVSDG function has no LLVM function type to describe it.
-            ret: match function.return_types.as_slice() {
-                [] => crate::rvsdg::types::VOID,
-                [single] => *single,
-                _ => panic!(
-                    "function {} has {} return values; multi-return has no LLVM function type",
-                    function.name,
-                    function.return_types.len()
-                ),
-            },
-            is_var_arg: function.is_var_arg,
-        });
-        self.signatures.intern(Signature {
-            func_type,
-            param_attrs: function
-                .params
-                .iter()
-                .map(|p| ParamAttrs {
-                    flags: p.flags,
-                    extra: p.extra.clone(),
-                })
-                .collect(),
-            return_attrs: function.return_attrs.clone(),
-            calling_convention: function.calling_convention,
-        })
-    }
-
-    /// Full declaration with explicit control over all function metadata.
-    pub fn declare_fn_full(&mut self, decl: FnDecl) -> FuncId {
-        let id = FuncId(self.functions.len() as u32);
-        let func = Function {
-            id,
-            name: decl.name.clone(),
-            lambda_val: None,
-            params: decl.params,
-            return_types: decl.return_types,
-            return_attrs: decl.return_attrs,
-            is_exported: decl.is_exported,
-            inline_hint: decl.inline_hint,
-            linkage_type: decl.linkage_type,
-            calling_convention: decl.calling_convention,
-            is_var_arg: decl.is_var_arg,
-            visibility: decl.visibility,
-            attrs: decl.attrs,
-            dll_storage_class: decl.dll_storage_class,
-        };
-        self.functions.push(func);
-        self.fn_map.insert(decl.name, id);
+        let id = self
+            .tables
+            .declare_fn(name, params, ret_types, linkage_type);
+        self.graphs.push(None);
         id
     }
 
+    /// Full declaration with explicit control over all function metadata;
+    /// delegates to the tables and keeps `graphs` FuncId-indexed.
+    pub fn declare_fn_full(&mut self, decl: FnDecl) -> FuncId {
+        let id = self.tables.declare_fn_full(decl);
+        self.graphs.push(None);
+        id
+    }
+
+    /// Build `func_id`'s body as a detached [`FunctionGraph`] and attach
+    /// it on completion. The graph never coexists half-built with the
+    /// module, and construction touches only the tables and its own
+    /// graph -- the boundary that later becomes the thread boundary.
     pub fn define_fn(
         &mut self,
         func_id: FuncId,
         rb_fn: impl FnOnce(&mut RegionBuilder, State) -> color_eyre::Result<FnResult>,
     ) -> color_eyre::Result<()> {
-        debug_assert!(self.functions[func_id.0 as usize].lambda_val.is_none());
+        debug_assert_eq!(
+            self.graphs.len(),
+            self.tables.functions.len(),
+            "declare through RVSDGMod so graphs stays FuncId-indexed"
+        );
+        debug_assert!(self.graphs[func_id.0 as usize].is_none());
 
-        let mut rb = RegionBuilder::new_from_func(self, func_id);
+        let mut graph = FunctionGraph::new(func_id);
+        let mut rb = RegionBuilder::new_from_func(&mut graph, &mut self.tables, func_id);
         let region_id = rb.region_id();
         let state = rb.graph.regions[region_id.0 as usize].entry_state;
         let fn_res = rb_fn(&mut rb, state)?;
@@ -380,32 +330,13 @@ impl RVSDGMod {
             state: fn_res.state,
         });
         rb.graph.value_types.push(TypeRef::Scalar(ScalarType::Void));
-        let lambda_val = Value {
-            ty: TypeRef::Scalar(ScalarType::Void),
-            kind: ValueKind::Lambda {
-                region: region_id,
-                func_id,
-            },
-        };
-        let lambda_id = rb.add_value(lambda_val);
-        self.functions[func_id.0 as usize].lambda_val = Some(lambda_id);
-        self.regions[region_id.0 as usize].results = results;
-        self.regions[region_id.0 as usize].exit_state = fn_res.state;
-        self.regions[region_id.0 as usize].owner = lambda_id;
+        graph.regions[region_id.0 as usize].results = results;
+        graph.regions[region_id.0 as usize].exit_state = fn_res.state;
 
         // TODO: if in debug mode check that the return values match the declerations return types
         // Also consider if it is variadic
+        self.graphs[func_id.0 as usize] = Some(graph);
         Ok(())
-    }
-
-    #[inline]
-    pub fn get_func(&self, id: FuncId) -> &Function {
-        &self.functions[id.0 as usize]
-    }
-
-    #[inline]
-    pub fn get_func_by_name(&self, name: &str) -> Option<&Function> {
-        self.fn_map.get(name).map(|v| self.get_func(*v))
     }
 }
 

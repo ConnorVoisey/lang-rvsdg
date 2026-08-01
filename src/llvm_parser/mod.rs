@@ -163,11 +163,11 @@ impl RVSDGMod {
 
         // lower function declerations
         for func in &module.func_declarations {
-            let decl = FnDecl::from_declaration(func, &mut rvsdg_mod.types, &module)?;
+            let decl = FnDecl::from_declaration(func, &mut rvsdg_mod.tables.types, &module)?;
             rvsdg_mod.declare_fn_full(decl);
         }
         for func in &module.functions {
-            let decl = FnDecl::from_fn(func, &mut rvsdg_mod.types, &module)?;
+            let decl = FnDecl::from_fn(func, &mut rvsdg_mod.tables.types, &module)?;
             rvsdg_mod.declare_fn_full(decl);
         }
 
@@ -220,14 +220,17 @@ impl RVSDGMod {
                 // struct global initialised by a literal struct constant).
                 Some(init) => {
                     let ty = module.types.type_of(init.as_ref());
-                    rvsdg_mod.types.convert_type_ref(&ty, &module)?
+                    rvsdg_mod.tables.types.convert_type_ref(&ty, &module)?
                 }
                 // No initializer (external/declared global): value_type
                 // (LLVMGlobalGetValueType) is the authoritative content
                 // type; the global value's own type is just an opaque ptr.
-                None => rvsdg_mod.types.convert_type_ref(value_type, &module)?,
+                None => rvsdg_mod
+                    .tables
+                    .types
+                    .convert_type_ref(value_type, &module)?,
             };
-            let id = rvsdg_mod.define_global(GlobalDef {
+            let id = rvsdg_mod.tables.define_global(GlobalDef {
                 name: global_name_string(name),
                 ty: value_ty,
                 // Resolved in pass 2, once every name is registered.
@@ -286,8 +289,8 @@ impl RVSDGMod {
         // Pass 2: resolve initializers now that every name is registered.
         for (global, &id) in module.global_vars.iter().zip(&var_ids) {
             if let Some(init) = &global.initializer {
-                let cid = rvsdg_mod.convert_const_ref(init.clone(), &module)?;
-                rvsdg_mod.set_global_init(id, GlobalInit::Init(cid));
+                let cid = rvsdg_mod.tables.convert_const_ref(init.clone(), &module)?;
+                rvsdg_mod.tables.set_global_init(id, GlobalInit::Init(cid));
             }
         }
         // TODO: lower types
@@ -308,7 +311,8 @@ impl RVSDGMod {
         module: &Module,
     ) -> color_eyre::Result<()> {
         let fn_id = self
-            .get_func_by_name(&func.name)
+            .tables
+            .get_function_by_name(&func.name)
             .ok_or_else(|| color_eyre::eyre::eyre!("function `{}` was not declared", func.name))?
             .id;
         let bb_mapper = intern_blocks_and_arcs(func);

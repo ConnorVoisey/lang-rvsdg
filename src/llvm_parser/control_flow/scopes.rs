@@ -46,7 +46,7 @@ use smallvec::SmallVec;
 
 use crate::{
     llvm_parser::control_flow::overlay::AuxVar,
-    rvsdg::{RVSDGMod, RegionId, ValueId},
+    rvsdg::{RegionId, ValueId, function_graph::FunctionGraph},
 };
 
 /// A dense per-function handle for one symbol. All hot-path bookkeeping is
@@ -303,7 +303,7 @@ impl SymbolScopes {
     /// the capture so later reads reuse it.
     pub(in crate::llvm_parser) fn resolve_id(
         &mut self,
-        graph: &mut RVSDGMod,
+        graph: &mut FunctionGraph,
         id: SymbolId,
     ) -> Option<ValueId> {
         let current = (self.frames.len() - 1) as u32;
@@ -336,7 +336,7 @@ impl SymbolScopes {
     /// Resolve an LLVM name (the instruction-operand hot path).
     pub(in crate::llvm_parser) fn resolve_name(
         &mut self,
-        graph: &mut RVSDGMod,
+        graph: &mut FunctionGraph,
         name: &Name,
     ) -> Option<ValueId> {
         let id = self.intern_name(name);
@@ -346,7 +346,7 @@ impl SymbolScopes {
     /// Resolve an auxiliary selector.
     pub(in crate::llvm_parser) fn resolve_aux(
         &mut self,
-        graph: &mut RVSDGMod,
+        graph: &mut FunctionGraph,
         var: AuxVar,
     ) -> Option<ValueId> {
         let id = self.intern_aux(var);

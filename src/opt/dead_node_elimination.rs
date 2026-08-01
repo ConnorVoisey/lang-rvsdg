@@ -2,7 +2,7 @@ use color_eyre::eyre::eyre;
 
 use crate::rvsdg::{
     MatchArmPool, MatchArmSpan, RVSDGMod, RegionId, RegionPool, RegionsSpan, State, U32Pool,
-    U32Span, ValueId, ValueKind, ValuePool, ValuesSpan, func::Function,
+    U32Span, ValueId, ValueKind, ValuePool, ValuesSpan, function_graph::FunctionGraph,
 };
 
 /// Counters only this pass can produce cheaply: slot-level interface
@@ -27,53 +27,34 @@ pub struct DneEffects {
 
 impl RVSDGMod {
     pub fn opt_dead_node_elimination(&mut self) -> color_eyre::Result<DneEffects> {
-        // Phi constructs (mutual recursion environments) are not yet
-        // handled: their recursion variables live in the node list
-        // rather than the params list, and lambdas defined inside are
-        // rooted independently of the phi, so the slot rules below
-        // would tear the construct apart. Refuse loudly rather than
-        // reconstruct wrongly.
-        if self
-            .value_kinds
-            .iter()
-            .any(|value| matches!(value, ValueKind::Phi { .. }))
-        {
-            return Err(eyre!(
-                "dead node elimination does not support phi constructs yet"
-            ));
-        }
-
         let mut effects = DneEffects::default();
-        let mut alive = vec![false; self.value_kinds.len()];
-        self.mark_all_alive_nodes(&mut alive, &mut effects)?;
-
-        self.remove_dead_nodes(&alive, &mut effects)?;
-
+        // Graph-sized mark scratch, reused across the function loop.
+        let mut alive: Vec<bool> = Vec::new();
+        for graph in self.graphs.iter_mut().flatten() {
+            alive.clear();
+            alive.resize(graph.value_kinds.len(), false);
+            graph.mark_alive_nodes(&mut alive)?;
+            graph.pin_projections(&mut alive, &mut effects);
+            graph.remove_dead_nodes(&alive, &mut effects)?;
+        }
         Ok(effects)
     }
+}
 
-    #[tracing::instrument(skip_all)]
-    fn mark_all_alive_nodes(
-        &self,
-        alive: &mut Vec<bool>,
-        effects: &mut DneEffects,
-    ) -> color_eyre::Result<()> {
-        for func in &self.functions {
-            self.mark_alive_nodes(alive, func)?;
-        }
-
-        // Signature-fixed nodes (calls, loads, compare-and-swap, ...)
-        // own their projection layout: a live node keeps every
-        // projection, used or not, so the adjacency contract
-        // (projection_of) survives compaction. Gamma/theta/phi
-        // projections are per-slot and stay dead with their slot. A
-        // projection's only operand is its node, so this sweep never
-        // creates new work for the mark loop.
+impl FunctionGraph {
+    /// Signature-fixed nodes (calls, loads, compare-and-swap, ...)
+    /// own their projection layout: a live node keeps every
+    /// projection, used or not, so the adjacency contract
+    /// (projection_of) survives compaction. Gamma/theta
+    /// projections are per-slot and stay dead with their slot. A
+    /// projection's only operand is its node, so this sweep never
+    /// creates new work for the mark loop.
+    fn pin_projections(&self, alive: &mut [bool], effects: &mut DneEffects) {
         for index in 0..self.value_kinds.len() {
             if let ValueKind::Project { call, .. } = self.value_kinds[index] {
                 let slotted = matches!(
                     self.get_value_kind(call),
-                    ValueKind::Gamma { .. } | ValueKind::Theta { .. } | ValueKind::Phi { .. }
+                    ValueKind::Gamma { .. } | ValueKind::Theta { .. }
                 );
                 if !slotted && alive[call.0 as usize] && !alive[index] {
                     alive[index] = true;
@@ -81,26 +62,16 @@ impl RVSDGMod {
                 }
             }
         }
-        Ok(())
     }
 
-    fn mark_alive_nodes(&self, alive: &mut [bool], func: &Function) -> color_eyre::Result<()> {
-        let lambda_id = match func.lambda_val {
-            Some(v) => v,
-            None => return Ok(()),
-        };
+    fn mark_alive_nodes(&self, alive: &mut [bool]) -> color_eyre::Result<()> {
+        // Region 0 is the function body by the graph constructor's
+        // convention. It is unique in this search: everything it
+        // returns is assumed needed.
+        let region = self.get_region(RegionId(0));
 
-        let lambda = &self.get_value_kind(lambda_id);
-        let region_id = match &lambda {
-            ValueKind::Lambda { region, func_id: _ } => region,
-            t => Err(eyre!("function lambda value was not a lambda, got: {t:?}"))?,
-        };
-        let region = self.get_region(*region_id);
-
-        // this region is unique in our search since we assume that everything it returns is needed
         let mut stack = self.value_pool.get(region.results).to_vec();
         stack.push(region.exit_state.0);
-        stack.push(lambda_id);
         stack.extend_from_slice(&region.params);
         stack.push(region.entry_state.0);
 
@@ -220,46 +191,38 @@ impl RVSDGMod {
                         ValueKind::Theta { .. } => {
                             self.push_theta_slot_faces(*call, index, &mut stack);
                         }
-                        ValueKind::Phi { region, .. } => {
-                            let results = self.regions[region.0 as usize].results;
-                            stack.push(self.value_pool.get(results)[index as usize]);
-                        }
                         _ => {}
                     }
                 }
                 // A used parameter is a demanded input slot of the
-                // owning construct.
+                // owning construct. The body region's parameters (region
+                // 0, owner-less by the root convention) are the
+                // function's own parameters, fed by callers rather than
+                // graph edges; nothing to demand for those.
                 ValueKind::RegionParam { index, region, .. } => {
-                    let index = *index;
-                    let owner = self.regions[region.0 as usize].owner;
-                    match self.get_value_kind(owner) {
-                        // Function parameters are fed by callers, not by
-                        // graph edges; nothing to demand.
-                        ValueKind::Lambda { .. } => {}
-                        // The outer value feeding the slot, and the slot's
-                        // parameter in every sibling arm: slots are
-                        // aligned across arms, so a slot read anywhere
-                        // survives everywhere.
-                        ValueKind::Gamma {
-                            inputs, regions, ..
-                        } => {
-                            stack.push(self.value_pool.get(*inputs)[index as usize]);
-                            for &arm in self.region_pool.get(*regions) {
-                                stack.push(self.regions[arm.0 as usize].params[index as usize]);
+                    if region.0 != 0 {
+                        let index = *index;
+                        let owner = self.regions[region.0 as usize].owner;
+                        match self.get_value_kind(owner) {
+                            // The outer value feeding the slot, and the slot's
+                            // parameter in every sibling arm: slots are
+                            // aligned across arms, so a slot read anywhere
+                            // survives everywhere.
+                            ValueKind::Gamma {
+                                inputs, regions, ..
+                            } => {
+                                stack.push(self.value_pool.get(*inputs)[index as usize]);
+                                for &arm in self.region_pool.get(*regions) {
+                                    stack.push(self.regions[arm.0 as usize].params[index as usize]);
+                                }
                             }
+                            ValueKind::Theta { .. } => {
+                                self.push_theta_slot_faces(owner, index as u16, &mut stack);
+                            }
+                            t => Err(eyre!(
+                                "region {region:?} owned by non-construct value {owner:?} ({t:?})"
+                            ))?,
                         }
-                        ValueKind::Theta { .. } => {
-                            self.push_theta_slot_faces(owner, index as u16, &mut stack);
-                        }
-                        // A used recursion variable demands the lambda
-                        // bound to it.
-                        ValueKind::Phi { region, .. } => {
-                            let results = self.regions[region.0 as usize].results;
-                            stack.push(self.value_pool.get(results)[index as usize]);
-                        }
-                        t => Err(eyre!(
-                            "region {region:?} owned by non-construct value {owner:?} ({t:?})"
-                        ))?,
                     }
                 }
                 // this is inefficent since we're rematching, but it prevents duping the logic of
@@ -310,11 +273,13 @@ impl RVSDGMod {
                 live_values += 1;
             }
         }
-        // A region lives exactly as long as the construct owning it.
+        // The body region (region 0, owner-less by the root convention)
+        // always lives; every other region lives exactly as long as the
+        // construct owning it.
         let mut region_mapper = vec![u32::MAX; self.regions.len()];
         let mut live_regions: u32 = 0;
         for (old, region) in self.regions.iter().enumerate() {
-            if alive[region.owner.0 as usize] {
+            if old == 0 || alive[region.owner.0 as usize] {
                 region_mapper[old] = live_regions;
                 live_regions += 1;
             }
@@ -342,7 +307,7 @@ impl RVSDGMod {
                     value_mapper: &value_mapper,
                     region_mapper: &region_mapper,
                     alive,
-                    module: self,
+                    graph: self,
                     fresh: &mut fresh,
                     scratch: &mut scratch,
                     effects,
@@ -369,14 +334,11 @@ impl RVSDGMod {
 
             // Result slots of a gamma arm or theta body live and die
             // with their projection (old ids: projections sit directly
-            // after their construct). A lambda region's results are the
-            // function's ABI and are kept whole.
+            // after their construct). The body region's results (region
+            // 0, owner-less by the root convention) are the function's
+            // ABI and are kept whole.
             let owner_old = self.regions[new as usize].owner;
-            let owner_new = value_mapper[owner_old.0 as usize];
-            let keep_all_results = matches!(
-                self.value_kinds[owner_new as usize],
-                ValueKind::Lambda { .. }
-            );
+            let keep_all_results = old == 0;
             let results = self.regions[new as usize].results;
             let new_results = repool_masked(
                 &self.value_pool,
@@ -390,7 +352,9 @@ impl RVSDGMod {
 
             let region = &mut self.regions[new as usize];
             region.results = new_results;
-            region.owner = ValueId(owner_new);
+            if old != 0 {
+                region.owner = ValueId(value_mapper[owner_old.0 as usize]);
+            }
             // States are remapped poison-blind everywhere else by
             // design; these two are the only remaps with no assert
             // between them and a use-site panic, so check here.
@@ -417,12 +381,6 @@ impl RVSDGMod {
 
         fresh.install(self);
 
-        for func in self.functions.iter_mut() {
-            if let Some(id) = func.lambda_val {
-                func.lambda_val = Some(ValueId(value_mapper[id.0 as usize]));
-            }
-        }
-
         self.remap_interned_values(alive, &value_mapper);
 
         Ok(())
@@ -434,8 +392,8 @@ impl RVSDGMod {
 /// and index renumbering) while the pools are written (span contents
 /// rewritten in place).
 /// The pools rebuilt by a compaction: live spans are repooled here and
-/// the whole set swaps into the module at the end, dropping the old
-/// pools holes and all. Field names mirror the module's.
+/// the whole set swaps into the graph at the end, dropping the old
+/// pools holes and all. Field names mirror the graph's.
 #[derive(Default)]
 struct FreshPools {
     value_pool: ValuePool,
@@ -445,11 +403,11 @@ struct FreshPools {
 }
 
 impl FreshPools {
-    fn install(self, module: &mut RVSDGMod) {
-        module.value_pool = self.value_pool;
-        module.region_pool = self.region_pool;
-        module.u32_pool = self.u32_pool;
-        module.match_arm_pool = self.match_arm_pool;
+    fn install(self, graph: &mut FunctionGraph) {
+        graph.value_pool = self.value_pool;
+        graph.region_pool = self.region_pool;
+        graph.u32_pool = self.u32_pool;
+        graph.match_arm_pool = self.match_arm_pool;
     }
 }
 
@@ -479,7 +437,7 @@ struct RemapContext<'a> {
     region_mapper: &'a [u32],
     alive: &'a [bool],
     /// Read side: the pre-compaction graph (regions and pools).
-    module: &'a RVSDGMod,
+    graph: &'a FunctionGraph,
     /// Write side: the pools being rebuilt.
     fresh: &'a mut FreshPools,
     /// Reused staging buffer for masked span copies.
@@ -514,7 +472,7 @@ impl RemapContext<'_> {
         keep: impl FnMut(usize) -> bool,
     ) -> ValuesSpan {
         repool_masked(
-            &self.module.value_pool,
+            &self.graph.value_pool,
             &mut self.fresh.value_pool,
             self.scratch,
             self.value_mapper,
@@ -530,7 +488,7 @@ impl RemapContext<'_> {
         let new_span = self
             .fresh
             .region_pool
-            .push_slice(self.module.region_pool.get(span));
+            .push_slice(self.graph.region_pool.get(span));
         for region in self.fresh.region_pool.get_mut(new_span) {
             *region = RegionId(self.region_mapper[region.0 as usize]);
         }
@@ -541,7 +499,7 @@ impl RemapContext<'_> {
     fn repool_u32(&mut self, span: U32Span) -> U32Span {
         self.fresh
             .u32_pool
-            .push_slice(self.module.u32_pool.get(span))
+            .push_slice(self.graph.u32_pool.get(span))
     }
 
     /// Copy a match-arm span (constant case-to-alternative pairs)
@@ -549,7 +507,7 @@ impl RemapContext<'_> {
     fn repool_match_arms(&mut self, span: MatchArmSpan) -> MatchArmSpan {
         self.fresh
             .match_arm_pool
-            .push_slice(self.module.match_arm_pool.get(span))
+            .push_slice(self.graph.match_arm_pool.get(span))
     }
 }
 
@@ -682,7 +640,6 @@ fn remap_kind(
             *callee = ctx.map_value(*callee);
             *args = ctx.repool_values(*args);
         }
-        ValueKind::Lambda { region, .. } => *region = ctx.map_region(*region),
         ValueKind::Theta {
             loop_vars,
             condition,
@@ -692,7 +649,7 @@ fn remap_kind(
             *condition = ctx.map_value(*condition);
             *state = ctx.map_state(*state);
             let alive = ctx.alive;
-            let body = &ctx.module.regions[region_id.0 as usize];
+            let body = &ctx.graph.regions[region_id.0 as usize];
             // The slot mask here is the body parameter; the body
             // results shrink later against the projection. The mark
             // keeps a slot's four faces in lockstep -- hold it to that.
@@ -722,18 +679,13 @@ fn remap_kind(
             // parameter liveness is THE slot mask; arms themselves
             // always survive with their construct.
             let alive = ctx.alive;
-            let arm0 = ctx.module.region_pool.get(*regions)[0];
-            let arm0_params: &[ValueId] = &ctx.module.regions[arm0.0 as usize].params;
+            let arm0 = ctx.graph.region_pool.get(*regions)[0];
+            let arm0_params: &[ValueId] = &ctx.graph.regions[arm0.0 as usize].params;
             let repooled =
                 ctx.repool_values_masked(*inputs, |slot| alive[arm0_params[slot].0 as usize]);
             ctx.effects.gamma_input_slots_dropped += (inputs.len - repooled.len) as u64;
             *inputs = repooled;
             *regions = ctx.repool_regions(*regions);
-        }
-        ValueKind::Phi { .. } => {
-            return Err(eyre!(
-                "phi constructs are not yet handled by dead node elimination"
-            ));
         }
         // Projections are contiguous after their node, so the new index
         // is the count of live projections before this one. For
@@ -753,7 +705,7 @@ fn remap_kind(
             // state parameter sits one past the params list (its index
             // equals the list length), so counting the whole list gives
             // its new one-past position.
-            let params = &ctx.module.regions[region.0 as usize].params;
+            let params = &ctx.graph.regions[region.0 as usize].params;
             *index = params[..*index as usize]
                 .iter()
                 .filter(|param| ctx.alive[param.0 as usize])
@@ -779,6 +731,7 @@ mod tests {
         ArithFlags, BinaryOp, ConstValue, ICmpPred, Linkage, RVSDGMod, ValueId, ValueKind,
         builder::{BranchResult, LoopResult},
         func::FnResult,
+        function_graph::FunctionGraph,
         types::{BOOL, I32, PtrType, TypeRef},
     };
 
@@ -786,11 +739,32 @@ mod tests {
     // an Add, so assertions are just kind counts and survive the id
     // renumbering that rebuild-with-compaction performs.
 
+    /// The single defined function graph these tests build. Ids captured
+    /// during define_fn are ids of THIS graph.
+    fn graph(m: &RVSDGMod) -> &FunctionGraph {
+        let mut graphs = m.graphs.iter().flatten();
+        let graph = graphs.next().expect("test defines one function");
+        assert!(
+            graphs.next().is_none(),
+            "these tests assume a single function"
+        );
+        graph
+    }
+
+    fn graph_mut(m: &mut RVSDGMod) -> &mut FunctionGraph {
+        m.graphs
+            .iter_mut()
+            .flatten()
+            .next()
+            .expect("test defines one function")
+    }
+
     fn count_nodes(m: &RVSDGMod, pred: impl Fn(&ValueKind) -> bool) -> usize {
-        m.regions
+        let g = graph(m);
+        g.regions
             .iter()
             .flat_map(|region| region.nodes.iter())
-            .filter(|id| pred(m.get_value_kind(**id)))
+            .filter(|id| pred(g.get_value_kind(**id)))
             .count()
     }
 
@@ -809,10 +783,11 @@ mod tests {
     /// The single node matching `pred`, by id. Panics unless exactly one
     /// exists, so lookups cannot silently grab the wrong construct.
     fn single_node(m: &RVSDGMod, pred: impl Fn(&ValueKind) -> bool) -> ValueId {
+        let g = graph(m);
         let mut found = None;
-        for region in &m.regions {
+        for region in &g.regions {
             for &id in &region.nodes {
-                if pred(m.get_value_kind(id)) {
+                if pred(g.get_value_kind(id)) {
                     assert!(found.is_none(), "expected exactly one matching node");
                     found = Some(id);
                 }
@@ -822,7 +797,7 @@ mod tests {
     }
 
     fn ptr_ty(m: &mut RVSDGMod) -> TypeRef {
-        let id = m.types.intern_ptr(PtrType {
+        let id = m.tables.types.intern_ptr(PtrType {
             pointee: Some(I32),
             alias_set: None,
             no_escape: false,
@@ -836,10 +811,9 @@ mod tests {
     }
 
     fn mark_alive(m: &RVSDGMod) -> Vec<bool> {
-        let mut alive = vec![false; m.value_kinds.len()];
-        for func in &m.functions {
-            m.mark_alive_nodes(&mut alive, func).unwrap();
-        }
+        let g = graph(m);
+        let mut alive = vec![false; g.value_kinds.len()];
+        g.mark_alive_nodes(&mut alive).unwrap();
         alive
     }
 
@@ -1049,7 +1023,7 @@ mod tests {
         // (remove_dead_nodes refuses them: they share their span with
         // the region's results), so a valid crafted slice excludes
         // them too.
-        let alive: Vec<bool> = m
+        let alive: Vec<bool> = graph(&m)
             .value_kinds
             .iter()
             .map(|v| {
@@ -1063,7 +1037,8 @@ mod tests {
             })
             .collect();
 
-        m.remove_dead_nodes(&alive, &mut DneEffects::default())
+        graph_mut(&mut m)
+            .remove_dead_nodes(&alive, &mut DneEffects::default())
             .unwrap();
 
         assert_verified(&m);
@@ -1074,7 +1049,11 @@ mod tests {
             "exactly the flagged node is gone"
         );
         assert_eq!(
-            m.regions.iter().map(|r| r.params.len()).sum::<usize>(),
+            graph(&m)
+                .regions
+                .iter()
+                .map(|r| r.params.len())
+                .sum::<usize>(),
             2,
             "region parameters survive"
         );
@@ -1095,13 +1074,14 @@ mod tests {
         })
         .unwrap();
         let nodes_before = count_nodes(&m, |_| true);
-        let alive: Vec<bool> = m
+        let alive: Vec<bool> = graph(&m)
             .value_kinds
             .iter()
             .map(|v| !matches!(v, ValueKind::RegionResult { .. }))
             .collect();
 
-        m.remove_dead_nodes(&alive, &mut DneEffects::default())
+        graph_mut(&mut m)
+            .remove_dead_nodes(&alive, &mut DneEffects::default())
             .unwrap();
 
         assert_verified(&m);
@@ -1146,28 +1126,28 @@ mod tests {
             })
         })
         .unwrap();
-        let value_pool_before = m.value_pool.len();
-        let region_pool_before = m.region_pool.len();
+        let value_pool_before = graph(&m).value_pool.len();
+        let region_pool_before = graph(&m).region_pool.len();
 
         m.opt_dead_node_elimination().unwrap();
 
         assert_verified(&m);
         assert!(
-            m.value_pool.len() < value_pool_before,
+            graph(&m).value_pool.len() < value_pool_before,
             "dead gamma spans reclaimed: {} -> {}",
             value_pool_before,
-            m.value_pool.len()
+            graph(&m).value_pool.len()
         );
         assert!(
-            m.region_pool.len() < region_pool_before,
+            graph(&m).region_pool.len() < region_pool_before,
             "dead regions span reclaimed: {} -> {}",
             region_pool_before,
-            m.region_pool.len()
+            graph(&m).region_pool.len()
         );
         // Only the function region's results span (one entry) remains
         // in the value pool.
-        assert_eq!(m.value_pool.len(), 1);
-        assert_eq!(m.region_pool.len(), 0);
+        assert_eq!(graph(&m).value_pool.len(), 1);
+        assert_eq!(graph(&m).region_pool.len(), 0);
     }
 
     /// Layer-1 observability: the pipeline returns one report per pass
@@ -1569,12 +1549,13 @@ mod tests {
 
         assert_verified(&m);
         let gamma = single_node(&m, |k| matches!(k, ValueKind::Gamma { .. }));
-        let ValueKind::Gamma { regions, .. } = *m.get_value_kind(gamma) else {
+        let g = graph(&m);
+        let ValueKind::Gamma { regions, .. } = *g.get_value_kind(gamma) else {
             unreachable!();
         };
-        for &arm in m.region_pool.get(regions) {
+        for &arm in g.region_pool.get(regions) {
             assert_eq!(
-                m.value_pool.get(m.regions[arm.0 as usize].results).len(),
+                g.value_pool.get(g.regions[arm.0 as usize].results).len(),
                 1,
                 "unused result slot removed from every arm"
             );
@@ -1632,20 +1613,21 @@ mod tests {
 
         assert_verified(&m);
         let gamma = single_node(&m, |k| matches!(k, ValueKind::Gamma { .. }));
+        let g = graph(&m);
         let ValueKind::Gamma {
             inputs, regions, ..
-        } = m.get_value_kind(gamma)
+        } = g.get_value_kind(gamma)
         else {
             unreachable!();
         };
         assert_eq!(
-            m.value_pool.get(*inputs).len(),
+            g.value_pool.get(*inputs).len(),
             0,
             "unreferenced input slot removed"
         );
-        for &arm in m.region_pool.get(*regions) {
+        for &arm in g.region_pool.get(*regions) {
             assert_eq!(
-                m.regions[arm.0 as usize].params.len(),
+                g.regions[arm.0 as usize].params.len(),
                 0,
                 "matching arm parameter removed"
             );
@@ -1691,23 +1673,24 @@ mod tests {
 
         assert_verified(&m);
         let theta = single_node(&m, |k| matches!(k, ValueKind::Theta { .. }));
+        let g = graph(&m);
         let ValueKind::Theta {
             loop_vars,
             region_id,
             ..
-        } = *m.get_value_kind(theta)
+        } = *g.get_value_kind(theta)
         else {
             unreachable!();
         };
         assert_eq!(
-            m.value_pool.get(loop_vars).len(),
+            g.value_pool.get(loop_vars).len(),
             1,
             "pass-through loop variable removed from the theta inputs"
         );
-        let body = &m.regions[region_id.0 as usize];
+        let body = &g.regions[region_id.0 as usize];
         assert_eq!(body.params.len(), 1, "matching body parameter removed");
         assert_eq!(
-            m.value_pool.get(body.results).len(),
+            g.value_pool.get(body.results).len(),
             1,
             "matching body result slot removed"
         );
@@ -1751,11 +1734,12 @@ mod tests {
 
         assert_verified(&m);
         let theta = single_node(&m, |k| matches!(k, ValueKind::Theta { .. }));
-        let ValueKind::Theta { loop_vars, .. } = *m.get_value_kind(theta) else {
+        let g = graph(&m);
+        let ValueKind::Theta { loop_vars, .. } = *g.get_value_kind(theta) else {
             unreachable!();
         };
         assert_eq!(
-            m.value_pool.get(loop_vars).len(),
+            g.value_pool.get(loop_vars).len(),
             1,
             "self-feeding but externally unread loop variable removed"
         );

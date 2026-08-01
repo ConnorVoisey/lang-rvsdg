@@ -462,7 +462,12 @@ fn probe_program(program: &Program) -> color_eyre::Result<Probed> {
     let rvsdg = RVSDGMod::from_llvm_mod(crate::ir_file_to_mod(staged.path())?)?;
     Ok(Probed {
         name: program.name.clone(),
-        values: rvsdg.value_kinds.len(),
+        values: rvsdg.graphs.iter().fold(0, |acc, g| {
+            acc + match g {
+                Some(g) => g.value_kinds.len(),
+                None => 0,
+            }
+        }),
         verified: rvsdg.verify().is_empty(),
         staged,
         io: tempfile::tempdir()?,

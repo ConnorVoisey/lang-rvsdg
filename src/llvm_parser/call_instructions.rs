@@ -37,7 +37,7 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
     ) -> color_eyre::Result<SignatureId> {
         let func_type = match self
             .rb
-            .graph
+            .module_tables
             .types
             .convert_type_ref(&inst.function_ty, self.fn_ctx.llvm_mod)?
         {
@@ -48,15 +48,19 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
             .arguments
             .iter()
             .map(|(_, attrs)| {
-                convert_param_attrs(attrs, &mut self.rb.graph.types, self.fn_ctx.llvm_mod)
+                convert_param_attrs(
+                    attrs,
+                    &mut self.rb.module_tables.types,
+                    self.fn_ctx.llvm_mod,
+                )
             })
             .collect::<color_eyre::Result<Vec<_>>>()?;
         let return_attrs = convert_param_attrs(
             &inst.return_attributes,
-            &mut self.rb.graph.types,
+            &mut self.rb.module_tables.types,
             self.fn_ctx.llvm_mod,
         )?;
-        Ok(self.rb.graph.signatures.intern(Signature {
+        Ok(self.rb.module_tables.signatures.intern(Signature {
             func_type,
             param_attrs,
             return_attrs,
@@ -112,7 +116,7 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
         let result = if let Some(name) = callee_as_global_name(callee_operand)
             && let Some(&fn_id) = self
                 .rb
-                .graph
+                .module_tables
                 .fn_map
                 .get(&crate::llvm_parser::global_name_string(name))
         {

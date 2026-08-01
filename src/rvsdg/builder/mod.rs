@@ -6,25 +6,26 @@ mod memory;
 use smallvec::SmallVec;
 
 use crate::rvsdg::{
-    FuncId, RVSDGMod, Region, RegionId, State, Value, ValueId, ValueKind, ValuesSpan,
-    types::TypeRef,
+    FuncId, Region, RegionId, State, Value, ValueId, ValueKind, ValuesSpan,
+    function_graph::FunctionGraph, module_tables::ModuleTables, types::TypeRef,
 };
 
 /// Passed to a branch closure -- represents being inside a gamma branch
 #[derive(Debug)]
 pub struct RegionBuilder<'a> {
     pub region_id: RegionId,
-    pub graph: &'a mut RVSDGMod,
+    pub graph: &'a mut FunctionGraph,
+    pub module_tables: &'a mut ModuleTables,
 }
 
-impl RVSDGMod {
+impl FunctionGraph {
     /// Append a parameter to `region`, returning its value. Used by the
     /// emitter's capture-on-demand: a region acquires an input the moment
     /// its body first reads an outer value, so parameter values interleave
     /// with body values in the global array (which is why `Region::params`
     /// is an explicit list).
     pub(crate) fn append_region_param(&mut self, region: RegionId, ty: TypeRef) -> ValueId {
-        let index = self.regions[region.0 as usize].params.len() as u32;
+        let index = self.get_region(region).params.len() as u32;
         let id = ValueId(self.value_kinds.len() as u32);
         self.value_kinds
             .push(ValueKind::RegionParam { index, ty, region });
@@ -50,14 +51,14 @@ impl RVSDGMod {
             *index = position as u32;
             *param_region = region;
         }
-        self.regions[region.0 as usize].params = params.into();
+        self.get_region_mut(region).params = params.into();
     }
 
     /// Set `region`'s results (construct assembly runs after the region's
     /// body has been emitted).
     pub(crate) fn set_region_results(&mut self, region: RegionId, results: &[ValueId]) {
         let span = self.value_pool.push_slice(results);
-        self.regions[region.0 as usize].results = span;
+        self.get_region_mut(region).results = span;
     }
 }
 
@@ -65,11 +66,23 @@ impl<'a> RegionBuilder<'a> {
     /// A builder over an already-created region, for incremental construct
     /// assembly: the region is created first (`add_region`), emitted into,
     /// and the enclosing gamma/theta node built afterwards.
-    pub fn over(graph: &'a mut RVSDGMod, region_id: RegionId) -> Self {
-        Self { region_id, graph }
+    pub fn over(
+        graph: &'a mut FunctionGraph,
+        module_tables: &'a mut ModuleTables,
+        region_id: RegionId,
+    ) -> Self {
+        Self {
+            region_id,
+            module_tables,
+            graph,
+        }
     }
 
-    pub fn new_empty(graph: &'a mut RVSDGMod, entry_state: State) -> Self {
+    pub fn new_empty(
+        graph: &'a mut FunctionGraph,
+        module_tables: &'a mut ModuleTables,
+        entry_state: State,
+    ) -> Self {
         let region = RegionId(graph.regions.len() as u32);
         graph.regions.push(Region {
             params: SmallVec::new(),
@@ -81,12 +94,14 @@ impl<'a> RegionBuilder<'a> {
         });
         Self {
             region_id: region,
+            module_tables,
             graph,
         }
     }
 
     pub fn new_with_params(
-        graph: &'a mut RVSDGMod,
+        graph: &'a mut FunctionGraph,
+        module_tables: &'a mut ModuleTables,
         entry_state: State,
         param_types: &[TypeRef],
     ) -> Self {
@@ -116,13 +131,18 @@ impl<'a> RegionBuilder<'a> {
         });
         Self {
             region_id: region,
+            module_tables,
             graph,
         }
     }
 
-    pub fn new_from_func(graph: &'a mut RVSDGMod, func_id: FuncId) -> Self {
+    pub fn new_from_func(
+        graph: &'a mut FunctionGraph,
+        module_tables: &'a mut ModuleTables,
+        func_id: FuncId,
+    ) -> Self {
         let region = RegionId(graph.regions.len() as u32);
-        let fn_params = &graph.functions[func_id.0 as usize].params;
+        let fn_params = &module_tables.get_function(func_id).params;
 
         let params = {
             let fn_param_tys: Vec<TypeRef> = fn_params.iter().map(|param| param.ty).collect();
@@ -158,6 +178,7 @@ impl<'a> RegionBuilder<'a> {
         });
         Self {
             region_id: region,
+            module_tables,
             graph,
         }
     }
@@ -169,7 +190,7 @@ impl<'a> RegionBuilder<'a> {
 
     #[inline]
     pub fn param(&self, index: u32) -> ValueId {
-        self.graph.regions[self.region_id.0 as usize].params[index as usize]
+        self.graph.get_region(self.region_id).params[index as usize]
     }
 
     #[inline]
@@ -186,7 +207,7 @@ impl<'a> RegionBuilder<'a> {
         id
     }
 
-    #[inline]
+    #[inline(always)]
     pub(crate) fn add_value(&mut self, data: Value) -> ValueId {
         let id = ValueId(self.graph.value_kinds.len() as u32);
         self.graph.value_kinds.push(data.kind);

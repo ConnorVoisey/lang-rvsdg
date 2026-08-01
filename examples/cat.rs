@@ -32,18 +32,18 @@ pub fn build_yes() -> RVSDGMod {
 
     // Build a BUF_SIZE buffer filled with repeating "y\n"
     let buf: Vec<u8> = b"y\n".iter().copied().cycle().take(BUF_SIZE).collect();
-    let arr_id = rvsdg.types.intern_array(ArrayType {
+    let arr_id = rvsdg.tables.types.intern_array(ArrayType {
         element: TypeRef::Scalar(ScalarType::I8),
         len: BUF_SIZE as u64,
     });
     let buf_type = TypeRef::Array(arr_id);
-    let buf_ptr_type = TypeRef::Ptr(rvsdg.types.intern_ptr(PtrType {
+    let buf_ptr_type = TypeRef::Ptr(rvsdg.tables.types.intern_ptr(PtrType {
         pointee: Some(buf_type),
         alias_set: None,
         no_escape: false,
     }));
-    let buf_const_id = rvsdg.constants.string(buf_type, buf);
-    let buf_global = rvsdg.define_global_plain(
+    let buf_const_id = rvsdg.tables.constants.string(buf_type, buf);
+    let buf_global = rvsdg.tables.define_global_plain(
         String::from("yes_buf"),
         buf_type,
         GlobalInit::Init(buf_const_id),

@@ -1,8 +1,4 @@
-use crate::rvsdg::{
-    IntrinsicOp, RVSDGMod, ValueId, ValuesSpan,
-    func::Function,
-    lower_to_llvm::{LLVMBuilderCtx, ValueMapper},
-};
+use crate::rvsdg::{IntrinsicOp, ValueId, ValuesSpan, lower_to_llvm::FunctionLowerer};
 use color_eyre::eyre::{bail, eyre};
 use inkwell::{
     intrinsics::Intrinsic,
@@ -10,273 +6,222 @@ use inkwell::{
     values::{BasicMetadataValueEnum, BasicValueEnum, ValueKind},
 };
 
-impl RVSDGMod {
-    pub(crate) fn lower_intrinsic<'a, 'ctx>(
-        &self,
-        llvm_builder: &LLVMBuilderCtx<'a, 'ctx>,
-        mapper: &mut ValueMapper<'ctx>,
-        rvsdg_func: &Function,
+impl<'m, 'a, 'ctx> FunctionLowerer<'m, 'a, 'ctx> {
+    pub(crate) fn lower_intrinsic(
+        &mut self,
         op: IntrinsicOp,
         args: ValuesSpan,
         value_id: ValueId,
     ) -> color_eyre::Result<()> {
-        let arg_ids = self.value_pool.get(args).to_vec();
-        let arg_vals: Vec<BasicValueEnum<'ctx>> = arg_ids
+        let graph = self.graph;
+        let arg_vals: Vec<BasicValueEnum<'ctx>> = graph
+            .value_pool
+            .get(args)
             .iter()
-            .map(|&id| self.expect_value(llvm_builder, mapper, rvsdg_func, id))
+            .map(|&id| self.expect_value(id))
             .collect::<color_eyre::Result<_>>()?;
 
         match op {
             // Void intrinsics (state-only, no Project)
             IntrinsicOp::MemCopy => {
-                self.call_void_intrinsic(llvm_builder, "llvm.memcpy", &arg_vals)?;
+                self.call_void_intrinsic("llvm.memcpy", &arg_vals)?;
             }
             IntrinsicOp::MemMove => {
-                self.call_void_intrinsic(llvm_builder, "llvm.memmove", &arg_vals)?;
+                self.call_void_intrinsic("llvm.memmove", &arg_vals)?;
             }
             IntrinsicOp::MemSet => {
-                self.call_void_intrinsic(llvm_builder, "llvm.memset", &arg_vals)?;
+                self.call_void_intrinsic("llvm.memset", &arg_vals)?;
             }
             IntrinsicOp::LifetimeStart | IntrinsicOp::LifetimeEnd => {
                 // Optimizer hints -- emit nothing for now
             }
             IntrinsicOp::Unreachable => {
-                llvm_builder.builder.build_unreachable()?;
+                self.builder.build_unreachable()?;
             }
             IntrinsicOp::Expect => {
                 // llvm.expect.i1(condition, expected) -> condition
                 // Just pass through the condition value as the result
-                let project_id = self.projection_of(value_id, 0);
-                mapper.set_val(project_id, arg_vals[0]);
+                let project_id = graph.projection_of(value_id, 0);
+                self.set_val(project_id, arg_vals[0]);
             }
 
             // Single-result intrinsics (Project{0} for the value)
             IntrinsicOp::IntAbs => {
                 let int_val = arg_vals[0].into_int_value();
                 let int_type = BasicTypeEnum::IntType(int_val.get_type());
-                let is_poison = llvm_builder.context.bool_type().const_zero();
+                let is_poison = self.mod_lower.context.bool_type().const_zero();
                 let result = self.call_overloaded_intrinsic(
-                    llvm_builder,
                     "llvm.abs",
                     &[int_type],
                     &[int_val.into(), is_poison.into()],
                     "abs",
                 )?;
-                let project_id = self.projection_of(value_id, 0);
-                mapper.set_val(project_id, result);
+                let project_id = graph.projection_of(value_id, 0);
+                self.set_val(project_id, result);
             }
             IntrinsicOp::FloatFma => {
                 let float_type =
                     BasicTypeEnum::FloatType(arg_vals[0].into_float_value().get_type());
                 let result = self.call_overloaded_intrinsic(
-                    llvm_builder,
                     "llvm.fma",
                     &[float_type],
                     &[arg_vals[0].into(), arg_vals[1].into(), arg_vals[2].into()],
                     "fma",
                 )?;
-                let project_id = self.projection_of(value_id, 0);
-                mapper.set_val(project_id, result);
+                let project_id = graph.projection_of(value_id, 0);
+                self.set_val(project_id, result);
             }
             IntrinsicOp::FloatMin => {
                 let float_type =
                     BasicTypeEnum::FloatType(arg_vals[0].into_float_value().get_type());
                 let result = self.call_overloaded_intrinsic(
-                    llvm_builder,
                     "llvm.minnum",
                     &[float_type],
                     &[arg_vals[0].into(), arg_vals[1].into()],
                     "fmin",
                 )?;
-                let project_id = self.projection_of(value_id, 0);
-                mapper.set_val(project_id, result);
+                let project_id = graph.projection_of(value_id, 0);
+                self.set_val(project_id, result);
             }
             IntrinsicOp::FloatMax => {
                 let float_type =
                     BasicTypeEnum::FloatType(arg_vals[0].into_float_value().get_type());
                 let result = self.call_overloaded_intrinsic(
-                    llvm_builder,
                     "llvm.maxnum",
                     &[float_type],
                     &[arg_vals[0].into(), arg_vals[1].into()],
                     "fmax",
                 )?;
-                let project_id = self.projection_of(value_id, 0);
-                mapper.set_val(project_id, result);
+                let project_id = graph.projection_of(value_id, 0);
+                self.set_val(project_id, result);
             }
             IntrinsicOp::FloatCopySign => {
                 let float_type =
                     BasicTypeEnum::FloatType(arg_vals[0].into_float_value().get_type());
                 let result = self.call_overloaded_intrinsic(
-                    llvm_builder,
                     "llvm.copysign",
                     &[float_type],
                     &[arg_vals[0].into(), arg_vals[1].into()],
                     "copysign",
                 )?;
-                let project_id = self.projection_of(value_id, 0);
-                mapper.set_val(project_id, result);
+                let project_id = graph.projection_of(value_id, 0);
+                self.set_val(project_id, result);
             }
             IntrinsicOp::SignedAddSaturate => {
                 let int_type = BasicTypeEnum::IntType(arg_vals[0].into_int_value().get_type());
                 let result = self.call_overloaded_intrinsic(
-                    llvm_builder,
                     "llvm.sadd.sat",
                     &[int_type],
                     &[arg_vals[0].into(), arg_vals[1].into()],
                     "sadd.sat",
                 )?;
-                let project_id = self.projection_of(value_id, 0);
-                mapper.set_val(project_id, result);
+                let project_id = graph.projection_of(value_id, 0);
+                self.set_val(project_id, result);
             }
             IntrinsicOp::UnsignedAddSaturate => {
                 let int_type = BasicTypeEnum::IntType(arg_vals[0].into_int_value().get_type());
                 let result = self.call_overloaded_intrinsic(
-                    llvm_builder,
                     "llvm.uadd.sat",
                     &[int_type],
                     &[arg_vals[0].into(), arg_vals[1].into()],
                     "uadd.sat",
                 )?;
-                let project_id = self.projection_of(value_id, 0);
-                mapper.set_val(project_id, result);
+                let project_id = graph.projection_of(value_id, 0);
+                self.set_val(project_id, result);
             }
             IntrinsicOp::SignedSubSaturate => {
                 let int_type = BasicTypeEnum::IntType(arg_vals[0].into_int_value().get_type());
                 let result = self.call_overloaded_intrinsic(
-                    llvm_builder,
                     "llvm.ssub.sat",
                     &[int_type],
                     &[arg_vals[0].into(), arg_vals[1].into()],
                     "ssub.sat",
                 )?;
-                let project_id = self.projection_of(value_id, 0);
-                mapper.set_val(project_id, result);
+                let project_id = graph.projection_of(value_id, 0);
+                self.set_val(project_id, result);
             }
             IntrinsicOp::UnsignedSubSaturate => {
                 let int_type = BasicTypeEnum::IntType(arg_vals[0].into_int_value().get_type());
                 let result = self.call_overloaded_intrinsic(
-                    llvm_builder,
                     "llvm.usub.sat",
                     &[int_type],
                     &[arg_vals[0].into(), arg_vals[1].into()],
                     "usub.sat",
                 )?;
-                let project_id = self.projection_of(value_id, 0);
-                mapper.set_val(project_id, result);
+                let project_id = graph.projection_of(value_id, 0);
+                self.set_val(project_id, result);
             }
             IntrinsicOp::SignedMin => {
                 let int_type = BasicTypeEnum::IntType(arg_vals[0].into_int_value().get_type());
                 let result = self.call_overloaded_intrinsic(
-                    llvm_builder,
                     "llvm.smin",
                     &[int_type],
                     &[arg_vals[0].into(), arg_vals[1].into()],
                     "smin",
                 )?;
-                let project_id = self.projection_of(value_id, 0);
-                mapper.set_val(project_id, result);
+                let project_id = graph.projection_of(value_id, 0);
+                self.set_val(project_id, result);
             }
             IntrinsicOp::SignedMax => {
                 let int_type = BasicTypeEnum::IntType(arg_vals[0].into_int_value().get_type());
                 let result = self.call_overloaded_intrinsic(
-                    llvm_builder,
                     "llvm.smax",
                     &[int_type],
                     &[arg_vals[0].into(), arg_vals[1].into()],
                     "smax",
                 )?;
-                let project_id = self.projection_of(value_id, 0);
-                mapper.set_val(project_id, result);
+                let project_id = graph.projection_of(value_id, 0);
+                self.set_val(project_id, result);
             }
             IntrinsicOp::UnsignedMin => {
                 let int_type = BasicTypeEnum::IntType(arg_vals[0].into_int_value().get_type());
                 let result = self.call_overloaded_intrinsic(
-                    llvm_builder,
                     "llvm.umin",
                     &[int_type],
                     &[arg_vals[0].into(), arg_vals[1].into()],
                     "umin",
                 )?;
-                let project_id = self.projection_of(value_id, 0);
-                mapper.set_val(project_id, result);
+                let project_id = graph.projection_of(value_id, 0);
+                self.set_val(project_id, result);
             }
             IntrinsicOp::UnsignedMax => {
                 let int_type = BasicTypeEnum::IntType(arg_vals[0].into_int_value().get_type());
                 let result = self.call_overloaded_intrinsic(
-                    llvm_builder,
                     "llvm.umax",
                     &[int_type],
                     &[arg_vals[0].into(), arg_vals[1].into()],
                     "umax",
                 )?;
-                let project_id = self.projection_of(value_id, 0);
-                mapper.set_val(project_id, result);
+                let project_id = graph.projection_of(value_id, 0);
+                self.set_val(project_id, result);
             }
 
             // Two-result overflow intrinsics (Project{0} = result, Project{1} = overflow flag)
             IntrinsicOp::SignedAddOverflow => {
-                self.lower_overflow_intrinsic(
-                    llvm_builder,
-                    mapper,
-                    "llvm.sadd.with.overflow",
-                    &arg_vals,
-                    value_id,
-                )?;
+                self.lower_overflow_intrinsic("llvm.sadd.with.overflow", &arg_vals, value_id)?;
             }
             IntrinsicOp::UnsignedAddOverflow => {
-                self.lower_overflow_intrinsic(
-                    llvm_builder,
-                    mapper,
-                    "llvm.uadd.with.overflow",
-                    &arg_vals,
-                    value_id,
-                )?;
+                self.lower_overflow_intrinsic("llvm.uadd.with.overflow", &arg_vals, value_id)?;
             }
             IntrinsicOp::SignedSubOverflow => {
-                self.lower_overflow_intrinsic(
-                    llvm_builder,
-                    mapper,
-                    "llvm.ssub.with.overflow",
-                    &arg_vals,
-                    value_id,
-                )?;
+                self.lower_overflow_intrinsic("llvm.ssub.with.overflow", &arg_vals, value_id)?;
             }
             IntrinsicOp::UnsignedSubOverflow => {
-                self.lower_overflow_intrinsic(
-                    llvm_builder,
-                    mapper,
-                    "llvm.usub.with.overflow",
-                    &arg_vals,
-                    value_id,
-                )?;
+                self.lower_overflow_intrinsic("llvm.usub.with.overflow", &arg_vals, value_id)?;
             }
             IntrinsicOp::SignedMulOverflow => {
-                self.lower_overflow_intrinsic(
-                    llvm_builder,
-                    mapper,
-                    "llvm.smul.with.overflow",
-                    &arg_vals,
-                    value_id,
-                )?;
+                self.lower_overflow_intrinsic("llvm.smul.with.overflow", &arg_vals, value_id)?;
             }
             IntrinsicOp::UnsignedMulOverflow => {
-                self.lower_overflow_intrinsic(
-                    llvm_builder,
-                    mapper,
-                    "llvm.umul.with.overflow",
-                    &arg_vals,
-                    value_id,
-                )?;
+                self.lower_overflow_intrinsic("llvm.umul.with.overflow", &arg_vals, value_id)?;
             }
         }
 
         Ok(())
     }
 
-    fn call_void_intrinsic<'a, 'ctx>(
+    fn call_void_intrinsic(
         &self,
-        llvm_builder: &LLVMBuilderCtx<'a, 'ctx>,
         name: &str,
         args: &[BasicValueEnum<'ctx>],
     ) -> color_eyre::Result<()> {
@@ -284,17 +229,15 @@ impl RVSDGMod {
         let intrinsic =
             Intrinsic::find(name).ok_or_else(|| eyre!("intrinsic `{name}` not found"))?;
         let func = intrinsic
-            .get_declaration(llvm_builder.module, &param_types)
+            .get_declaration(self.mod_lower.module, &param_types)
             .ok_or_else(|| eyre!("failed to get declaration for intrinsic `{name}`"))?;
         let meta_args: Vec<BasicMetadataValueEnum<'ctx>> = args.iter().map(|&a| a.into()).collect();
-        llvm_builder.builder.build_call(func, &meta_args, name)?;
+        self.builder.build_call(func, &meta_args, name)?;
         Ok(())
     }
 
-    fn lower_overflow_intrinsic<'a, 'ctx>(
-        &self,
-        llvm_builder: &LLVMBuilderCtx<'a, 'ctx>,
-        mapper: &mut ValueMapper<'ctx>,
+    fn lower_overflow_intrinsic(
+        &mut self,
         name: &str,
         args: &[BasicValueEnum<'ctx>],
         value_id: ValueId,
@@ -303,10 +246,10 @@ impl RVSDGMod {
         let intrinsic =
             Intrinsic::find(name).ok_or_else(|| eyre!("intrinsic `{name}` not found"))?;
         let func = intrinsic
-            .get_declaration(llvm_builder.module, &[int_type])
+            .get_declaration(self.mod_lower.module, &[int_type])
             .ok_or_else(|| eyre!("failed to get declaration for intrinsic `{name}`"))?;
         let meta_args: Vec<BasicMetadataValueEnum<'ctx>> = args.iter().map(|&a| a.into()).collect();
-        let call_result = llvm_builder
+        let call_result = self
             .builder
             .build_call(func, &meta_args, name)?
             .try_as_basic_value();
@@ -314,14 +257,12 @@ impl RVSDGMod {
             ValueKind::Basic(struct_val) => {
                 // The overflow intrinsic returns {iN, i1}
                 let sv = struct_val.into_struct_value();
-                let result = llvm_builder.builder.build_extract_value(sv, 0, "result")?;
-                let overflow = llvm_builder
-                    .builder
-                    .build_extract_value(sv, 1, "overflow")?;
-                let project_0 = self.projection_of(value_id, 0);
-                let project_1 = self.projection_of(value_id, 1);
-                mapper.set_val(project_0, result);
-                mapper.set_val(project_1, overflow);
+                let result = self.builder.build_extract_value(sv, 0, "result")?;
+                let overflow = self.builder.build_extract_value(sv, 1, "overflow")?;
+                let project_0 = self.graph.projection_of(value_id, 0);
+                let project_1 = self.graph.projection_of(value_id, 1);
+                self.set_val(project_0, result);
+                self.set_val(project_1, overflow);
             }
             ValueKind::Instruction(_) => {
                 bail!("overflow intrinsic `{name}` unexpectedly returned void")

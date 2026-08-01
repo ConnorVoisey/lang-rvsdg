@@ -1,11 +1,12 @@
 use crate::rvsdg::{
-    FuncId, GlobalId, GlobalInit, Linkage, RVSDGMod, Region, ThreadLocalMode, ValueId, ValueKind,
-    Visibility,
+    FuncId, GlobalId, GlobalInit, Linkage, RVSDGMod, Region, ThreadLocalMode, ValueId, Visibility,
     func::{
         CallingConvention, FnAttrFlags, FnAttrs, Function, MemoryEffects, ModRef, ParamAttrFlags,
         ParamAttrsExtra, Signature,
     },
+    function_graph::FunctionGraph,
     global::{DllStorageClass, GlobalDef, UnnamedAddr},
+    module_tables::ModuleTables,
     types::{ScalarType, TypeRef},
 };
 use color_eyre::eyre::{bail, eyre};
@@ -60,17 +61,21 @@ pub mod unary;
 pub mod value;
 
 #[derive(Debug)]
-pub struct LLVMBuilderCtx<'a, 'ctx> {
+pub struct ModuleLowerer<'a, 'ctx> {
     context: &'ctx Context,
     module: &'a Module<'ctx>,
-    builder: &'a Builder<'ctx>,
+    tables: &'a ModuleTables,
+    fns: Vec<Option<FunctionValue<'ctx>>>,
+    globals: Vec<Option<GlobalValue<'ctx>>>,
 }
 
 #[derive(Debug)]
-pub struct ValueMapper<'ctx> {
+pub struct FunctionLowerer<'m, 'a, 'ctx> {
+    mod_lower: &'m mut ModuleLowerer<'a, 'ctx>,
+    builder: &'a Builder<'ctx>,
+    graph: &'a FunctionGraph,
+    func_id: FuncId,
     values: Vec<Option<BasicValueEnum<'ctx>>>,
-    fns: Vec<Option<FunctionValue<'ctx>>>,
-    globals: Vec<Option<GlobalValue<'ctx>>>,
     /// Control nodes (gamma/theta) currently being lowered. A node has no
     /// mapper entry until it completes, so a value inside a construct that
     /// (illegally) references the construct itself would re-enter its
@@ -79,14 +84,52 @@ pub struct ValueMapper<'ctx> {
     in_progress: rustc_hash::FxHashSet<ValueId>,
 }
 
-impl<'ctx> ValueMapper<'ctx> {
-    fn new(rvsdg_mod: &RVSDGMod) -> Self {
+impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
+    fn new(context: &'ctx Context, module: &'a Module<'ctx>, tables: &'a ModuleTables) -> Self {
         Self {
-            values: vec![None; rvsdg_mod.value_kinds.len()],
-            fns: vec![None; rvsdg_mod.functions.len()],
-            globals: vec![None; rvsdg_mod.globals.len()],
-            in_progress: rustc_hash::FxHashSet::default(),
+            context,
+            module,
+            tables,
+            fns: vec![None; tables.functions.len()],
+            globals: vec![None; tables.globals.len()],
         }
+    }
+
+    fn get_fn(&self, func_id: FuncId) -> Option<FunctionValue<'ctx>> {
+        self.fns[func_id.0 as usize]
+    }
+    fn set_fn(&mut self, func_id: FuncId, func: FunctionValue<'ctx>) {
+        self.fns[func_id.0 as usize] = Some(func);
+    }
+
+    fn get_global(&self, global_id: GlobalId) -> Option<GlobalValue<'ctx>> {
+        self.globals[global_id.0 as usize]
+    }
+    fn set_global(&mut self, global_id: GlobalId, global_value: GlobalValue<'ctx>) {
+        self.globals[global_id.0 as usize] = Some(global_value);
+    }
+}
+
+impl<'m, 'a, 'ctx> FunctionLowerer<'m, 'a, 'ctx> {
+    fn new(
+        mod_lower: &'m mut ModuleLowerer<'a, 'ctx>,
+        builder: &'a Builder<'ctx>,
+        graph: &'a FunctionGraph,
+        func_id: FuncId,
+    ) -> Self {
+        Self {
+            builder,
+            graph,
+            func_id,
+            values: vec![None; graph.value_kinds.len()],
+            in_progress: rustc_hash::FxHashSet::default(),
+            mod_lower,
+        }
+    }
+
+    /// The metadata of the function being lowered.
+    fn function(&self) -> &Function {
+        &self.mod_lower.tables.functions[self.func_id.0 as usize]
     }
 
     /// Mark a control node's lowering as started; errors on re-entry.
@@ -104,25 +147,11 @@ impl<'ctx> ValueMapper<'ctx> {
         self.in_progress.remove(&value_id);
     }
 
-    fn get_val(&self, value_id: ValueId) -> &Option<BasicValueEnum<'ctx>> {
-        &self.values[value_id.0 as usize]
+    fn get_val(&self, value_id: ValueId) -> Option<BasicValueEnum<'ctx>> {
+        self.values[value_id.0 as usize]
     }
     fn set_val(&mut self, value_id: ValueId, value_enum: BasicValueEnum<'ctx>) {
         self.values[value_id.0 as usize] = Some(value_enum);
-    }
-
-    fn get_fn(&self, func_id: FuncId) -> &Option<FunctionValue<'ctx>> {
-        &self.fns[func_id.0 as usize]
-    }
-    fn set_fn(&mut self, func_id: FuncId, func: FunctionValue<'ctx>) {
-        self.fns[func_id.0 as usize] = Some(func);
-    }
-
-    fn get_global(&self, global_id: GlobalId) -> &Option<GlobalValue<'ctx>> {
-        &self.globals[global_id.0 as usize]
-    }
-    fn set_global(&mut self, global_id: GlobalId, global_value: GlobalValue<'ctx>) {
-        self.globals[global_id.0 as usize] = Some(global_value);
     }
 }
 
@@ -139,13 +168,8 @@ impl RVSDGMod {
             module.set_inline_assembly(&self.module_asm);
         }
         let builder = context.create_builder();
-        let llvm_builder = LLVMBuilderCtx {
-            context,
-            module: &module,
-            builder: &builder,
-        };
-        let mut value_mapper = ValueMapper::new(self);
-        self.lower_mod(&llvm_builder, &mut value_mapper)?;
+        let mut mod_lower = ModuleLowerer::new(context, &module, &self.tables);
+        mod_lower.lower_mod(&self.graphs, &builder)?;
         Ok(module)
     }
 
@@ -263,36 +287,42 @@ impl RVSDGMod {
         eprintln!("Run it with:  ./{output}");
         Ok(())
     }
+}
 
-    fn lower_mod<'a, 'ctx>(
-        &self,
-        llvm_builder: &LLVMBuilderCtx<'a, 'ctx>,
-        mapper: &mut ValueMapper<'ctx>,
+impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
+    fn lower_mod(
+        &mut self,
+        graphs: &'a [Option<FunctionGraph>],
+        builder: &'a Builder<'ctx>,
     ) -> color_eyre::Result<()> {
         // For now we'll use a naive implementation that converts the RVSDG directly to llvm
         // without using predicates.
         // TODO: replace this implemenation with this https://static.googleusercontent.com/media/research.google.com/en//pubs/archive/43246.pdf
+        let tables = self.tables;
+        debug_assert_eq!(
+            tables.functions.len(),
+            graphs.len(),
+            "graphs must be FuncId-indexed parallel to tables.functions"
+        );
 
         // Function declarations must precede global initializers: an
         // initializer can take a function's address (a function-pointer
-        // table), and that FuncAddr resolves through the mapper, which only
+        // table), and that FuncAddr resolves through the lowerer, which only
         // has the function once register_fn has declared it. Globals must in
         // turn precede function bodies, which reference them freely.
-        for func in self.functions.iter() {
-            self.register_fn(llvm_builder, mapper, func)?;
+        for func in tables.functions.iter() {
+            self.register_fn(func)?;
         }
-        self.lower_globals(llvm_builder, mapper)?;
-        for func in self.functions.iter() {
-            if func.lambda_val.is_none() {
-                continue; // declaration only, no body to lower
-            }
-            self.lower_fn(llvm_builder, mapper, func)?;
+        self.lower_globals()?;
+        for (func, graph) in tables.functions.iter().zip(graphs.iter()) {
+            let Some(graph) = graph else { continue };
+            FunctionLowerer::new(self, builder, graph, func.id).lower_fn(func)?;
         }
         {
             // Like codegen, LLVM's verifier walks OUR emitted module and
             // scales with its size; span it so it can't hide in traces.
             let _span = tracing::info_span!("llvm_module_verify").entered();
-            if let Err(e) = llvm_builder.module.verify() {
+            if let Err(e) = self.module.verify() {
                 bail!("LLVM module verification failed: {e}");
             }
         }
@@ -300,56 +330,7 @@ impl RVSDGMod {
         Ok(())
     }
 
-    fn lower_globals<'a, 'ctx>(
-        &self,
-        llvm_builder: &LLVMBuilderCtx<'a, 'ctx>,
-        mapper: &mut ValueMapper<'ctx>,
-    ) -> color_eyre::Result<()> {
-        // Pass 1: declare every global. This must finish before any
-        // initializer is lowered, because an initializer can reference another
-        // global that is declared later (e.g. `@a = ptr @b` with `@b` below
-        // `@a`); that GlobalAddr resolves through the mapper, which only has
-        // the global once it's declared here. Same two-pass shape as the
-        // frontend's `from_llvm_mod`.
-        for (i, global) in self.globals.iter().enumerate() {
-            let llvm_type = self.type_to_basic_type_llvm(llvm_builder.context, global.ty)?;
-            let space = (global.addr_space != 0)
-                .then(|| {
-                    AddressSpace::try_from(global.addr_space).map_err(|_| {
-                        eyre!(
-                            "global {} has address space {} outside LLVM's range",
-                            global.name,
-                            global.addr_space
-                        )
-                    })
-                })
-                .transpose()?;
-            let glob = llvm_builder
-                .module
-                .add_global(llvm_type, space, &global.name);
-            apply_global_attrs(glob, global);
-            mapper.set_global(GlobalId(i as u32), glob);
-        }
-
-        // Pass 2: set initializers, now that every global resolves.
-        for (i, global) in self.globals.iter().enumerate() {
-            if let GlobalInit::Init(const_id) = global.initializer {
-                let const_val = self.lower_const_id(llvm_builder, mapper, const_id)?;
-                mapper
-                    .get_global(GlobalId(i as u32))
-                    .ok_or_else(|| eyre!("global {i} was not declared in pass 1"))?
-                    .set_initializer(&const_val as &dyn BasicValue);
-            }
-        }
-        Ok(())
-    }
-
-    fn register_fn<'a, 'ctx>(
-        &self,
-        llvm_builder: &LLVMBuilderCtx<'a, 'ctx>,
-        mapper: &mut ValueMapper<'ctx>,
-        rvsdg_func: &Function,
-    ) -> color_eyre::Result<()> {
+    fn register_fn(&mut self, rvsdg_func: &Function) -> color_eyre::Result<()> {
         if rvsdg_func.return_types.len() >= 2 {
             bail!(
                 "function `{}` has {} return values; LLVM supports at most one",
@@ -361,36 +342,33 @@ impl RVSDGMod {
         let param_types = rvsdg_func
             .params
             .iter()
-            .map(|param| self.type_to_basic_meta_llvm(llvm_builder.context, param.ty))
+            .map(|param| self.type_to_basic_meta_llvm(param.ty))
             .collect::<color_eyre::Result<Vec<_>>>()?;
         let llvm_fn_type = if let Some(&ret_ty) = rvsdg_func.return_types.first() {
-            self.type_to_basic_type_llvm(llvm_builder.context, ret_ty)?
+            self.type_to_basic_type_llvm(ret_ty)?
                 .fn_type(&param_types, rvsdg_func.is_var_arg)
         } else {
-            llvm_builder
-                .context
+            self.context
                 .void_type()
                 .fn_type(&param_types, rvsdg_func.is_var_arg)
         };
 
-        let func_ty = llvm_builder.module.add_function(
+        let func_ty = self.module.add_function(
             &rvsdg_func.name,
             llvm_fn_type,
             Some(rvsdg_func.linkage_type.to_llvm()),
         );
-        self.apply_function_abi(llvm_builder.context, func_ty, rvsdg_func)?;
-        mapper.set_fn(rvsdg_func.id, func_ty);
+        self.apply_function_abi(func_ty, rvsdg_func)?;
+        self.set_fn(rvsdg_func.id, func_ty);
         Ok(())
     }
-
     /// Re-apply a function's ABI to its LLVM declaration: calling
     /// convention plus the parameter and return attributes that change how
     /// values physically move (`byval` stack-copies, `sret` return slots,
     /// `zeroext`/`signext` extensions). Dropping any of these silently
     /// miscompiles calls across an externally-compiled boundary.
-    fn apply_function_abi<'ctx>(
+    fn apply_function_abi(
         &self,
-        context: &'ctx Context,
         func_value: FunctionValue<'ctx>,
         function: &Function,
     ) -> color_eyre::Result<()> {
@@ -398,7 +376,6 @@ impl RVSDGMod {
         let mut attributes = Vec::new();
         for (index, param) in function.params.iter().enumerate() {
             self.collect_abi_attributes(
-                context,
                 AttributeLoc::Param(index as u32),
                 param.flags,
                 param.extra.as_deref(),
@@ -406,7 +383,6 @@ impl RVSDGMod {
             )?;
         }
         self.collect_abi_attributes(
-            context,
             AttributeLoc::Return,
             function.return_attrs.flags,
             function.return_attrs.extra.as_deref(),
@@ -445,14 +421,15 @@ impl RVSDGMod {
             if flags.contains(flag) {
                 func_value.add_attribute(
                     AttributeLoc::Function,
-                    context.create_enum_attribute(Attribute::get_named_enum_kind_id(name), value),
+                    self.context
+                        .create_enum_attribute(Attribute::get_named_enum_kind_id(name), value),
                 );
             }
         }
         if let Some(memory) = memory {
             func_value.add_attribute(
                 AttributeLoc::Function,
-                context.create_enum_attribute(
+                self.context.create_enum_attribute(
                     Attribute::get_named_enum_kind_id("memory"),
                     memory_effects_to_llvm(*memory),
                 ),
@@ -461,7 +438,7 @@ impl RVSDGMod {
         for (kind, value) in string_attrs {
             func_value.add_attribute(
                 AttributeLoc::Function,
-                context.create_string_attribute(kind, value),
+                self.context.create_string_attribute(kind, value),
             );
         }
         if let Some(align) = alignment {
@@ -502,9 +479,8 @@ impl RVSDGMod {
     /// pointers, and a variadic call's trailing arguments have no
     /// declaration entries at all. Used for BOTH direct and indirect
     /// calls -- one implementation, no drift.
-    pub(crate) fn apply_call_site_abi<'ctx>(
+    pub(crate) fn apply_call_site_abi(
         &self,
-        context: &'ctx Context,
         call_site: CallSiteValue<'ctx>,
         signature: &Signature,
     ) -> color_eyre::Result<()> {
@@ -512,7 +488,6 @@ impl RVSDGMod {
         let mut attributes = Vec::new();
         for (index, attrs) in signature.param_attrs.iter().enumerate() {
             self.collect_abi_attributes(
-                context,
                 AttributeLoc::Param(index as u32),
                 attrs.flags,
                 attrs.extra.as_deref(),
@@ -520,7 +495,6 @@ impl RVSDGMod {
             )?;
         }
         self.collect_abi_attributes(
-            context,
             AttributeLoc::Return,
             signature.return_attrs.flags,
             signature.return_attrs.extra.as_deref(),
@@ -536,9 +510,8 @@ impl RVSDGMod {
     /// attributes: the ABI-bearing ones (zeroext/signext here,
     /// byval/sret/align in `extra`) and the optimisation hints, which the
     /// fidelity net holds us to re-emitting faithfully.
-    fn collect_abi_attributes<'ctx>(
+    fn collect_abi_attributes(
         &self,
-        context: &'ctx Context,
         loc: AttributeLoc,
         flags: ParamAttrFlags,
         extra: Option<&ParamAttrsExtra>,
@@ -559,26 +532,27 @@ impl RVSDGMod {
             if flags.contains(flag) {
                 out.push((
                     loc,
-                    context.create_enum_attribute(Attribute::get_named_enum_kind_id(name), 0),
+                    self.context
+                        .create_enum_attribute(Attribute::get_named_enum_kind_id(name), 0),
                 ));
             }
         }
         if let Some(extra) = extra {
             if let Some(ty) = extra.by_value {
-                let llvm_ty = self.type_to_basic_type_llvm(context, ty)?;
+                let llvm_ty = self.type_to_basic_type_llvm(ty)?;
                 out.push((
                     loc,
-                    context.create_type_attribute(
+                    self.context.create_type_attribute(
                         Attribute::get_named_enum_kind_id("byval"),
                         llvm_ty.as_any_type_enum(),
                     ),
                 ));
             }
             if let Some(ty) = extra.struct_return {
-                let llvm_ty = self.type_to_basic_type_llvm(context, ty)?;
+                let llvm_ty = self.type_to_basic_type_llvm(ty)?;
                 out.push((
                     loc,
-                    context.create_type_attribute(
+                    self.context.create_type_attribute(
                         Attribute::get_named_enum_kind_id("sret"),
                         llvm_ty.as_any_type_enum(),
                     ),
@@ -587,7 +561,7 @@ impl RVSDGMod {
             if let Some(align) = extra.alignment {
                 out.push((
                     loc,
-                    context.create_enum_attribute(
+                    self.context.create_enum_attribute(
                         Attribute::get_named_enum_kind_id("align"),
                         u64::from(align),
                     ),
@@ -596,7 +570,7 @@ impl RVSDGMod {
             if let Some(bytes) = extra.dereferenceable_bytes {
                 out.push((
                     loc,
-                    context.create_enum_attribute(
+                    self.context.create_enum_attribute(
                         Attribute::get_named_enum_kind_id("dereferenceable"),
                         bytes,
                     ),
@@ -606,101 +580,8 @@ impl RVSDGMod {
         Ok(())
     }
 
-    #[tracing::instrument(skip_all, fields(func = %rvsdg_func.name))]
-    fn lower_fn<'a, 'ctx>(
-        &self,
-        llvm_builder: &LLVMBuilderCtx<'a, 'ctx>,
-        mapper: &mut ValueMapper<'ctx>,
-        rvsdg_func: &Function,
-    ) -> color_eyre::Result<()> {
-        let func = mapper.get_fn(rvsdg_func.id).ok_or_else(|| {
-            eyre!(
-                "function `{}` was not registered before lowering its body",
-                rvsdg_func.name
-            )
-        })?;
-        let entry = llvm_builder.context.append_basic_block(func, "entry");
-        llvm_builder.builder.position_at_end(entry);
-        let fn_val = rvsdg_func.lambda_val.ok_or_else(|| {
-            eyre!(
-                "function `{}` has no lambda value set during RVSDG construction",
-                rvsdg_func.name
-            )
-        })?;
-        let lambda_val = self.get_value_kind(fn_val);
-        match lambda_val {
-            ValueKind::Lambda {
-                region: region_id,
-                func_id: _,
-            } => {
-                // register the regions inputs to the llvm functions parameters so that they can be
-                // referenced by project inside the region
-                let region = &self.regions[region_id.0 as usize];
-                for (i, &param_id) in region.params.iter().enumerate() {
-                    let param = func.get_nth_param(i as u32).ok_or_else(|| {
-                        eyre!("function `{}` is missing parameter {i}", rvsdg_func.name)
-                    })?;
-                    mapper.set_val(param_id, param);
-                }
-
-                self.lower_region(llvm_builder, mapper, rvsdg_func, region)?;
-
-                // regions results should be added from inside lower_region
-                let res = self.value_pool.get(region.results);
-                match res.len() {
-                    0 => llvm_builder.builder.build_return(None)?,
-                    1 => {
-                        let val = self
-                            .lowered_result(llvm_builder, mapper, rvsdg_func, res[0])?
-                            .ok_or_else(|| {
-                                eyre!("return value of `{}` was not lowered", rvsdg_func.name)
-                            })?;
-                        llvm_builder
-                            .builder
-                            .build_return(Some(&val as &dyn BasicValue))?
-                    }
-                    n => bail!(
-                        "function `{}` returns {n} values; LLVM supports at most one",
-                        rvsdg_func.name
-                    ),
-                }
-            }
-            t => bail!(
-                "function `{}` lambda has unexpected value kind {t:?}",
-                rvsdg_func.name
-            ),
-        };
-        Ok(())
-    }
-
-    /// Lower every node of a region, in `region.nodes` order.
-    ///
-    /// This linear walk is what honours the STATE edges: construction
-    /// appends nodes in symbolic-execution order, so the list is a
-    /// topological order of the state chain, and the LLVM builder's
-    /// insertion point only ever advances -- emission position IS the
-    /// state order. That is why the per-kind lowering arms destructure
-    /// `state: _`: LLVM has no state values (ordering between memory
-    /// instructions is positional within a block), so there is nothing to
-    /// resolve or return for a state edge at this level. Side-effecting
-    /// nodes must only ever be lowered by this walk, never on demand.
-    fn lower_region<'a, 'ctx>(
-        &self,
-        llvm_builder: &LLVMBuilderCtx<'a, 'ctx>,
-        mapper: &mut ValueMapper<'ctx>,
-        rvsdg_func: &Function,
-        region: &Region,
-    ) -> color_eyre::Result<()> {
-        for &value_id in region.nodes.iter() {
-            self.lower_value(llvm_builder, mapper, rvsdg_func, value_id)?;
-        }
-        Ok(())
-    }
-    fn type_to_basic_type_llvm<'b>(
-        &self,
-        context: &'b Context,
-        ty: TypeRef,
-    ) -> color_eyre::Result<BasicTypeEnum<'b>> {
+    fn type_to_basic_type_llvm(&self, ty: TypeRef) -> color_eyre::Result<BasicTypeEnum<'ctx>> {
+        let context = self.context;
         let basic = match ty {
             TypeRef::State => bail!("`state` is an IR-only type with no LLVM basic type"),
             TypeRef::Scalar(scalar_type) => match scalar_type {
@@ -729,16 +610,16 @@ impl RVSDGMod {
                 BasicTypeEnum::PointerType(context.ptr_type(AddressSpace::default()))
             }
             TypeRef::Array(array_type_id) => {
-                let arr = self.types.get_array(array_type_id);
-                let elem = self.type_to_basic_type_llvm(context, arr.element)?;
+                let arr = self.tables.types.get_array(array_type_id);
+                let elem = self.type_to_basic_type_llvm(arr.element)?;
                 BasicTypeEnum::ArrayType(elem.array_type(arr.len as u32))
             }
             TypeRef::Struct(struct_id) => {
-                let def = self.types.get_struct(struct_id);
+                let def = self.tables.types.get_struct(struct_id);
                 let field_types: Vec<BasicTypeEnum> = def
                     .fields
                     .iter()
-                    .map(|f| self.type_to_basic_type_llvm(context, f.field_type))
+                    .map(|f| self.type_to_basic_type_llvm(f.field_type))
                     .collect::<color_eyre::Result<_>>()?;
                 let llvm_struct = match &def.name {
                     // Named structs are identity-based in LLVM and live in
@@ -758,8 +639,8 @@ impl RVSDGMod {
                 BasicTypeEnum::StructType(llvm_struct)
             }
             TypeRef::Vector(vector_type_id) => {
-                let vec = self.types.get_vector(vector_type_id);
-                let elem = self.type_to_basic_type_llvm(context, vec.element)?;
+                let vec = self.tables.types.get_vector(vector_type_id);
+                let elem = self.type_to_basic_type_llvm(vec.element)?;
                 match elem {
                     BasicTypeEnum::IntType(t) => BasicTypeEnum::VectorType(t.vec_type(vec.lanes)),
                     BasicTypeEnum::FloatType(t) => BasicTypeEnum::VectorType(t.vec_type(vec.lanes)),
@@ -785,12 +666,108 @@ impl RVSDGMod {
     /// [`type_to_basic_type_llvm`](Self::type_to_basic_type_llvm) except for the
     /// wrapper enum, so it just converts that result -- every `BasicTypeEnum`
     /// has a `BasicMetadataTypeEnum` counterpart.
-    fn type_to_basic_meta_llvm<'b>(
+    fn type_to_basic_meta_llvm(
         &self,
-        context: &'b Context,
         ty: TypeRef,
-    ) -> color_eyre::Result<BasicMetadataTypeEnum<'b>> {
-        Ok(self.type_to_basic_type_llvm(context, ty)?.into())
+    ) -> color_eyre::Result<BasicMetadataTypeEnum<'ctx>> {
+        Ok(self.type_to_basic_type_llvm(ty)?.into())
+    }
+
+    fn lower_globals(&mut self) -> color_eyre::Result<()> {
+        let tables = self.tables;
+        // Pass 1: declare every global. This must finish before any
+        // initializer is lowered, because an initializer can reference another
+        // global that is declared later (e.g. `@a = ptr @b` with `@b` below
+        // `@a`); that GlobalAddr resolves through the lowerer, which only has
+        // the global once it's declared here. Same two-pass shape as the
+        // frontend's `from_llvm_mod`.
+        for (i, global) in tables.globals.iter().enumerate() {
+            let llvm_type = self.type_to_basic_type_llvm(global.ty)?;
+            let space = (global.addr_space != 0)
+                .then(|| {
+                    AddressSpace::try_from(global.addr_space).map_err(|_| {
+                        eyre!(
+                            "global {} has address space {} outside LLVM's range",
+                            global.name,
+                            global.addr_space
+                        )
+                    })
+                })
+                .transpose()?;
+            let glob = self.module.add_global(llvm_type, space, &global.name);
+            apply_global_attrs(glob, global);
+            self.set_global(GlobalId(i as u32), glob);
+        }
+
+        // Pass 2: set initializers, now that every global resolves.
+        for (i, global) in tables.globals.iter().enumerate() {
+            if let GlobalInit::Init(const_id) = global.initializer {
+                let const_val = self.lower_const_id(const_id)?;
+                self.get_global(GlobalId(i as u32))
+                    .ok_or_else(|| eyre!("global {i} was not declared in pass 1"))?
+                    .set_initializer(&const_val as &dyn BasicValue);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<'m, 'a, 'ctx> FunctionLowerer<'m, 'a, 'ctx> {
+    #[tracing::instrument(skip_all, fields(func = %rvsdg_func.name))]
+    fn lower_fn(&mut self, rvsdg_func: &Function) -> color_eyre::Result<()> {
+        let func = self.mod_lower.get_fn(self.func_id).ok_or_else(|| {
+            eyre!(
+                "function `{}` was not registered before lowering its body",
+                rvsdg_func.name
+            )
+        })?;
+        let entry = self.mod_lower.context.append_basic_block(func, "entry");
+        self.builder.position_at_end(entry);
+        let graph = self.graph;
+        let region = &graph.regions[0];
+        for (i, &param_id) in region.params.iter().enumerate() {
+            let param = func
+                .get_nth_param(i as u32)
+                .ok_or_else(|| eyre!("function `{}` is missing parameter {i}", rvsdg_func.name))?;
+            self.set_val(param_id, param);
+        }
+
+        self.lower_region(region)?;
+
+        // regions results should be added from inside lower_region
+        let res = graph.value_pool.get(region.results);
+        match res.len() {
+            0 => self.builder.build_return(None)?,
+            1 => {
+                let val = self.lowered_result(res[0])?.ok_or_else(|| {
+                    eyre!("return value of `{}` was not lowered", rvsdg_func.name)
+                })?;
+                self.builder.build_return(Some(&val as &dyn BasicValue))?
+            }
+            n => bail!(
+                "function `{}` returns {n} values; LLVM supports at most one",
+                rvsdg_func.name
+            ),
+        };
+        Ok(())
+    }
+
+    /// Lower every node of a region, in `region.nodes` order.
+    ///
+    /// This linear walk is what honours the STATE edges: construction
+    /// appends nodes in symbolic-execution order, so the list is a
+    /// topological order of the state chain, and the LLVM builder's
+    /// insertion point only ever advances -- emission position IS the
+    /// state order. That is why the per-kind lowering arms destructure
+    /// `state: _`: LLVM has no state values (ordering between memory
+    /// instructions is positional within a block), so there is nothing to
+    /// resolve or return for a state edge at this level. Side-effecting
+    /// nodes must only ever be lowered by this walk, never on demand.
+    fn lower_region(&mut self, region: &Region) -> color_eyre::Result<()> {
+        for &value_id in region.nodes.iter() {
+            self.lower_value(value_id)?;
+        }
+        Ok(())
     }
 }
 

@@ -15,7 +15,9 @@
 
 use rustc_hash::FxHashMap;
 
-use crate::rvsdg::{RVSDGMod, ValueId, ValueKind, verify::RVSDGVerificationError};
+use crate::rvsdg::{
+    ValueId, ValueKind, function_graph::FunctionGraph, verify::RVSDGVerificationError,
+};
 
 /// How one match value is consumed.
 #[derive(Default)]
@@ -28,7 +30,7 @@ struct MatchUses {
     other: u32,
 }
 
-impl RVSDGMod {
+impl FunctionGraph {
     pub(super) fn verify_predicate_form(&self, errs: &mut Vec<RVSDGVerificationError>) {
         // The match values, each with a use tally.
         let mut matches: FxHashMap<ValueId, MatchUses> = FxHashMap::default();
@@ -178,8 +180,6 @@ impl RVSDGMod {
                 | ValueKind::GlobalRef(_)
                 | ValueKind::FuncAddr(_)
                 | ValueKind::Fence { .. }
-                | ValueKind::Lambda { .. }
-                | ValueKind::Phi { .. }
                 | ValueKind::RegionParam { .. } => {}
             }
         }

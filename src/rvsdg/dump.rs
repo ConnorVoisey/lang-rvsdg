@@ -31,6 +31,8 @@ use crate::rvsdg::{
     BinaryOp, ConstId, ConstValue, ConstantKind, FuncId, GlobalId, ICmpPred, RVSDGMod, RegionId,
     State, ValueId, ValueKind,
     func::Function,
+    function_graph::FunctionGraph,
+    module_tables::ModuleTables,
     types::{
         ArrayTypeId, FuncTypeId, PtrType, ScalarType, StructId, TypeArena, TypeRef, VectorTypeId,
     },
@@ -54,8 +56,8 @@ impl Terminator {
 
 impl Display for RVSDGMod {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.fmt_constant_pool(f)?;
-        for func in &self.functions {
+        self.fmt_constant_pool(f, &self.tables)?;
+        for func in &self.tables.functions {
             func.fmt(f, self)?;
         }
         Ok(())
@@ -63,23 +65,27 @@ impl Display for RVSDGMod {
 }
 
 impl RVSDGMod {
-    fn fmt_constant_pool(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt_constant_pool(
+        &self,
+        f: &mut std::fmt::Formatter<'_>,
+        module_tables: &ModuleTables,
+    ) -> std::fmt::Result {
         f.write_str("constants {\n")?;
         // Aggregate element constants are listed inline inside their parent
         // aggregate, so skip them as standalone entries.
         let mut agg_elements = FxHashSet::default();
-        for id in self.constants.id_pool.0.iter() {
+        for id in module_tables.constants.id_pool.0.iter() {
             agg_elements.insert(id.0);
         }
-        for (i, const_def) in self.constants.entries.iter().enumerate() {
+        for (i, const_def) in module_tables.constants.entries.iter().enumerate() {
             if agg_elements.contains(&(i as u32)) {
                 continue;
             }
             pad(f, 2)?;
             write!(f, "%c{i}: ")?;
-            const_def.ty.fmt(f, &self.types)?;
+            const_def.ty.fmt(f, &module_tables.types)?;
             f.write_str(" = ")?;
-            self.fmt_const_kind(f, &const_def.kind)?;
+            self.fmt_const_kind(f, module_tables, &const_def.kind)?;
             f.write_char('\n')?;
         }
         f.write_str("}\n\n")?;
@@ -89,6 +95,7 @@ impl RVSDGMod {
     fn fmt_const_kind(
         &self,
         f: &mut std::fmt::Formatter<'_>,
+        module_tables: &ModuleTables,
         kind: &ConstantKind,
     ) -> std::fmt::Result {
         match kind {
@@ -96,7 +103,7 @@ impl RVSDGMod {
             ConstantKind::Zero => f.write_str("zero"),
             ConstantKind::Aggregate(span) => {
                 f.write_str("aggregate (")?;
-                let elements = self.constants.get_aggregate_elements(*span);
+                let elements = module_tables.constants.get_aggregate_elements(*span);
                 for (i, const_id) in elements.iter().enumerate() {
                     if i != 0 {
                         f.write_str(", ")?;
@@ -116,7 +123,7 @@ impl RVSDGMod {
                 ..
             } => {
                 write!(f, "get_element_ptr base: {base}, ty: ")?;
-                source_type.fmt(f, &self.types)?;
+                source_type.fmt(f, &module_tables.types)?;
                 write!(f, ", in_bounds: {in_bounds}")
             }
             ConstantKind::Cast { op, operand } => write!(f, "cast {op:?} {operand}"),
@@ -132,33 +139,30 @@ impl Function {
                 f.write_str(", ")?;
             }
             write!(f, "a{i}: ")?;
-            param.ty.fmt(f, &m.types)?;
+            param.ty.fmt(f, &m.tables.types)?;
         }
         f.write_str(") -> (")?;
         for (i, ret_ty) in self.return_types.iter().enumerate() {
             if i != 0 {
                 f.write_str(", ")?;
             }
-            ret_ty.fmt(f, &m.types)?;
+            ret_ty.fmt(f, &m.tables.types)?;
         }
         f.write_str(") {\n")?;
 
-        match self.lambda_val {
-            Some(lambda_id) => {
-                let region_id = match m.get_value_kind(lambda_id) {
-                    ValueKind::Lambda { region, .. } => region,
-                    // A function's lambda_val must be a Lambda; anything else
-                    // is a construction bug, so surface it rather than hide it.
-                    ref other => {
-                        write!(
-                            f,
-                            "    <malformed lambda: {other:?}>\n}} fn end {}\n\n",
-                            self.id
-                        )?;
-                        return Ok(());
-                    }
-                };
-                fmt_region_body(f, m, *region_id, 4, false, true, None, Terminator::Return)?;
+        match m.get_graph(self.id) {
+            Some(graph) => {
+                fmt_region_body(
+                    f,
+                    m,
+                    graph,
+                    RegionId(0),
+                    4,
+                    false,
+                    true,
+                    None,
+                    Terminator::Return,
+                )?;
             }
             None => pad(f, 4).and_then(|_| f.write_str("; external (no body)\n"))?,
         }
@@ -182,6 +186,7 @@ impl Function {
 fn fmt_region_body(
     f: &mut std::fmt::Formatter<'_>,
     m: &RVSDGMod,
+    graph: &FunctionGraph,
     region_id: RegionId,
     indent: usize,
     print_args: bool,
@@ -189,7 +194,7 @@ fn fmt_region_body(
     continue_if: Option<ValueId>,
     terminator: Terminator,
 ) -> std::fmt::Result {
-    let region = m.get_region(region_id);
+    let region = graph.get_region(region_id);
 
     if show_entry_state {
         pad(f, indent)?;
@@ -203,9 +208,9 @@ fn fmt_region_body(
             if i != 0 {
                 f.write_str(", ")?;
             }
-            let param = m.get_value_type(param_id);
+            let param = graph.get_value_type(param_id);
             write!(f, "a{i}: ")?;
-            param.fmt(f, &m.types)?;
+            param.fmt(f, &m.tables.types)?;
         }
         f.write_str(" ]\n")?;
     }
@@ -215,34 +220,32 @@ fn fmt_region_body(
         // this region, region params are shown in `args`, projects are folded
         // into `%vNODE#K` references, and the region result is the terminator.
         if matches!(
-            m.get_value_kind(node_id),
-            ValueKind::Lambda { .. }
-                | ValueKind::Project { .. }
-                | ValueKind::RegionParam { .. }
+            graph.get_value_kind(node_id),
+            |ValueKind::Project { .. }| ValueKind::RegionParam { .. }
                 | ValueKind::RegionResult { .. }
         ) {
             continue;
         }
         pad(f, indent)?;
         write!(f, "{node_id} = ")?;
-        fmt_node(f, m, node_id, indent)?;
+        fmt_node(f, m, graph, node_id, indent)?;
         f.write_char('\n')?;
     }
 
     if let Some(pred) = continue_if {
         pad(f, indent)?;
         f.write_str("continue_if ")?;
-        fmt_value_ref(f, m, pred)?;
+        fmt_value_ref(f, m, graph, pred)?;
         f.write_char('\n')?;
     }
 
     pad(f, indent)?;
     write!(f, "{} [ ", terminator.keyword())?;
-    for (i, &result) in m.value_pool.get(region.results).iter().enumerate() {
+    for (i, &result) in graph.value_pool.get(region.results).iter().enumerate() {
         if i != 0 {
             f.write_str(", ")?;
         }
-        fmt_value_ref(f, m, result)?;
+        fmt_value_ref(f, m, graph, result)?;
     }
     f.write_str(" ]\n")?;
 
@@ -255,10 +258,11 @@ fn fmt_region_body(
 fn fmt_node(
     f: &mut std::fmt::Formatter<'_>,
     m: &RVSDGMod,
+    graph: &FunctionGraph,
     node_id: ValueId,
     indent: usize,
 ) -> std::fmt::Result {
-    let value = m.get_value_kind(node_id);
+    let value = graph.get_value_kind(node_id);
     match value {
         ValueKind::Const(const_value) => write!(f, "const {const_value}"),
         ValueKind::ConstPoolRef(const_id) => fmt_const_ref(f, m, *const_id),
@@ -268,15 +272,15 @@ fn fmt_node(
             op, left, right, ..
         } => {
             write!(f, "{op} ")?;
-            fmt_value_ref(f, m, *left)?;
+            fmt_value_ref(f, m, graph, *left)?;
             f.write_str(", ")?;
-            fmt_value_ref(f, m, *right)
+            fmt_value_ref(f, m, graph, *right)
         }
         ValueKind::ICmp { pred, left, right } => {
             write!(f, "icmp {} ", icmp_pred_str(*pred))?;
-            fmt_value_ref(f, m, *left)?;
+            fmt_value_ref(f, m, graph, *left)?;
             f.write_str(", ")?;
-            fmt_value_ref(f, m, *right)
+            fmt_value_ref(f, m, graph, *right)
         }
         ValueKind::Match {
             input,
@@ -285,9 +289,9 @@ fn fmt_node(
             ..
         } => {
             f.write_str("match ")?;
-            fmt_value_ref(f, m, *input)?;
+            fmt_value_ref(f, m, graph, *input)?;
             f.write_str(" { ")?;
-            for arm in m.match_arm_pool.get(*arms) {
+            for arm in graph.match_arm_pool.get(*arms) {
                 write!(f, "{} => arm{}, ", arm.value, arm.alternative)?;
             }
             write!(f, "_ => arm{default} }}")
@@ -299,7 +303,7 @@ fn fmt_node(
             args,
         } => {
             write!(f, "call {fn_id} {sig} args ")?;
-            fmt_value_list(f, m, *args)?;
+            fmt_value_list(f, m, graph, *args)?;
             write!(f, " state_in {state} state_out %s{}", node_id.0)
         }
         ValueKind::CallIndirect {
@@ -309,9 +313,9 @@ fn fmt_node(
             args,
         } => {
             write!(f, "call_indirect {sig} callee ")?;
-            fmt_value_ref(f, m, *callee)?;
+            fmt_value_ref(f, m, graph, *callee)?;
             f.write_str(" args ")?;
-            fmt_value_list(f, m, *args)?;
+            fmt_value_list(f, m, graph, *args)?;
             write!(f, " state_in {state} state_out %s{}", node_id.0)
         }
         ValueKind::Gamma {
@@ -321,21 +325,22 @@ fn fmt_node(
             regions,
         } => {
             f.write_str("gamma predicate ")?;
-            fmt_value_ref(f, m, *condition)?;
+            fmt_value_ref(f, m, graph, *condition)?;
             write!(f, " state_in {state} state_out %s{} {{\n", node_id.0)?;
 
             pad(f, indent + 4)?;
             f.write_str("in ")?;
-            fmt_value_list(f, m, *inputs)?;
+            fmt_value_list(f, m, graph, *inputs)?;
             f.write_char('\n')?;
 
-            let region_ids = m.region_pool.get(*regions);
+            let region_ids = graph.region_pool.get(*regions);
             for (i, &arm_region) in region_ids.iter().enumerate() {
                 pad(f, indent + 4)?;
                 write!(f, "arm{i}:\n")?;
                 fmt_region_body(
                     f,
                     m,
+                    graph,
                     arm_region,
                     indent + 8,
                     true,
@@ -346,8 +351,8 @@ fn fmt_node(
             }
 
             // All arms share output arity/types; take them from the first arm.
-            let outputs = m.get_region(region_ids[0]).results;
-            fmt_struct_outputs(f, m, node_id, outputs, indent)
+            let outputs = graph.get_region(region_ids[0]).results;
+            fmt_struct_outputs(f, m, graph, node_id, outputs, indent)
         }
         ValueKind::Theta {
             loop_vars,
@@ -359,12 +364,13 @@ fn fmt_node(
 
             pad(f, indent + 4)?;
             f.write_str("in ")?;
-            fmt_value_list(f, m, *loop_vars)?;
+            fmt_value_list(f, m, graph, *loop_vars)?;
             f.write_char('\n')?;
 
             fmt_region_body(
                 f,
                 m,
+                graph,
                 *region_id,
                 indent + 4,
                 true,
@@ -373,8 +379,8 @@ fn fmt_node(
                 Terminator::Yield,
             )?;
 
-            let outputs = m.get_region(*region_id).results;
-            fmt_struct_outputs(f, m, node_id, outputs, indent)
+            let outputs = graph.get_region(*region_id).results;
+            fmt_struct_outputs(f, m, graph, node_id, outputs, indent)
         }
         // Remaining kinds are not yet given a bespoke rendering. Fall back to a
         // debug print so the dump degrades gracefully instead of panicking on
@@ -389,18 +395,19 @@ fn fmt_node(
 fn fmt_struct_outputs(
     f: &mut std::fmt::Formatter<'_>,
     m: &RVSDGMod,
+    graph: &FunctionGraph,
     node_id: ValueId,
     result_values: crate::rvsdg::ValuesSpan,
     indent: usize,
 ) -> std::fmt::Result {
     pad(f, indent)?;
     f.write_str("} -> ( ")?;
-    for (i, &result) in m.value_pool.get(result_values).iter().enumerate() {
+    for (i, &result) in graph.value_pool.get(result_values).iter().enumerate() {
         if i != 0 {
             f.write_str(", ")?;
         }
         write!(f, "%v{}#{i}: ", node_id.0)?;
-        m.get_value_type(result).fmt(f, &m.types)?;
+        graph.get_value_type(result).fmt(f, &m.tables.types)?;
     }
     f.write_str(" )")
 }
@@ -409,22 +416,28 @@ fn fmt_struct_outputs(
 fn fmt_value_list(
     f: &mut std::fmt::Formatter<'_>,
     m: &RVSDGMod,
+    graph: &FunctionGraph,
     span: crate::rvsdg::ValuesSpan,
 ) -> std::fmt::Result {
     f.write_str("[ ")?;
-    for (i, &id) in m.value_pool.get(span).iter().enumerate() {
+    for (i, &id) in graph.value_pool.get(span).iter().enumerate() {
         if i != 0 {
             f.write_str(", ")?;
         }
-        fmt_value_ref(f, m, id)?;
+        fmt_value_ref(f, m, graph, id)?;
     }
     f.write_str(" ]")
 }
 
 /// Resolve a value reference to its origin and print it: a region argument as
 /// `aN`, a folded project output as `%vNODE#K`, everything else as `%vN`.
-fn fmt_value_ref(f: &mut std::fmt::Formatter<'_>, m: &RVSDGMod, id: ValueId) -> std::fmt::Result {
-    match m.get_value_kind(id) {
+fn fmt_value_ref(
+    f: &mut std::fmt::Formatter<'_>,
+    m: &RVSDGMod,
+    graph: &FunctionGraph,
+    id: ValueId,
+) -> std::fmt::Result {
+    match graph.get_value_kind(id) {
         ValueKind::RegionParam { index, .. } => write!(f, "a{index}"),
         ValueKind::Project { call, index } => write!(f, "%v{}#{}", call.0, index),
         // Region-free values have no defining line in any region (they
@@ -444,7 +457,7 @@ fn fmt_const_ref(
     m: &RVSDGMod,
     const_id: ConstId,
 ) -> std::fmt::Result {
-    match &m.constants.get(const_id).kind {
+    match &m.tables.constants.get(const_id).kind {
         ConstantKind::Scalar(const_value) => write!(f, "const {const_value}"),
         ConstantKind::FuncAddr(func_id) => write!(f, "func_addr {func_id}"),
         ConstantKind::GlobalAddr(global_id) => write!(f, "global_addr {global_id}"),
