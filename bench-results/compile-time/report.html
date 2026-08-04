@@ -152,7 +152,18 @@
                 </tfoot>
               </table>
             </div>
-            <p class="hint">Each cell is the change vs baseline (red worse, green better; intensity tracks magnitude). Columns: <strong>instr</strong> instructions executed &mdash; the primary deterministic signal; <strong>cache misses</strong> last-level miss <em>count</em> (thousands) &mdash; the deterministic locality signal (captures access patterns instruction count does not); <strong>cycles</strong> a cost-model roll-up (L1 + 5&times;LL + 35&times;RAM hits, generic latency weights &mdash; not real cycles, and ~instr&times;const on cache-friendly code); <strong>wall</strong> end-to-end compile time; <strong>RSS</strong> peak resident memory; <strong>obj</strong> object-file size. instr / cache misses / cycles are simulated Cachegrind figures for our pipeline + in-process backend (frontend excluded), so run-to-run noise is tiny (&lt;~0.05%, vs tens of percent for a hardware counter on a busy machine) and they are not clang-comparable (hence absent from the vs-clang panel); a delta above ~0.05% is a real change, anything smaller is noise (and left uncoloured). wall carries a ▲/▼ mark for a statistically significant difference from the baseline <em>run</em> (Mann-Whitney + bootstrap CI; a dim wall cell failed it) &mdash; but the two runs were taken at different times, so a mark is not by itself proof of a code change; wall / RSS are native and contention-sensitive (informational on a busy machine). Click a program to trace it in the charts below.</p>
+            <p class="hint">Each cell is the change vs baseline (red worse, green better; intensity tracks magnitude). Click a program to trace it in the charts below. The columns, in order:</p>
+            <ul class="hint">
+              <li><strong>instr</strong> &mdash; instructions our compile executed (simulated by Cachegrind, deterministic). The primary regression signal.</li>
+              <li><strong>cache misses</strong> &mdash; last-level cache miss <em>count</em>, thousands (Cachegrind). The locality signal: moves with access patterns that instruction count cannot capture.</li>
+              <li><strong>cycles</strong> &mdash; cost-model roll-up of the two above (L1 + 5&times;LL + 35&times;RAM hits, generic latency weights). A comparative index, not real cycles; ~instr&times;const on cache-friendly code.</li>
+              <li><strong>allocs</strong> &mdash; Rust-heap allocator calls across our in-process phases, thousands. Iteration-deterministic; needs a <code>--wall</code> run on schema&nbsp;v5+; LLVM's C++ heap is invisible to it.</li>
+              <li><strong>alloc churn</strong> &mdash; bytes handed out over the same window (MiB, cumulative). Transient scratch and Vec growth count in full, so it shows allocator pressure that RSS cannot.</li>
+              <li><strong>wall</strong> &mdash; end-to-end compile time (native, contention-sensitive). ▲/▼ marks a statistically significant difference from the baseline run.</li>
+              <li><strong>RSS</strong> &mdash; peak resident memory of the whole compile (native).</li>
+              <li><strong>obj</strong> &mdash; object-file size.</li>
+            </ul>
+            <p class="hint">instr / cache misses / cycles are simulated Cachegrind figures for our pipeline + in-process backend (frontend excluded), so run-to-run noise is tiny (&lt;~0.05%, vs tens of percent for a hardware counter on a busy machine) and they are not clang-comparable (hence absent from the vs-clang panel); a delta above ~0.05% is a real change, anything smaller is noise (and left uncoloured). wall's significance mark comes from Mann-Whitney + a bootstrap CI (a dim wall cell failed it) &mdash; but the two runs were taken at different times, so a mark is not by itself proof of a code change; wall / RSS are informational on a busy machine.</p>
             <p class="hint" x-show="runIdx === baselineIdx">Only one run loaded (baseline is the current run): cells show absolute values, not deltas vs a baseline.</p>
           </section>
 
@@ -167,12 +178,21 @@
           </section>
 
           <section x-show="hasPhaseData()">
-            <h2>Phase breakdown &mdash; where our time goes</h2>
-            <label>
-              <input type="checkbox" role="switch" x-model="normalize" @change="onFilterChange()" />
-              Normalize by graph size
-            </label>
+            <h2>Phase breakdown &mdash; where our time and allocator traffic go</h2>
+            <div style="display: flex; gap: 1.5rem; align-items: center; flex-wrap: wrap;">
+              <span class="seg">
+                <template x-for="pm in phaseMetricKeys" :key="pm">
+                  <button @click="setPhaseMetric(pm)" :aria-current="phaseMetric === pm" x-text="phaseMetricLabel(pm)"></button>
+                </template>
+              </span>
+              <span class="seg">
+                <template x-for="nm in normModeKeys" :key="nm">
+                  <button @click="setNormMode(nm)" :aria-current="normMode === nm" x-text="normModeLabel(nm)"></button>
+                </template>
+              </span>
+            </div>
             <div id="chart-phases" class="chart"></div>
+            <p class="hint"><strong>raw</strong> is the metric as measured; <strong>/ value</strong> divides by graph size (unit cost &mdash; a bar standing out is disproportionately expensive for its size); <strong>% of total</strong> stacks every program to 100% (which phase dominates, independent of size and machine noise). Allocation views need a schema&nbsp;v5+ <code>--wall</code> run; older runs show wall only. Allocation counts are iteration-deterministic (Rust heap only &mdash; LLVM's C++ allocations are invisible).</p>
           </section>
 
           <section x-show="hasClangData()">

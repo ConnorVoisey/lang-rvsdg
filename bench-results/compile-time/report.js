@@ -74,6 +74,8 @@
  * @property {number[]|null} instructions
  * @property {number[]|null} cache_misses
  * @property {number[]|null} cache_references
+ * @property {number[]|null} [allocations]  Rust-heap allocator calls (schema >= 5).
+ * @property {number[]|null} [alloc_bytes]  Bytes handed out, cumulative churn (schema >= 5).
  */
 /**
  * @typedef {Object} PhaseRecord
@@ -313,17 +315,47 @@ const METRICS = {
   // Secondary: on a cache-friendly compile it is ~instr times a constant,
   // so its only content beyond instr is the locality penalty.
   cg_cycles: { label: 'cycles', unit: 'Mcyc', samples: () => null, point: (c) => (c.cachegrind_estimated_cycles == null ? null : c.cachegrind_estimated_cycles / 1e6) },
+  // Rust-heap allocator calls across the in-process phases (a --wall
+  // metric). Iteration-deterministic like the Cachegrind counts -- same
+  // compile, same count -- so it reads as a regression signal, but it
+  // sees only OUR Rust heap: LLVM's C++ allocations are invisible.
+  allocs: { label: 'allocs', unit: 'k', samples: () => null, point: (c) => phaseCounterTotal(c, 'allocations', 1e3) },
+  // Bytes handed out over the same window (cumulative churn: transient
+  // scratch and Vec growth-doubling count in full; a realloc counts its
+  // whole new size). The signal for allocator-pressure work that the
+  // live/peak RSS view cannot show.
+  alloc_bytes: { label: 'alloc churn', unit: 'MiB', samples: () => null, point: (c) => phaseCounterTotal(c, 'alloc_bytes', 1024 * 1024) },
   wall: { label: 'wall', unit: 'ms', samples: (c) => c.end_to_end && c.end_to_end.wall_ms, point: (c) => median(c.end_to_end && c.end_to_end.wall_ms) },
   peak_rss: { label: 'RSS', unit: 'MiB', samples: () => null, point: (c) => (c.peak_rss_bytes == null ? null : c.peak_rss_bytes / (1024 * 1024)) },
   obj_size: { label: 'obj', unit: 'KiB', samples: () => null, point: (c) => (c.object_size_bytes == null ? null : c.object_size_bytes / 1024) },
 };
-const GRID_METRICS = ['cg_ir', 'cg_cache', 'cg_cycles', 'wall', 'peak_rss', 'obj_size'];
-const TREND_METRICS = ['cg_ir', 'cg_cache', 'cg_cycles'];
+const GRID_METRICS = ['cg_ir', 'cg_cache', 'cg_cycles', 'allocs', 'alloc_bytes', 'wall', 'peak_rss', 'obj_size'];
+const TREND_METRICS = ['cg_ir', 'cg_cache', 'cg_cycles', 'allocs'];
 // Native, contention-sensitive metrics: their grid cells are dimmed (never
 // coloured at full magnitude like a deterministic Cachegrind regression),
 // unless wall passed a significance test.
 const NOISY_METRICS = ['wall', 'peak_rss'];
 const CLANG_METRICS = ['wall', 'peak_rss', 'obj_size'];
+
+// Sum of per-phase medians of one allocation counter, scaled. Null when
+// any phase lacks the counter (pre-v5 records, deterministic-only runs,
+// clang configs -- which have no phases at all).
+/**
+ * @param {Config} config
+ * @param {"allocations"|"alloc_bytes"} field
+ * @param {number} scale
+ * @returns {number|null}
+ */
+function phaseCounterTotal(config, field, scale) {
+  if (!config.phases || config.phases.length === 0) return null;
+  let total = 0;
+  for (const rec of config.phases) {
+    const m = median(rec.samples && rec.samples[field]);
+    if (m == null) return null;
+    total += m;
+  }
+  return total / scale;
+}
 
 /** @param {Config} config @returns {string} e.g. "ours-o0" */
 function configKey(config) {
@@ -555,39 +587,88 @@ function metricTrendOption(runs, metricKey, level, focus) {
   };
 }
 
-// Where our time goes: stacked per-phase wall, one bar per program, at the
-// chosen level; optionally normalized by graph size so programs compare.
+// What the phase-breakdown panel can stack: wall time or the allocation
+// counters (the latter only present in schema >= 5 --wall runs; their
+// bars simply blank out on older records).
+/** @type {Object<string, {label: string, unit: string, field: string, scale: number}>} */
+const PHASE_METRICS = {
+  wall: { label: 'wall', unit: 'ms', field: 'wall_ms', scale: 1 },
+  allocs: { label: 'allocations', unit: 'k', field: 'allocations', scale: 1e3 },
+  alloc_bytes: { label: 'alloc churn', unit: 'MiB', field: 'alloc_bytes', scale: 1024 * 1024 },
+};
+
+// How the phase bars are scaled. `raw` is the metric as measured;
+// `per_value` divides by graph size so differently-sized programs
+// compare on unit cost; `share` stacks each program to 100% so the
+// question "which phase dominates" is independent of both program size
+// and machine noise (a uniformly slow first program shares out the
+// same as a fast one).
+/** @type {Object<string, string>} */
+const NORM_MODES = { raw: 'raw', per_value: '/ value', share: '% of total' };
+
+// Where our time (or allocator traffic) goes: stacked per-phase medians,
+// one bar per program, at the chosen level.
 /**
  * @param {Run} run
  * @param {string} level
- * @param {boolean} normalize  divide by graph size (values)
+ * @param {string} normMode  a NORM_MODES key
+ * @param {string} metricKey  a PHASE_METRICS key
  * @returns {object} ECharts option
  */
-function phaseBreakdownOption(run, level, normalize) {
+function phaseBreakdownOption(run, level, normMode, metricKey) {
+  const pm = PHASE_METRICS[metricKey] || PHASE_METRICS.wall;
   const programs = run.programs;
   const names = programs.map((p) => p.name);
+  const phaseMedian = (p, ph) => {
+    const c = oursConfig(p, level);
+    const rec = c && c.phases && c.phases.find((x) => x.phase === ph);
+    return rec ? median(rec.samples && rec.samples[pm.field]) : null;
+  };
+  // Per-program totals for the share mode; null (blanking the bar) when
+  // any phase is unmeasured, so a partial bar never masquerades as 100%.
+  const totals = programs.map((p) => {
+    let total = 0;
+    for (const ph of PHASES) {
+      const m = phaseMedian(p, ph);
+      if (m == null) return null;
+      total += m;
+    }
+    return total > 0 ? total : null;
+  });
   const series = PHASES.map((ph, idx) => ({
     name: ph,
     type: 'bar',
     stack: 'phase',
     itemStyle: { color: PHASE_COLORS[idx] },
-    data: programs.map((p) => {
-      const c = oursConfig(p, level);
-      const rec = c && c.phases && c.phases.find((x) => x.phase === ph);
-      const m = rec ? median(rec.samples && rec.samples.wall_ms) : null;
-      if (m == null) return null;
-      // When normalizing, a zero-size program has no meaningful per-value
-      // figure -- blank it rather than show a misleading unnormalized bar.
-      if (normalize) return p.values ? m / p.values : null;
+    data: programs.map((p, pi) => {
+      const raw = phaseMedian(p, ph);
+      if (raw == null) return null;
+      if (normMode === 'share') {
+        return totals[pi] == null ? null : (raw / totals[pi]) * 100;
+      }
+      const m = raw / pm.scale;
+      // When normalizing by size, a zero-size program has no meaningful
+      // per-value figure -- blank it rather than show a misleading bar.
+      if (normMode === 'per_value') return p.values ? m / p.values : null;
       return m;
     }),
   }));
+  const unit =
+    normMode === 'share' ? '% of compile' : normMode === 'per_value' ? `${pm.unit} / value` : pm.unit;
   return {
-    title: { text: `phase breakdown -- ours ${level.toUpperCase()} ${normalize ? '(ms / value)' : '(ms)'}`, left: 'center', textStyle: { fontSize: 13 } },
-    tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' } },
+    title: { text: `phase breakdown -- ours ${level.toUpperCase()}, ${pm.label} (${unit})`, left: 'center', textStyle: { fontSize: 13 } },
+    tooltip: {
+      trigger: 'axis',
+      axisPointer: { type: 'shadow' },
+      valueFormatter: normMode === 'share' ? (v) => (v == null ? '-' : v.toFixed(1) + '%') : undefined,
+    },
     legend: { top: 26 },
     ...categoryBarBase(names),
-    yAxis: { type: 'value', splitLine: { lineStyle: { color: GRID } } },
+    yAxis: {
+      type: 'value',
+      max: normMode === 'share' ? 100 : undefined,
+      splitLine: { lineStyle: { color: GRID } },
+    },
     series,
   };
 }
@@ -642,7 +723,10 @@ function reportComponent() {
     level: 'o0',
     /** @type {string|null} */
     focus: null, // program drilled into from the grid
-    normalize: false,
+    normMode: 'raw',
+    normModeKeys: Object.keys(NORM_MODES),
+    phaseMetric: 'wall',
+    phaseMetricKeys: Object.keys(PHASE_METRICS),
     sort: { key: 'cg_ir', dir: -1 }, // dir -1 = biggest |delta| first; cg_ir is always populated (wall needs --wall)
     /** @type {Object<string, any>} */
     charts: {},
@@ -810,9 +894,24 @@ function reportComponent() {
       );
     },
 
+    setPhaseMetric(key) {
+      this.phaseMetric = key;
+      this.renderCharts();
+    },
+    phaseMetricLabel(key) {
+      return PHASE_METRICS[key].label;
+    },
+    setNormMode(key) {
+      this.normMode = key;
+      this.renderCharts();
+    },
+    normModeLabel(key) {
+      return NORM_MODES[key];
+    },
+
     renderCharts() {
       this.renderTrends();
-      this.setChart('phases', () => phaseBreakdownOption(this.currentRun(), this.level, this.normalize));
+      this.setChart('phases', () => phaseBreakdownOption(this.currentRun(), this.level, this.normMode, this.phaseMetric));
       this.setChart('clang', () => clangRatioOption(this.currentRun(), this.level));
     },
     renderTrends() {
@@ -857,5 +956,8 @@ window.BENCH_REPORT = {
   metricTrendOption,
   phaseBreakdownOption,
   clangRatioOption,
+  phaseCounterTotal,
   METRICS,
+  PHASE_METRICS,
+  NORM_MODES,
 };
