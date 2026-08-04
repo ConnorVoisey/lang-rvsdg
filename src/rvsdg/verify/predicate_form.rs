@@ -16,7 +16,7 @@
 use rustc_hash::FxHashMap;
 
 use crate::rvsdg::{
-    ValueId, ValueKind, function_graph::FunctionGraph, verify::RVSDGVerificationError,
+    RegionId, ValueId, ValueKind, function_graph::FunctionGraph, verify::RVSDGVerificationError,
 };
 
 /// How one match value is consumed.
@@ -169,12 +169,6 @@ impl FunctionGraph {
                 ValueKind::Project { call, .. } => {
                     tally(*call, false, &mut matches);
                 }
-                // RegionResult values share their span with the owning
-                // region's `results` field (define_fn stores the same span
-                // in both places), so tallying here would double-count
-                // every function result. The regions loop below is the one
-                // source for result tallies; it covers every region.
-                ValueKind::RegionResult { .. } => {}
                 ValueKind::Const(_)
                 | ValueKind::ConstPoolRef(_)
                 | ValueKind::GlobalRef(_)
@@ -183,10 +177,10 @@ impl FunctionGraph {
                 | ValueKind::RegionParam { .. } => {}
             }
         }
-        // Every region's results, function bodies included (see the
-        // RegionResult note above: this loop is the single source).
-        for region in &self.regions {
-            for &result in self.value_pool.get(region.results) {
+        // Every region's results, function bodies included; this loop is
+        // the single source for result tallies.
+        for region_index in 0..self.regions.len() {
+            for &result in self.region_results(RegionId(region_index as u32)) {
                 tally(result, true, &mut matches);
             }
         }

@@ -21,8 +21,11 @@ use std::time::{Duration, Instant};
 use perf_event::events::Hardware;
 use perf_event::{Builder, Counter, Group};
 
-/// One phase's measurement: always a wall time, plus counters when the
-/// kernel allowed them.
+use crate::stats::heap;
+
+/// One phase's measurement: always a wall time, plus hardware counters
+/// when the kernel allowed them, plus Rust-heap allocation traffic when
+/// the binary installed the counting allocator and enabled it.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PhaseMetrics {
     pub wall: Duration,
@@ -30,6 +33,13 @@ pub struct PhaseMetrics {
     pub instructions: Option<u64>,
     pub cache_misses: Option<u64>,
     pub cache_references: Option<u64>,
+    /// Allocator calls during the phase (near-deterministic, so a
+    /// regression signal rather than a timing).
+    pub allocations: Option<u64>,
+    /// Bytes handed out during the phase, cumulative churn: transient
+    /// scratch and vector growth-doubling count in full, unlike a
+    /// live/peak view.
+    pub alloc_bytes: Option<u64>,
 }
 
 /// A reusable counter group. Built once and reset around each phase, so
@@ -95,17 +105,23 @@ impl Counters {
     /// Run `phase` once, returning its result and metrics. Wall time is a
     /// plain `Instant` (cross-checks against a shell `time`); counters,
     /// when present, are reset-enabled-disabled-read tightly around the
-    /// call so only the phase's work is counted.
+    /// call so only the phase's work is counted. Allocation snapshots are
+    /// taken inside the same window -- before the perf group read, which
+    /// itself allocates.
     pub fn measure<R>(&mut self, phase: impl FnOnce() -> R) -> (R, PhaseMetrics) {
         match &mut self.inner {
             None => {
+                let allocs_before = heap::alloc_snapshot();
                 let start = Instant::now();
                 let result = phase();
                 let wall = start.elapsed();
+                let allocs = alloc_delta(allocs_before);
                 (
                     result,
                     PhaseMetrics {
                         wall,
+                        allocations: allocs.map(|a| a.count),
+                        alloc_bytes: allocs.map(|a| a.bytes),
                         ..Default::default()
                     },
                 )
@@ -119,28 +135,33 @@ impl Counters {
                     .reset()
                     .and_then(|_| group.group.enable())
                     .is_ok();
+                let allocs_before = heap::alloc_snapshot();
                 let start = Instant::now();
                 let result = phase();
                 let wall = start.elapsed();
+                let allocs = alloc_delta(allocs_before);
                 let counts = if armed {
                     group.group.disable().ok();
                     group.group.read().ok()
                 } else {
                     None
                 };
-                let metrics = match counts {
+                let mut metrics = match counts {
                     Some(counts) => PhaseMetrics {
                         wall,
                         cycles: Some(counts[&group.cycles]),
                         instructions: Some(counts[&group.instructions]),
                         cache_misses: Some(counts[&group.cache_misses]),
                         cache_references: Some(counts[&group.cache_references]),
+                        ..Default::default()
                     },
                     None => PhaseMetrics {
                         wall,
                         ..Default::default()
                     },
                 };
+                metrics.allocations = allocs.map(|a| a.count);
+                metrics.alloc_bytes = allocs.map(|a| a.bytes);
                 (result, metrics)
             }
         }
@@ -151,6 +172,12 @@ impl Default for Counters {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Allocation traffic since `before`; `None` when counting was off at
+/// either end (readings from a half-enabled window would undercount).
+fn alloc_delta(before: Option<heap::AllocSnapshot>) -> Option<heap::AllocSnapshot> {
+    before.and_then(|earlier| heap::alloc_snapshot().map(|now| now.since(&earlier)))
 }
 
 /// A one-line note when counters are unavailable, so a wall-clock-only

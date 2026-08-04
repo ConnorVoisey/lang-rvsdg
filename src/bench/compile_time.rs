@@ -200,6 +200,8 @@ fn phase_metric_samples(metrics: &[PhaseMetrics]) -> MetricSamples {
         instructions: counter(|m| m.instructions),
         cache_misses: counter(|m| m.cache_misses),
         cache_references: counter(|m| m.cache_references),
+        allocations: counter(|m| m.allocations),
+        alloc_bytes: counter(|m| m.alloc_bytes),
     }
 }
 
@@ -754,7 +756,12 @@ fn augment_one(
     let io = tempfile::tempdir()?;
     let bc = prog.staged.path();
     for &level in levels {
-        // Our in-process phases (mid+backend from the staged IR).
+        // Our in-process phases (mid+backend from the staged IR). The
+        // steady tick repaints from a background thread and its string
+        // formatting allocates into the process-global allocation
+        // counters, so it is paused while phases are measured -- the
+        // per-phase allocation counts stay deterministic.
+        bar.disable_steady_tick();
         let run = measure_phases(
             bc,
             &prog.name,
@@ -762,7 +769,9 @@ fn augment_one(
             opts.warmup,
             opts.iters,
             counters,
-        )?;
+        );
+        bar.enable_steady_tick(Duration::from_millis(120));
+        let run = run?;
         let phases = phase_records(&run);
         let passes = pass_records(&run);
         if record.emitted_ir.is_none() {

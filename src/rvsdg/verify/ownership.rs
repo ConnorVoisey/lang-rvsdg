@@ -51,7 +51,7 @@ impl FunctionGraph {
                 }
             }
 
-            for &param in &region.params {
+            for &param in self.region_params(region_id) {
                 let names_region_back = matches!(
                     self.get_value_kind(param),
                     ValueKind::RegionParam { region: r, .. } if *r == region_id
@@ -140,9 +140,9 @@ mod tests {
         // Spot-check the links resolve to the right constructs: every
         // parameter names the region whose params list holds it.
         let graph = m.graphs[0].as_ref().unwrap();
-        for (index, reg) in graph.regions.iter().enumerate() {
+        for index in 0..graph.regions.len() {
             let region = RegionId(index as u32);
-            for &param in &reg.params {
+            for &param in graph.region_params(region) {
                 let ValueKind::RegionParam { region: r, .. } = &graph.get_value_kind(param) else {
                     unreachable!();
                 };
@@ -172,10 +172,8 @@ mod tests {
         let graph = m.graphs[0].as_mut().unwrap();
         // Point the function region's owner at a value that is not a
         // construct owning it (the returned Add).
-        let add = graph
-            .regions
-            .iter()
-            .flat_map(|r| r.nodes.iter())
+        let add = (0..graph.regions.len())
+            .flat_map(|index| graph.region_nodes(RegionId(index as u32)).iter())
             .find(|id| matches!(graph.get_value_kind(**id), ValueKind::Binary { .. }))
             .copied()
             .unwrap();
@@ -192,7 +190,7 @@ mod tests {
     fn param_naming_wrong_region_is_caught() {
         let mut m = build_gamma_theta_module();
         let graph = m.graphs[0].as_mut().unwrap();
-        let param = graph.regions[0].params[0];
+        let param = graph.region_params(RegionId(0))[0];
         let ValueKind::RegionParam { region, .. } = &mut graph.get_value_kind_mut(param) else {
             unreachable!();
         };

@@ -268,10 +268,6 @@ pub enum ValueKind {
         /// region's params list.
         region: RegionId,
     },
-    RegionResult {
-        values: ValuesSpan,
-        state: State,
-    },
 }
 
 impl ValueKind {

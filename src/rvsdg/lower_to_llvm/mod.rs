@@ -1,5 +1,6 @@
 use crate::rvsdg::{
-    FuncId, GlobalId, GlobalInit, Linkage, RVSDGMod, Region, ThreadLocalMode, ValueId, Visibility,
+    FuncId, GlobalId, GlobalInit, Linkage, RVSDGMod, RegionId, ThreadLocalMode, ValueId,
+    Visibility,
     func::{
         CallingConvention, FnAttrFlags, FnAttrs, Function, MemoryEffects, ModRef, ParamAttrFlags,
         ParamAttrsExtra, Signature,
@@ -724,18 +725,18 @@ impl<'m, 'a, 'ctx> FunctionLowerer<'m, 'a, 'ctx> {
         let entry = self.mod_lower.context.append_basic_block(func, "entry");
         self.builder.position_at_end(entry);
         let graph = self.graph;
-        let region = &graph.regions[0];
-        for (i, &param_id) in region.params.iter().enumerate() {
+        let body = RegionId(0);
+        for (i, &param_id) in graph.region_params(body).iter().enumerate() {
             let param = func
                 .get_nth_param(i as u32)
                 .ok_or_else(|| eyre!("function `{}` is missing parameter {i}", rvsdg_func.name))?;
             self.set_val(param_id, param);
         }
 
-        self.lower_region(region)?;
+        self.lower_region(body)?;
 
         // regions results should be added from inside lower_region
-        let res = graph.value_pool.get(region.results);
+        let res = graph.region_results(body);
         match res.len() {
             0 => self.builder.build_return(None)?,
             1 => {
@@ -752,7 +753,7 @@ impl<'m, 'a, 'ctx> FunctionLowerer<'m, 'a, 'ctx> {
         Ok(())
     }
 
-    /// Lower every node of a region, in `region.nodes` order.
+    /// Lower every node of a region, in its nodes-block order.
     ///
     /// This linear walk is what honours the STATE edges: construction
     /// appends nodes in symbolic-execution order, so the list is a
@@ -763,8 +764,9 @@ impl<'m, 'a, 'ctx> FunctionLowerer<'m, 'a, 'ctx> {
     /// instructions is positional within a block), so there is nothing to
     /// resolve or return for a state edge at this level. Side-effecting
     /// nodes must only ever be lowered by this walk, never on demand.
-    fn lower_region(&mut self, region: &Region) -> color_eyre::Result<()> {
-        for &value_id in region.nodes.iter() {
+    fn lower_region(&mut self, region: RegionId) -> color_eyre::Result<()> {
+        let graph = self.graph;
+        for &value_id in graph.region_nodes(region) {
             self.lower_value(value_id)?;
         }
         Ok(())

@@ -502,10 +502,11 @@ pub fn run_cli(cli: &Cli) -> color_eyre::Result<Option<u8>> {
     // anyway.
     let collect_stats = cli.stats || cli.stats_json.is_some();
     if collect_stats {
-        // Heap counting costs ~7ns of atomics per alloc/dealloc pair
-        // (~0.3-0.5% of a large compile through the llvm-ir parse), so
-        // it runs only when the numbers were asked for. The counters
-        // absorb the few pre-enable allocations (see stats::heap).
+        // Heap counting costs a few relaxed atomics per allocation (on
+        // the order of half a percent of a large compile through the
+        // llvm-ir parse), so it runs only when the numbers were asked
+        // for. The counters absorb the few pre-enable allocations (see
+        // stats::heap).
         stats::heap::enable();
     }
 

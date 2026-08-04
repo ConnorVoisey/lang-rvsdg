@@ -322,6 +322,7 @@ impl<'m> Emitter<'m> {
 
         // Process each alternative in its own region under its own frame.
         let mut arm_regions: Vec<RegionId> = Vec::with_capacity(partition.arms.len());
+        let mut arm_exits: Vec<State> = Vec::with_capacity(partition.arms.len());
         let mut arm_frames: Vec<Frame> = Vec::with_capacity(partition.arms.len());
         for (index, arm) in partition.arms.iter().enumerate() {
             let region_id = lowerer.rb.add_region(state);
@@ -349,7 +350,7 @@ impl<'m> Emitter<'m> {
                     None
                 }
             };
-            lowerer.rb.graph.regions[region_id.0 as usize].exit_state = arm_exit.unwrap_or(state);
+            arm_exits.push(arm_exit.unwrap_or(state));
             arm_frames.push(lowerer.scopes.pop_frame());
         }
 
@@ -450,7 +451,7 @@ impl<'m> Emitter<'m> {
                 };
                 results.push(value);
             }
-            graph.set_region_results(region_id, results);
+            graph.seal_region(region_id, results, arm_exits[index]);
         }
 
         let result = lowerer.rb.finish_gamma(
@@ -634,7 +635,6 @@ impl<'m> Emitter<'m> {
             };
             (condition, body_exit)
         };
-        lowerer.rb.graph.regions[body_region_id.0 as usize].exit_state = body_exit;
         let frame = lowerer.scopes.pop_frame();
 
         // Assembly, afterwards. Slots: the frame's captures in capture
@@ -699,7 +699,7 @@ impl<'m> Emitter<'m> {
         lowerer
             .rb
             .graph
-            .set_region_results(body_region_id, next_values);
+            .seal_region(body_region_id, next_values, body_exit);
 
         let result = lowerer
             .rb

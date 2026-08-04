@@ -35,6 +35,15 @@ use lang_rvsdg::bench::record::{
     SCHEMA_VERSION, regenerate_data_js, write_run,
 };
 use lang_rvsdg::bench::suite::{self, Suite};
+use lang_rvsdg::stats::heap::{self, CountingAllocator};
+
+/// Rust-heap allocation counting for the `--wall` pass's per-phase
+/// breakdown. Enabled only when that pass runs: counting costs a few
+/// atomic ops per allocation (~0.3-0.5% on the in-process hardware
+/// counters), and the deterministic Cachegrind pass measures
+/// subprocesses, which this binary's allocator cannot touch.
+#[global_allocator]
+static ALLOCATOR: CountingAllocator = CountingAllocator;
 
 /// A whole compile taking longer than this is a finding, not a
 /// measurement; the subprocess is killed and the config drops out.
@@ -198,6 +207,10 @@ fn main() -> color_eyre::Result<()> {
     let iters = args.iters.unwrap_or(DEFAULT_ITERS);
     let warmup = args.warmup.unwrap_or(DEFAULT_WARMUP);
     let compiler = locate_compiler(&args)?;
+
+    if args.wall {
+        heap::enable();
+    }
 
     let mut counters = Counters::new();
     if let Some(warning) = availability_warning(&counters) {
@@ -423,6 +436,25 @@ fn print_config(config: &ConfigRecord) {
         println!("      phases: {}", phases.join(", "));
         if let Some(misses) = total_cache_misses(config) {
             println!("      cache-misses (in-process, median sum): {misses}");
+        }
+        // Allocation traffic per phase (medians), when the counting
+        // allocator measured it.
+        let allocs: Vec<String> = config
+            .phases
+            .iter()
+            .filter_map(|p| {
+                let count = median(p.samples.allocations.as_deref()?)?;
+                let bytes = median(p.samples.alloc_bytes.as_deref()?)?;
+                Some(format!(
+                    "{} {} ({}B)",
+                    p.phase,
+                    human_count(count),
+                    human_count(bytes)
+                ))
+            })
+            .collect();
+        if !allocs.is_empty() {
+            println!("      allocs: {}", allocs.join(", "));
         }
     }
 }

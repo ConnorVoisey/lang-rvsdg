@@ -1,9 +1,9 @@
 use crate::rvsdg::{
-    FuncId, InlineHint, Linkage, RVSDGMod, State, ValueId, ValueKind, Visibility,
+    FuncId, InlineHint, Linkage, RVSDGMod, State, ValueId, Visibility,
     builder::RegionBuilder,
     function_graph::FunctionGraph,
     global::DllStorageClass,
-    types::{FuncTypeId, ScalarType, TypeRef},
+    types::{FuncTypeId, TypeRef},
 };
 use rustc_hash::FxHashMap;
 
@@ -324,14 +324,8 @@ impl RVSDGMod {
         let region_id = rb.region_id();
         let state = rb.graph.regions[region_id.0 as usize].entry_state;
         let fn_res = rb_fn(&mut rb, state)?;
-        let results = rb.graph.value_pool.push_slice(&fn_res.values);
-        rb.graph.value_kinds.push(ValueKind::RegionResult {
-            values: results,
-            state: fn_res.state,
-        });
-        rb.graph.value_types.push(TypeRef::Scalar(ScalarType::Void));
-        graph.regions[region_id.0 as usize].results = results;
-        graph.regions[region_id.0 as usize].exit_state = fn_res.state;
+        graph.seal_region(region_id, &fn_res.values, fn_res.state);
+        graph.finish_building();
 
         // TODO: if in debug mode check that the return values match the declerations return types
         // Also consider if it is variadic

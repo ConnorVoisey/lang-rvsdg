@@ -3,11 +3,9 @@ mod arithmetic;
 mod control_flow;
 mod memory;
 
-use smallvec::SmallVec;
-
 use crate::rvsdg::{
-    FuncId, Region, RegionId, State, Value, ValueId, ValueKind, ValuesSpan,
-    function_graph::FunctionGraph, module_tables::ModuleTables, types::TypeRef,
+    FuncId, RegionId, State, Value, ValueId, ValueKind, function_graph::FunctionGraph,
+    module_tables::ModuleTables, types::TypeRef,
 };
 
 /// Passed to a branch closure -- represents being inside a gamma branch
@@ -16,50 +14,6 @@ pub struct RegionBuilder<'a> {
     pub region_id: RegionId,
     pub graph: &'a mut FunctionGraph,
     pub module_tables: &'a mut ModuleTables,
-}
-
-impl FunctionGraph {
-    /// Append a parameter to `region`, returning its value. Used by the
-    /// emitter's capture-on-demand: a region acquires an input the moment
-    /// its body first reads an outer value, so parameter values interleave
-    /// with body values in the global array (which is why `Region::params`
-    /// is an explicit list).
-    pub(crate) fn append_region_param(&mut self, region: RegionId, ty: TypeRef) -> ValueId {
-        let index = self.get_region(region).params.len() as u32;
-        let id = ValueId(self.value_kinds.len() as u32);
-        self.value_kinds
-            .push(ValueKind::RegionParam { index, ty, region });
-        self.value_types.push(ty);
-        self.regions[region.0 as usize].params.push(id);
-        id
-    }
-
-    /// Replace `region`'s parameter list with `params` (construct assembly
-    /// aligns every alternative's parameters to one canonical input order),
-    /// fixing each parameter value's index and region fields to its new
-    /// position.
-    pub(crate) fn set_region_params(&mut self, region: RegionId, params: &[ValueId]) {
-        for (position, &param) in params.iter().enumerate() {
-            let ValueKind::RegionParam {
-                index,
-                region: param_region,
-                ..
-            } = &mut self.value_kinds[param.0 as usize]
-            else {
-                unreachable!("region parameter lists hold only RegionParam values");
-            };
-            *index = position as u32;
-            *param_region = region;
-        }
-        self.get_region_mut(region).params = params.into();
-    }
-
-    /// Set `region`'s results (construct assembly runs after the region's
-    /// body has been emitted).
-    pub(crate) fn set_region_results(&mut self, region: RegionId, results: &[ValueId]) {
-        let span = self.value_pool.push_slice(results);
-        self.get_region_mut(region).results = span;
-    }
 }
 
 impl<'a> RegionBuilder<'a> {
@@ -78,57 +32,16 @@ impl<'a> RegionBuilder<'a> {
         }
     }
 
-    pub fn new_empty(
-        graph: &'a mut FunctionGraph,
-        module_tables: &'a mut ModuleTables,
-        entry_state: State,
-    ) -> Self {
-        let region = RegionId(graph.regions.len() as u32);
-        graph.regions.push(Region {
-            params: SmallVec::new(),
-            results: ValuesSpan { start: 0, len: 0 },
-            owner: ValueId::INVALID,
-            entry_state,
-            exit_state: State::INVALID,
-            nodes: vec![],
-        });
-        Self {
-            region_id: region,
-            module_tables,
-            graph,
-        }
-    }
-
     pub fn new_with_params(
         graph: &'a mut FunctionGraph,
         module_tables: &'a mut ModuleTables,
         entry_state: State,
         param_types: &[TypeRef],
     ) -> Self {
-        let region = RegionId(graph.regions.len() as u32);
-
-        let params = {
-            let mut params = SmallVec::with_capacity(param_types.len());
-            for (i, &ty) in param_types.iter().enumerate() {
-                params.push(ValueId(graph.value_kinds.len() as u32));
-                graph.value_kinds.push(ValueKind::RegionParam {
-                    index: i as u32,
-                    ty,
-                    region,
-                });
-                graph.value_types.push(ty);
-            }
-            params
-        };
-
-        graph.regions.push(Region {
-            params,
-            owner: ValueId::INVALID,
-            entry_state,
-            exit_state: State::INVALID,
-            results: ValuesSpan { start: 0, len: 0 },
-            nodes: vec![],
-        });
+        let region = graph.create_region(entry_state);
+        for &ty in param_types {
+            graph.append_region_param(region, ty);
+        }
         Self {
             region_id: region,
             module_tables,
@@ -141,41 +54,27 @@ impl<'a> RegionBuilder<'a> {
         module_tables: &'a mut ModuleTables,
         func_id: FuncId,
     ) -> Self {
-        let region = RegionId(graph.regions.len() as u32);
-        let fn_params = &module_tables.get_function(func_id).params;
+        // The entry state is not known until the params exist; created
+        // INVALID and stamped below.
+        let region = graph.create_region(State::INVALID);
+        let function = module_tables.get_function(func_id);
+        for param in &function.params {
+            graph.append_region_param(region, param.ty);
+        }
 
-        let params = {
-            let fn_param_tys: Vec<TypeRef> = fn_params.iter().map(|param| param.ty).collect();
-            let mut params = SmallVec::with_capacity(fn_param_tys.len());
-            for (i, &ty) in fn_param_tys.iter().enumerate() {
-                params.push(ValueId(graph.value_kinds.len() as u32));
-                graph.value_kinds.push(ValueKind::RegionParam {
-                    index: i as u32,
-                    ty,
-                    region,
-                });
-                graph.value_types.push(ty);
-            }
-            params
-        };
-
-        // add state node after all params, this is not recorded in the result ValuesSpan
+        // Add the state parameter after all value params. It is NOT in
+        // the params segment (callers pass no state argument); its index
+        // is one past the list, and dead node elimination's renumbering
+        // preserves that convention.
         let entry_state = State(ValueId(graph.value_kinds.len() as u32));
         graph.value_kinds.push(ValueKind::RegionParam {
-            index: fn_params.len() as u32,
+            index: function.params.len() as u32,
             ty: TypeRef::State,
             region,
         });
         graph.value_types.push(TypeRef::State);
+        graph.regions[region.0 as usize].entry_state = entry_state;
 
-        graph.regions.push(Region {
-            params,
-            owner: ValueId::INVALID,
-            entry_state,
-            exit_state: State::INVALID,
-            results: ValuesSpan { start: 0, len: 0 },
-            nodes: vec![],
-        });
         Self {
             region_id: region,
             module_tables,
@@ -190,21 +89,12 @@ impl<'a> RegionBuilder<'a> {
 
     #[inline]
     pub fn param(&self, index: u32) -> ValueId {
-        self.graph.get_region(self.region_id).params[index as usize]
+        self.graph.region_params(self.region_id)[index as usize]
     }
 
     #[inline]
     pub fn add_region(&mut self, state: State) -> RegionId {
-        let id = RegionId(self.graph.regions.len() as u32);
-        self.graph.regions.push(Region {
-            owner: ValueId::INVALID,
-            entry_state: state,
-            exit_state: State::INVALID,
-            params: SmallVec::new(),
-            results: ValuesSpan { start: 0, len: 0 },
-            nodes: vec![],
-        });
-        id
+        self.graph.create_region(state)
     }
 
     #[inline(always)]
@@ -212,8 +102,7 @@ impl<'a> RegionBuilder<'a> {
         let id = ValueId(self.graph.value_kinds.len() as u32);
         self.graph.value_kinds.push(data.kind);
         self.graph.value_types.push(data.ty);
-        let region = self.graph.get_region_mut(self.region_id());
-        region.nodes.push(id);
+        self.graph.push_region_node(self.region_id, id);
         id
     }
 }
@@ -252,8 +141,8 @@ pub struct OverflowResult {
     pub overflow: ValueId,
 }
 
-// TODO: BranchResult, LoopResult, and PhiBody each allocate a Vec<ValueId> per
-// closure invocation. These are short-lived (created in the closure, consumed
+// TODO: BranchResult and LoopResult each allocate a Vec<ValueId> per closure
+// invocation. These are short-lived (created in the closure, consumed
 // immediately by the builder). For typical branches returning 1-3 values this is
 // likely fine, but profile real-world code to determine if SmallVec<[ValueId; 4]>
 // would be worthwhile.
@@ -285,24 +174,6 @@ pub struct ThetaResult {
 }
 
 impl ThetaResult {
-    pub fn result(&self, index: u16) -> ValueId {
-        debug_assert!(index < self.result_count);
-        ValueId(self.first_result.0 + index as u32)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PhiBody {
-    pub values: Vec<ValueId>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PhiResult {
-    pub first_result: ValueId,
-    pub result_count: u16,
-}
-
-impl PhiResult {
     pub fn result(&self, index: u16) -> ValueId {
         debug_assert!(index < self.result_count);
         ValueId(self.first_result.0 + index as u32)

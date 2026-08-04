@@ -12,8 +12,6 @@ impl<'a> RegionBuilder<'a> {
     /// N-way conditional branch. Condition value selects which region executes:
     /// 0 -> first branch, 1 -> second, etc. All branches must return the same
     /// number and types of values.
-    // (20-50+ in real programs). Profile real-world code to determine if an
-    // incremental builder API (gamma_begin/add_input/build) would be worthwhile.
     #[inline]
     pub fn gamma_n(
         &mut self,
@@ -23,8 +21,6 @@ impl<'a> RegionBuilder<'a> {
         branches: &[&dyn Fn(&mut RegionBuilder) -> color_eyre::Result<BranchResult>],
     ) -> color_eyre::Result<GammaResult> {
         debug_assert!(branches.len() >= 2, "gamma requires at least 2 branches");
-        let inputs_span = self.graph.value_pool.push_slice(inputs);
-
         let mut branch_regions: Vec<RegionId> = Vec::with_capacity(branches.len());
         let mut result_count: Option<u16> = None;
 
@@ -45,51 +41,13 @@ impl<'a> RegionBuilder<'a> {
                     "all gamma branches must return the same number of values"
                 ),
             }
-            let results = rb.graph.value_pool.push_slice(&res.values);
-            rb.graph.get_region_mut(rb.region_id).results = results;
-            rb.graph.get_region_mut(rb.region_id).exit_state = res.state;
+            rb.graph.seal_region(rb.region_id, &res.values, res.state);
             branch_regions.push(rb.region_id);
         }
 
         let result_count =
-            result_count.ok_or_else(|| eyre!("gamma_n requires at least one branch"))?;
-        let regions = self.graph.region_pool.push_slice(&branch_regions);
-
-        let gamma_val = self.add_value(Value {
-            ty: TypeRef::State,
-            kind: ValueKind::Gamma {
-                condition,
-                inputs: inputs_span,
-                state,
-                regions,
-            },
-        });
-        for &arm in &branch_regions {
-            self.graph.get_region_mut(arm).owner = gamma_val;
-        }
-        let out_state = State(gamma_val);
-
-        let first_result = ValueId(self.graph.value_kinds.len() as u32);
-        let first_region = branch_regions[0];
-        let first_results = self.graph.get_region(first_region).results;
-        for i in 0..result_count {
-            let ty = *self
-                .graph
-                .get_value_type(self.graph.value_pool.get(first_results)[i as usize]);
-            self.add_value(Value {
-                ty,
-                kind: ValueKind::Project {
-                    call: gamma_val,
-                    index: i,
-                },
-            });
-        }
-
-        Ok(GammaResult {
-            state: out_state,
-            first_result,
-            result_count,
-        })
+            result_count.ok_or_else(|| eyre!("gamma requires at least 2 branches"))?;
+        Ok(self.finish_gamma(condition, state, inputs, &branch_regions, result_count))
     }
 
     /// Assemble a gamma node from regions that were built incrementally
@@ -129,11 +87,10 @@ impl<'a> RegionBuilder<'a> {
 
         let first_result = ValueId(self.graph.value_kinds.len() as u32);
         let first_region = branch_regions[0];
-        let first_results = self.graph.get_region(first_region).results;
         for i in 0..result_count {
             let ty = *self
                 .graph
-                .get_value_type(self.graph.value_pool.get(first_results)[i as usize]);
+                .get_value_type(self.graph.region_results(first_region)[i as usize]);
             self.add_value(Value {
                 ty,
                 kind: ValueKind::Project {
@@ -197,7 +154,7 @@ impl<'a> RegionBuilder<'a> {
     }
 
     /// Two-way if/else convenience. Condition is a bool: true -> first branch,
-    /// false -> second branch. See `gamma_n` for the inputs allocation note.
+    /// false -> second branch.
     #[inline]
     pub fn gamma(
         &mut self,
@@ -271,9 +228,6 @@ impl<'a> RegionBuilder<'a> {
         loop_vars: &[ValueId],
         loop_body: impl FnOnce(&mut RegionBuilder) -> color_eyre::Result<LoopResult>,
     ) -> color_eyre::Result<ThetaResult> {
-        let loop_span = self.graph.value_pool.push_slice(loop_vars);
-        let result_count = loop_vars.len() as u16;
-
         let param_types: Vec<TypeRef> = loop_vars
             .iter()
             .map(|id| *self.graph.get_value_type(*id))
@@ -284,45 +238,16 @@ impl<'a> RegionBuilder<'a> {
                 RegionBuilder::new_with_params(self.graph, self.module_tables, state, &param_types);
             let res = loop_body(&mut rb)?;
             debug_assert_eq!(
-                res.next_vars.len() as u16,
-                result_count,
+                res.next_vars.len(),
+                loop_vars.len(),
                 "theta body must return the same number of loop vars"
             );
-            let results = rb.graph.value_pool.push_slice(&res.next_vars);
-            rb.graph.get_region_mut(rb.region_id).results = results;
-            rb.graph.get_region_mut(rb.region_id).exit_state = res.next_state;
+            rb.graph
+                .seal_region(rb.region_id, &res.next_vars, res.next_state);
             (rb.region_id, res.condition)
         };
 
-        let theta_val = self.add_value(Value {
-            ty: TypeRef::State,
-            kind: ValueKind::Theta {
-                loop_vars: loop_span,
-                condition,
-                state,
-                region_id: region,
-            },
-        });
-        self.graph.get_region_mut(region).owner = theta_val;
-        let out_state = State(theta_val);
-
-        let first_result = ValueId(self.graph.value_kinds.len() as u32);
-        for i in 0..result_count {
-            let ty = *self.graph.get_value_type(loop_vars[i as usize]);
-            self.add_value(Value {
-                ty,
-                kind: ValueKind::Project {
-                    call: theta_val,
-                    index: i,
-                },
-            });
-        }
-
-        Ok(ThetaResult {
-            state: out_state,
-            first_result,
-            result_count,
-        })
+        Ok(self.finish_theta(state, loop_vars, region, condition))
     }
 
     /// Call a known function with an ABI signature derived from its

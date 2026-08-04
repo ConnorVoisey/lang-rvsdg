@@ -484,10 +484,6 @@ impl<'m, 'a, 'ctx> FunctionLowerer<'m, 'a, 'ctx> {
             ValueKind::RegionParam { .. } => {
                 bail!("RegionParam {value_id:?} was not pre-populated in the lowerer")
             }
-            ValueKind::RegionResult {
-                values: _,
-                state: _,
-            } => None,
         };
 
         if let Some(val) = lowered_val {

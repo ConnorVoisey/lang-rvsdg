@@ -99,8 +99,10 @@ pub struct MemoryBudget {
     pub values_bytes: usize,
     pub value_pool_bytes: usize,
     pub region_structs_bytes: usize,
-    /// Heap entries of every region's params/nodes Vec.
-    pub region_lists_bytes: usize,
+    /// The regions' interface and node blocks, which live INSIDE the
+    /// value pool: a SUBSET of `value_pool_bytes` broken out for the
+    /// region view, never added to other byte figures.
+    pub region_blocks_bytes: usize,
     pub region_pool_bytes: usize,
     pub u32_pool_bytes: usize,
     pub match_arm_pool_bytes: usize,
@@ -112,9 +114,13 @@ pub struct MemoryBudget {
 #[derive(Debug, Default, Clone, Copy, Serialize)]
 pub struct SpanComposition {
     pub gamma_inputs: usize,
-    /// Every region's results span (function bodies, gamma arms, theta
-    /// bodies alike; RegionResult values reuse the same span).
+    /// Every region's params segment (interface blocks live in the pool).
+    pub region_params: usize,
+    /// Every region's results segment (function bodies, gamma arms,
+    /// theta bodies alike).
     pub region_results: usize,
+    /// Every region's nodes block.
+    pub region_nodes: usize,
     pub theta_loop_vars: usize,
     /// Call, CallIndirect and Intrinsic argument spans.
     pub call_args: usize,
@@ -276,10 +282,18 @@ pub struct ModuleSummaryRow {
     pub interned_constants: usize,
     pub bytes_values: usize,
     pub bytes_value_pool: usize,
+    /// Region structs plus the region-span pool; the regions' blocks are
+    /// inside `bytes_value_pool` and reported separately below, so the
+    /// byte fields stay additive.
     pub bytes_regions: usize,
+    /// The regions' interface/node blocks: a subset of
+    /// `bytes_value_pool`, never added to a total.
+    pub bytes_region_blocks: usize,
     pub bytes_match_arms: usize,
     pub span_gamma_inputs: usize,
+    pub span_region_params: usize,
     pub span_region_results: usize,
+    pub span_region_nodes: usize,
     pub span_loop_vars: usize,
     pub span_call_args: usize,
     pub span_ptr_offset_indices: usize,
@@ -323,7 +337,6 @@ pub fn kind_name(kind: &ValueKind) -> &'static str {
         ValueKind::CallIndirect { .. } => "CallIndirect",
         ValueKind::Project { .. } => "Project",
         ValueKind::RegionParam { .. } => "RegionParam",
-        ValueKind::RegionResult { .. } => "RegionResult",
     }
 }
 
@@ -376,15 +389,8 @@ fn effects_are_readonly(attrs: &FnAttrs) -> bool {
 /// parameters back to the values that feed them.
 #[derive(Clone, Copy)]
 enum RegionRole {
-    ThetaBody {
-        theta: ValueId,
-    },
-    GammaArm {
-        gamma: ValueId,
-    },
-    /// Phi and lambda bodies: parameters are not positionally fed by an
-    /// input list this analysis understands.
-    Opaque,
+    ThetaBody { theta: ValueId },
+    GammaArm { gamma: ValueId },
 }
 
 /// Everything one theta-level analysis needs to know about the regions
@@ -440,7 +446,7 @@ impl<'m> Collector<'m> {
             let region_id = info.all[cursor];
             cursor += 1;
             let depth = info.own_depth.get(&region_id.0).copied();
-            for &node in &self.graph.regions[region_id.0 as usize].nodes {
+            for &node in self.graph.region_nodes(region_id) {
                 match self.graph.get_value_kind(node) {
                     ValueKind::Gamma { regions, .. } => {
                         for &arm in self.graph.region_pool.get(*regions) {
@@ -482,8 +488,12 @@ impl<'m> Collector<'m> {
             return hit.map(|position| position as usize);
         }
         let result = 'walk: {
-            let r = &self.graph.regions[region.0 as usize];
-            if let Some(position) = r.params.iter().position(|&param| param == value) {
+            if let Some(position) = self
+                .graph
+                .region_params(region)
+                .iter()
+                .position(|&param| param == value)
+            {
                 break 'walk Some(position);
             }
             if let ValueKind::Project { call, index } = self.graph.get_value_kind(value)
@@ -521,8 +531,7 @@ impl<'m> Collector<'m> {
         }
         let mut agreed: Option<usize> = None;
         for &arm in arms {
-            let region = &self.graph.regions[arm.0 as usize];
-            let results = self.graph.value_pool.get(region.results);
+            let results = self.graph.region_results(arm);
             let position = results
                 .get(slot)
                 .and_then(|&result| self.reduces_to_param(arm, result));
@@ -580,10 +589,9 @@ impl<'m> Collector<'m> {
                 .get(*regions)
                 .iter()
                 .all(|&arm_region| {
-                    let arm = &self.graph.regions[arm_region.0 as usize];
                     let (Some(&arm_target), Some(&arm_result)) = (
-                        arm.params.get(position),
-                        self.graph.value_pool.get(arm.results).get(*index as usize),
+                        self.graph.region_params(arm_region).get(position),
+                        self.graph.region_results(arm_region).get(*index as usize),
                     ) else {
                         return false;
                     };
@@ -647,15 +655,14 @@ impl<'m> Collector<'m> {
                                 else {
                                     return false;
                                 };
-                                let body = &self.graph.regions[region as usize];
-                                let results = self.graph.value_pool.get(body.results);
+                                let results = self.graph.region_results(RegionId(region));
                                 let loop_vars = self.graph.value_pool.get(*loop_vars);
                                 index < results.len()
                                     && index < loop_vars.len()
                                     && self.traces_to(results[index], value)
                                     && self.invariant_in(info, memo, loop_vars[index])
                             }
-                            Some(RegionRole::Opaque) | None => false,
+                            None => false,
                         }
                     } else {
                         false
@@ -680,7 +687,7 @@ impl<'m> Collector<'m> {
         let mut resolved: FxHashMap<ValueId, crate::rvsdg::alias::ResolvedAddress> =
             FxHashMap::default();
         for &region_id in &info.all {
-            for &node in &self.graph.get_region(region_id).nodes {
+            for &node in self.graph.region_nodes(region_id) {
                 match self.graph.get_value_kind(node) {
                     ValueKind::Load { addr, .. }
                     | ValueKind::Store { addr, .. }
@@ -712,7 +719,7 @@ impl<'m> Collector<'m> {
         // This loop level's regions: address-origin classification and
         // the invariant-motion dry run.
         for &(region_id, _depth) in &info.own {
-            for &node in &self.graph.get_region(region_id).nodes {
+            for &node in self.graph.region_nodes(region_id) {
                 let kind = self.graph.get_value_kind(node);
                 match kind {
                     ValueKind::Load { addr, .. } | ValueKind::Store { addr, .. } => {
@@ -749,7 +756,7 @@ impl<'m> Collector<'m> {
         // arm) is the unconditional per-iteration shape; depth >= 2 is
         // a source-level conditional and counts as nested.
         for &(store_region, store_depth) in &info.own {
-            for &store in &self.graph.get_region(store_region).nodes {
+            for &store in self.graph.region_nodes(store_region) {
                 let (cell_addr, cell_volatile) = match self.graph.get_value_kind(store) {
                     ValueKind::Store { addr, volatile, .. } => (*addr, *volatile),
                     _ => continue,
@@ -765,7 +772,7 @@ impl<'m> Collector<'m> {
                 let mut sync = cell_volatile;
                 for &region_id in &info.all {
                     let depth = info.own_depth.get(&region_id.0).copied();
-                    for &node in &self.graph.get_region(region_id).nodes {
+                    for &node in self.graph.region_nodes(region_id) {
                         if node == store {
                             continue;
                         }
@@ -845,15 +852,15 @@ impl<'m> Collector<'m> {
         seen.insert(root.0);
         let mut stack: Vec<(RegionId, u32, u32)> = vec![(root, 0, 0)];
         while let Some((region_id, depth, loop_depth)) = stack.pop() {
-            let region = &self.graph.get_region(region_id);
+            let region_nodes = self.graph.region_nodes(region_id);
             fc.regions += 1;
-            fc.region_node_counts.push(region.nodes.len() as u32);
-            fc.values += (region.nodes.len() + region.params.len()) as u64;
+            fc.region_node_counts.push(region_nodes.len() as u32);
+            fc.values += (region_nodes.len() + self.graph.region_params(region_id).len()) as u64;
             fc.max_depth = fc.max_depth.max(depth);
             fc.max_loop_depth = fc.max_loop_depth.max(loop_depth);
 
             let mut in_region_seen: FxHashSet<Value> = FxHashSet::default();
-            for &node in &region.nodes {
+            for &node in region_nodes {
                 let value_kind = self.graph.get_value_kind(node);
                 match value_kind {
                     ValueKind::Gamma { regions, .. } => {
@@ -862,12 +869,7 @@ impl<'m> Collector<'m> {
                         fc.gamma_arities.push(arms.len() as u32);
                         let result_count = arms
                             .first()
-                            .map(|&arm| {
-                                self.graph
-                                    .value_pool
-                                    .get(self.graph.get_region(arm).results)
-                                    .len()
-                            })
+                            .map(|&arm| self.graph.region_results(arm).len())
                             .unwrap_or(0);
                         fc.gamma_outputs += result_count as u64;
                         for slot in 0..result_count {
@@ -876,8 +878,7 @@ impl<'m> Collector<'m> {
                             }
                         }
                         for &arm in arms {
-                            let arm_region = &self.graph.get_region(arm);
-                            for &result in self.graph.value_pool.get(arm_region.results) {
+                            for &result in self.graph.region_results(arm) {
                                 fc.gamma_result_entries += 1;
                                 if matches!(
                                     self.graph.get_value_kind(result),
@@ -899,11 +900,10 @@ impl<'m> Collector<'m> {
                         fc.thetas += 1;
                         fc.theta_arities
                             .push(self.graph.value_pool.get(*loop_vars).len() as u32);
-                        let body_region = &self.graph.get_region(*body);
-                        let results = self.graph.value_pool.get(body_region.results);
+                        let results = self.graph.region_results(*body);
                         fc.theta_outputs += results.len() as u64;
                         for (slot, &result) in results.iter().enumerate() {
-                            if let Some(&param) = body_region.params.get(slot)
+                            if let Some(&param) = self.graph.region_params(*body).get(slot)
                                 && self.traces_to(result, param)
                             {
                                 fc.theta_passthrough += 1;
@@ -1010,19 +1010,15 @@ pub fn collect(m: &RVSDGMod) -> ModuleCensus {
             }
         }
 
-        // Fan-out: value-operand uses plus region results (skipping
-        // RegionResult values, whose span IS the owning region's results).
+        // Fan-out: value-operand uses plus region results.
         let mut fanout = vec![0u32; graph.value_kinds.len()];
-        for (index, value) in graph.value_kinds.iter().enumerate() {
-            if matches!(value, ValueKind::RegionResult { .. }) {
-                continue;
-            }
+        for (index, _value) in graph.value_kinds.iter().enumerate() {
             graph.for_each_value_operand(ValueId(index as u32), |op| {
                 fanout[op.0 as usize] += 1;
             });
         }
-        for region in &graph.regions {
-            for &result in graph.value_pool.get(region.results) {
+        for region_index in 0..graph.regions.len() {
+            for &result in graph.region_results(RegionId(region_index as u32)) {
                 fanout[result.0 as usize] += 1;
             }
         }
@@ -1059,10 +1055,18 @@ pub fn collect(m: &RVSDGMod) -> ModuleCensus {
             + graph.value_types.len() * size_of::<TypeRef>();
         budget.value_pool_bytes += graph.value_pool.len() * size_of::<ValueId>();
         budget.region_structs_bytes += graph.regions.len() * size_of::<crate::rvsdg::Region>();
-        budget.region_lists_bytes += graph
+        // Region interface and node blocks live in the value pool, so
+        // their bytes are counted in value_pool_bytes; this field breaks
+        // out the block subtotal (a SUBSET, never added to a total).
+        budget.region_blocks_bytes += graph
             .regions
             .iter()
-            .map(|region| (region.params.len() + region.nodes.len()) * size_of::<ValueId>())
+            .map(|region| {
+                (region.params_len as usize
+                    + region.results_len as usize
+                    + region.nodes_len as usize)
+                    * size_of::<ValueId>()
+            })
             .sum::<usize>();
         budget.region_pool_bytes += graph.region_pool.len() * size_of::<RegionId>();
         budget.u32_pool_bytes += graph.u32_pool.len() * size_of::<u32>();
@@ -1087,7 +1091,9 @@ pub fn collect(m: &RVSDGMod) -> ModuleCensus {
             }
         }
         for region in &graph.regions {
-            spans.region_results += region.results.len as usize;
+            spans.region_params += region.params_len as usize;
+            spans.region_results += region.results_len as usize;
+            spans.region_nodes += region.nodes_len as usize;
         }
 
         // Liveness: region membership seeds a value-operand closure. The gap
@@ -1100,21 +1106,21 @@ pub fn collect(m: &RVSDGMod) -> ModuleCensus {
                 worklist.push(value);
             }
         };
-        for region in &graph.regions {
-            mark(&mut live, &mut worklist, region.entry_state.0);
-            for &param in &region.params {
+        for region_index in 0..graph.regions.len() {
+            let region_id = RegionId(region_index as u32);
+            mark(
+                &mut live,
+                &mut worklist,
+                graph.regions[region_index].entry_state.0,
+            );
+            for &param in graph.region_params(region_id) {
                 mark(&mut live, &mut worklist, param);
             }
-            for &node in &region.nodes {
+            for &node in graph.region_nodes(region_id) {
                 mark(&mut live, &mut worklist, node);
             }
-            for &result in graph.value_pool.get(region.results) {
+            for &result in graph.region_results(region_id) {
                 mark(&mut live, &mut worklist, result);
-            }
-        }
-        for (index, value) in graph.value_kinds.iter().enumerate() {
-            if matches!(value, ValueKind::RegionResult { .. }) {
-                mark(&mut live, &mut worklist, ValueId(index as u32));
             }
         }
         let mut operands = Vec::new();
@@ -1150,7 +1156,9 @@ pub fn collect(m: &RVSDGMod) -> ModuleCensus {
 
     spans.unaccounted = census.value_pool_len.saturating_sub(
         spans.gamma_inputs
+            + spans.region_params
             + spans.region_results
+            + spans.region_nodes
             + spans.theta_loop_vars
             + spans.call_args
             + spans.ptr_offset_indices
@@ -1213,11 +1221,13 @@ impl ModuleCensus {
             bytes_values: self.memory_budget.values_bytes,
             bytes_value_pool: self.memory_budget.value_pool_bytes,
             bytes_regions: self.memory_budget.region_structs_bytes
-                + self.memory_budget.region_lists_bytes
                 + self.memory_budget.region_pool_bytes,
+            bytes_region_blocks: self.memory_budget.region_blocks_bytes,
             bytes_match_arms: self.memory_budget.match_arm_pool_bytes,
             span_gamma_inputs: self.span_composition.gamma_inputs,
+            span_region_params: self.span_composition.region_params,
             span_region_results: self.span_composition.region_results,
+            span_region_nodes: self.span_composition.region_nodes,
             span_loop_vars: self.span_composition.theta_loop_vars,
             span_call_args: self.span_composition.call_args,
             span_ptr_offset_indices: self.span_composition.ptr_offset_indices,
@@ -1334,22 +1344,23 @@ impl ModuleCensus {
         let budget = &self.memory_budget;
         writeln!(
             out,
-            "-- memory budget -- values {}KB, value_pool {}KB, regions {}KB (structs {} + lists {} + pool {}), match arms {}KB",
+            "-- memory budget -- values {}KB, value_pool {}KB (of which region blocks {}KB), regions {}KB (structs {} + span pool {}), match arms {}KB",
             budget.values_bytes / 1024,
             budget.value_pool_bytes / 1024,
-            (budget.region_structs_bytes + budget.region_lists_bytes + budget.region_pool_bytes)
-                / 1024,
+            budget.region_blocks_bytes / 1024,
+            (budget.region_structs_bytes + budget.region_pool_bytes) / 1024,
             budget.region_structs_bytes / 1024,
-            budget.region_lists_bytes / 1024,
             budget.region_pool_bytes / 1024,
             budget.match_arm_pool_bytes / 1024,
         )?;
         let spans = &self.span_composition;
         writeln!(
             out,
-            "-- value_pool spans -- gamma inputs {}, region results {}, loop vars {}, call args {}, ptr offset indices {}, shuffle masks {}, unaccounted {}",
+            "-- value_pool spans -- gamma inputs {}, region params {}, region results {}, region nodes {}, loop vars {}, call args {}, ptr offset indices {}, shuffle masks {}, unaccounted {}",
             spans.gamma_inputs,
+            spans.region_params,
             spans.region_results,
+            spans.region_nodes,
             spans.theta_loop_vars,
             spans.call_args,
             spans.ptr_offset_indices,
@@ -1443,6 +1454,14 @@ mod tests {
             .unwrap();
 
         let census = collect(&rvsdg);
+        // Accounting invariants the reporting relies on: every pool entry
+        // lands in exactly one span bucket (unaccounted means orphaned
+        // spans, and a fresh module has none), and the regions' blocks
+        // are a subset of the pool they live in. Pinned here so a future
+        // double-count fails instead of being clamped by saturating_sub.
+        assert_eq!(census.span_composition.unaccounted, 0);
+        assert!(census.memory_budget.region_blocks_bytes <= census.memory_budget.value_pool_bytes);
+
         assert_eq!(census.functions.len(), 1);
         let f = &census.functions[0];
         assert_eq!(f.thetas, 1);

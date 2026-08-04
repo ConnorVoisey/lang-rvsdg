@@ -29,9 +29,9 @@ pub(crate) enum Owner {
     /// Not in any region's nodes or params: region results, entry states,
     /// and other structural values that are never ordinary operands.
     Unowned,
-    /// `region.nodes[position]`.
+    /// Entry `position` of the region's nodes block.
     Node { region: u32, position: u32 },
-    /// One of `region.params`.
+    /// One of the region's parameters.
     Param { region: u32 },
 }
 
@@ -46,8 +46,9 @@ impl FunctionGraph {
         errs: &mut Vec<RVSDGVerificationError>,
     ) -> Vec<Owner> {
         let mut owner = vec![Owner::Unowned; self.value_kinds.len()];
-        for (region_index, region) in self.regions.iter().enumerate() {
-            for (position, &value) in region.nodes.iter().enumerate() {
+        for region_index in 0..self.regions.len() {
+            let region_id = RegionId(region_index as u32);
+            for (position, &value) in self.region_nodes(region_id).iter().enumerate() {
                 if owner[value.0 as usize] != Owner::Unowned {
                     errs.push(RVSDGVerificationError::ValueInMultipleRegions(value));
                     continue;
@@ -57,7 +58,7 @@ impl FunctionGraph {
                     position: position as u32,
                 };
             }
-            for &param in &region.params {
+            for &param in self.region_params(region_id) {
                 if owner[param.0 as usize] != Owner::Unowned {
                     errs.push(RVSDGVerificationError::ValueInMultipleRegions(param));
                     continue;
@@ -102,9 +103,10 @@ impl FunctionGraph {
             }
         };
 
-        for (region_index, region) in self.regions.iter().enumerate() {
+        for region_index in 0..self.regions.len() {
+            let region_id = RegionId(region_index as u32);
             let user_region = region_index as u32;
-            for (position, &user) in region.nodes.iter().enumerate() {
+            for (position, &user) in self.region_nodes(region_id).iter().enumerate() {
                 let user_position = position as u32;
                 let visit = |errs: &mut Vec<RVSDGVerificationError>, operand: ValueId| {
                     check(errs, user, user_region, user_position, operand);
@@ -230,11 +232,6 @@ impl FunctionGraph {
                             }),
                         }
                     }
-                    ValueKind::RegionResult { values, .. } => {
-                        // Structural: its span IS the owning region's
-                        // results, checked in the results loop below.
-                        let _ = values;
-                    }
                     ValueKind::Const(_)
                     | ValueKind::ConstPoolRef(_)
                     | ValueKind::GlobalRef(_)
@@ -246,7 +243,7 @@ impl FunctionGraph {
 
             // A region's results must be visible inside it (at its end):
             // one of its nodes, one of its parameters, or region-free.
-            for &result in self.value_pool.get(region.results) {
+            for &result in self.region_results(region_id) {
                 let visible = region_free(result)
                     || matches!(
                         owner[result.0 as usize],

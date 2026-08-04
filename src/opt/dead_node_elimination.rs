@@ -35,7 +35,7 @@ impl RVSDGMod {
             alive.resize(graph.value_kinds.len(), false);
             graph.mark_alive_nodes(&mut alive)?;
             graph.pin_projections(&mut alive, &mut effects);
-            graph.remove_dead_nodes(&alive, &mut effects)?;
+            graph.remove_dead_nodes(&alive, &mut effects);
         }
         Ok(effects)
     }
@@ -68,12 +68,11 @@ impl FunctionGraph {
         // Region 0 is the function body by the graph constructor's
         // convention. It is unique in this search: everything it
         // returns is assumed needed.
-        let region = self.get_region(RegionId(0));
-
-        let mut stack = self.value_pool.get(region.results).to_vec();
-        stack.push(region.exit_state.0);
-        stack.extend_from_slice(&region.params);
-        stack.push(region.entry_state.0);
+        let body = RegionId(0);
+        let mut stack = self.region_results(body).to_vec();
+        stack.push(self.get_region(body).exit_state.0);
+        stack.extend_from_slice(self.region_params(body));
+        stack.push(self.get_region(body).entry_state.0);
 
         while let Some(value_id) = stack.pop() {
             if alive[value_id.0 as usize] {
@@ -139,10 +138,6 @@ impl FunctionGraph {
                     stack.push(*callee);
                     stack.extend_from_slice(self.value_pool.get(*args));
                 }
-                ValueKind::RegionResult { values, state } => {
-                    stack.push(state.0);
-                    stack.extend_from_slice(self.value_pool.get(*values));
-                }
                 // A live theta always needs its repetition predicate and
                 // its body's state chain. Its loop variable slots are NOT
                 // blanket-marked: each slot is demanded individually,
@@ -184,8 +179,7 @@ impl FunctionGraph {
                     match self.get_value_kind(*call) {
                         ValueKind::Gamma { regions, .. } => {
                             for &arm in self.region_pool.get(*regions) {
-                                let arm_results = self.regions[arm.0 as usize].results;
-                                stack.push(self.value_pool.get(arm_results)[index as usize]);
+                                stack.push(self.region_results(arm)[index as usize]);
                             }
                         }
                         ValueKind::Theta { .. } => {
@@ -213,7 +207,7 @@ impl FunctionGraph {
                             } => {
                                 stack.push(self.value_pool.get(*inputs)[index as usize]);
                                 for &arm in self.region_pool.get(*regions) {
-                                    stack.push(self.regions[arm.0 as usize].params[index as usize]);
+                                    stack.push(self.region_params(arm)[index as usize]);
                                 }
                             }
                             ValueKind::Theta { .. } => {
@@ -247,19 +241,15 @@ impl FunctionGraph {
         else {
             unreachable!("theta slot faces requested for non-theta value");
         };
-        let body = &self.regions[region_id.0 as usize];
+        let body = *region_id;
         stack.push(self.value_pool.get(*loop_vars)[index as usize]);
-        stack.push(body.params[index as usize]);
-        stack.push(self.value_pool.get(body.results)[index as usize]);
+        stack.push(self.region_params(body)[index as usize]);
+        stack.push(self.region_results(body)[index as usize]);
         stack.push(self.projection_of(theta, index));
     }
 
     #[tracing::instrument(skip_all)]
-    fn remove_dead_nodes(
-        &mut self,
-        alive: &[bool],
-        effects: &mut DneEffects,
-    ) -> color_eyre::Result<()> {
+    fn remove_dead_nodes(&mut self, alive: &[bool], effects: &mut DneEffects) {
         debug_assert_eq!(alive.len(), self.value_kinds.len());
 
         // Both mappers are plain prefix sums of the mark, complete
@@ -299,7 +289,7 @@ impl FunctionGraph {
             if !alive[old] {
                 continue;
             }
-            let mut value = self.value_kinds[old].clone();
+            let mut value = self.value_kinds[old];
             remap_kind(
                 &mut value,
                 ValueId(old as u32),
@@ -312,46 +302,71 @@ impl FunctionGraph {
                     scratch: &mut scratch,
                     effects,
                 },
-            )?;
+            );
             self.value_kinds[value_mapper[old] as usize] = value;
             self.value_types[value_mapper[old] as usize] = self.value_types[old];
         }
         self.value_kinds.truncate(live_values as usize);
         self.value_types.truncate(live_values as usize);
 
+        // Three lists per region, alive together so the shared block
+        // writer sees the whole layout at once (params reuse `scratch`).
+        let mut results_scratch: Vec<ValueId> = Vec::new();
+        let mut nodes_scratch: Vec<ValueId> = Vec::new();
+
         // Slide live regions the same way. This runs after the value
         // pass because remap_kind reads the OLD regions: parameter
-        // lists drive the slot masks and index renumbering.
+        // lists drive the slot masks and index renumbering. Each live
+        // region's interface and node blocks are rebuilt masked into
+        // the fresh pool -- one repool path for params, results, and
+        // nodes alike -- and the old blocks are dropped with the old
+        // pool when it swaps out.
         for old in 0..self.regions.len() {
             let new = region_mapper[old];
             if new == u32::MAX {
                 continue;
             }
-            // Swap rather than clone: params/nodes are heap vecs, and
-            // the evicted slot content is dead or already relocated,
-            // never read again.
             self.regions.swap(new as usize, old);
+            let owner_old = self.regions[new as usize].owner;
+
+            // Params: masked by liveness, remapped.
+            scratch.clear();
+            for &param in self.region_params(RegionId(new)) {
+                if alive[param.0 as usize] {
+                    scratch.push(ValueId(value_mapper[param.0 as usize]));
+                }
+            }
 
             // Result slots of a gamma arm or theta body live and die
             // with their projection (old ids: projections sit directly
             // after their construct). The body region's results (region
             // 0, owner-less by the root convention) are the function's
             // ABI and are kept whole.
-            let owner_old = self.regions[new as usize].owner;
             let keep_all_results = old == 0;
-            let results = self.regions[new as usize].results;
-            let new_results = repool_masked(
-                &self.value_pool,
-                &mut fresh.value_pool,
-                &mut scratch,
-                &value_mapper,
-                results,
-                |slot| keep_all_results || alive[owner_old.0 as usize + 1 + slot],
-            );
-            effects.result_entries_dropped += (results.len - new_results.len) as u64;
+            let old_results_len = self.regions[new as usize].results_len;
+            results_scratch.clear();
+            for (slot, &result) in self.region_results(RegionId(new)).iter().enumerate() {
+                if keep_all_results || alive[owner_old.0 as usize + 1 + slot] {
+                    results_scratch.push(ValueId(value_mapper[result.0 as usize]));
+                }
+            }
+
+            // Nodes: masked by liveness, remapped, order preserved.
+            nodes_scratch.clear();
+            for &node in self.region_nodes(RegionId(new)) {
+                if alive[node.0 as usize] {
+                    nodes_scratch.push(ValueId(value_mapper[node.0 as usize]));
+                }
+            }
 
             let region = &mut self.regions[new as usize];
-            region.results = new_results;
+            region.write_blocks(
+                &mut fresh.value_pool,
+                &scratch,
+                &results_scratch,
+                &nodes_scratch,
+            );
+            effects.result_entries_dropped += (old_results_len - region.results_len) as u64;
             if old != 0 {
                 region.owner = ValueId(value_mapper[owner_old.0 as usize]);
             }
@@ -368,22 +383,12 @@ impl FunctionGraph {
             );
             region.entry_state = State(ValueId(value_mapper[region.entry_state.0.0 as usize]));
             region.exit_state = State(ValueId(value_mapper[region.exit_state.0.0 as usize]));
-            region.params.retain(|param| alive[param.0 as usize]);
-            for param in region.params.iter_mut() {
-                *param = ValueId(value_mapper[param.0 as usize]);
-            }
-            region.nodes.retain(|node| alive[node.0 as usize]);
-            for node in region.nodes.iter_mut() {
-                *node = ValueId(value_mapper[node.0 as usize]);
-            }
         }
         self.regions.truncate(live_regions as usize);
 
         fresh.install(self);
 
         self.remap_interned_values(alive, &value_mapper);
-
-        Ok(())
     }
 }
 
@@ -412,9 +417,9 @@ impl FreshPools {
 }
 
 /// Copy the slots `keep` selects from `span` into `new`, remapped
-/// through `mapper` and staged in `scratch`. The single implementation
-/// of the masked span copy, shared by the value pass (construct input
-/// spans) and the region pass (result spans).
+/// through `mapper` and staged in `scratch`. Used by the value pass for
+/// construct input spans; the region pass masks its lists itself and
+/// writes them through `Region::write_blocks`.
 fn repool_masked(
     old: &ValuePool,
     new: &mut ValuePool,
@@ -520,11 +525,7 @@ impl RemapContext<'_> {
 /// decision here. `old_id` is the value's pre-compaction id (projection
 /// adjacency is defined on old ids).
 #[inline(always)]
-fn remap_kind(
-    kind: &mut ValueKind,
-    old_id: ValueId,
-    ctx: &mut RemapContext,
-) -> color_eyre::Result<()> {
+fn remap_kind(kind: &mut ValueKind, old_id: ValueId, ctx: &mut RemapContext) {
     match kind {
         ValueKind::Const(_)
         | ValueKind::ConstPoolRef(_)
@@ -649,18 +650,20 @@ fn remap_kind(
             *condition = ctx.map_value(*condition);
             *state = ctx.map_state(*state);
             let alive = ctx.alive;
-            let body = &ctx.graph.regions[region_id.0 as usize];
+            // Copy the graph reference out of ctx so the params slice
+            // does not hold a borrow of ctx across the &mut repool call.
+            let graph = ctx.graph;
+            let body_params = graph.region_params(*region_id);
             // The slot mask here is the body parameter; the body
             // results shrink later against the projection. The mark
             // keeps a slot's four faces in lockstep -- hold it to that.
             for slot in 0..loop_vars.len as usize {
                 debug_assert_eq!(
-                    alive[body.params[slot].0 as usize],
+                    alive[body_params[slot].0 as usize],
                     alive[old_id.0 as usize + 1 + slot],
                     "theta {old_id:?} slot {slot}: parameter and projection liveness disagree"
                 );
             }
-            let body_params: &[ValueId] = &body.params;
             let repooled =
                 ctx.repool_values_masked(*loop_vars, |slot| alive[body_params[slot].0 as usize]);
             ctx.effects.theta_loop_var_slots_dropped += (loop_vars.len - repooled.len) as u64;
@@ -679,8 +682,9 @@ fn remap_kind(
             // parameter liveness is THE slot mask; arms themselves
             // always survive with their construct.
             let alive = ctx.alive;
-            let arm0 = ctx.graph.region_pool.get(*regions)[0];
-            let arm0_params: &[ValueId] = &ctx.graph.regions[arm0.0 as usize].params;
+            let graph = ctx.graph;
+            let arm0 = graph.region_pool.get(*regions)[0];
+            let arm0_params = graph.region_params(arm0);
             let repooled =
                 ctx.repool_values_masked(*inputs, |slot| alive[arm0_params[slot].0 as usize]);
             ctx.effects.gamma_input_slots_dropped += (inputs.len - repooled.len) as u64;
@@ -705,21 +709,14 @@ fn remap_kind(
             // state parameter sits one past the params list (its index
             // equals the list length), so counting the whole list gives
             // its new one-past position.
-            let params = &ctx.graph.regions[region.0 as usize].params;
+            let params = ctx.graph.region_params(*region);
             *index = params[..*index as usize]
                 .iter()
                 .filter(|param| ctx.alive[param.0 as usize])
                 .count() as u32;
             *region = ctx.map_region(*region);
         }
-        ValueKind::RegionResult { .. } => {
-            return Err(eyre!(
-                "RegionResult {old_id:?} survived marking; it shares its span with its \
-                 region's results, so remapping both would corrupt the pool"
-            ));
-        }
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -728,7 +725,8 @@ mod tests {
 
     use super::DneEffects;
     use crate::rvsdg::{
-        ArithFlags, BinaryOp, ConstValue, ICmpPred, Linkage, RVSDGMod, ValueId, ValueKind,
+        ArithFlags, BinaryOp, ConstValue, ICmpPred, Linkage, RVSDGMod, RegionId, ValueId,
+        ValueKind,
         builder::{BranchResult, LoopResult},
         func::FnResult,
         function_graph::FunctionGraph,
@@ -761,9 +759,8 @@ mod tests {
 
     fn count_nodes(m: &RVSDGMod, pred: impl Fn(&ValueKind) -> bool) -> usize {
         let g = graph(m);
-        g.regions
-            .iter()
-            .flat_map(|region| region.nodes.iter())
+        (0..g.regions.len())
+            .flat_map(|index| g.region_nodes(RegionId(index as u32)).iter())
             .filter(|id| pred(g.get_value_kind(**id)))
             .count()
     }
@@ -785,8 +782,8 @@ mod tests {
     fn single_node(m: &RVSDGMod, pred: impl Fn(&ValueKind) -> bool) -> ValueId {
         let g = graph(m);
         let mut found = None;
-        for region in &g.regions {
-            for &id in &region.nodes {
+        for index in 0..g.regions.len() {
+            for &id in g.region_nodes(RegionId(index as u32)) {
                 if pred(g.get_value_kind(id)) {
                     assert!(found.is_none(), "expected exactly one matching node");
                     found = Some(id);
@@ -1019,10 +1016,6 @@ mod tests {
         })
         .unwrap();
         let nodes_before = count_nodes(&m, |_| true);
-        // RegionResult values are never marked by the real mark phase
-        // (remove_dead_nodes refuses them: they share their span with
-        // the region's results), so a valid crafted slice excludes
-        // them too.
         let alive: Vec<bool> = graph(&m)
             .value_kinds
             .iter()
@@ -1032,14 +1025,12 @@ mod tests {
                     ValueKind::Binary {
                         op: BinaryOp::Mul,
                         ..
-                    } | ValueKind::RegionResult { .. }
+                    }
                 )
             })
             .collect();
 
-        graph_mut(&mut m)
-            .remove_dead_nodes(&alive, &mut DneEffects::default())
-            .unwrap();
+        graph_mut(&mut m).remove_dead_nodes(&alive, &mut DneEffects::default());
 
         assert_verified(&m);
         assert_eq!(count_muls(&m), 0, "flagged node removed from its region");
@@ -1052,7 +1043,7 @@ mod tests {
             graph(&m)
                 .regions
                 .iter()
-                .map(|r| r.params.len())
+                .map(|r| r.params_len as usize)
                 .sum::<usize>(),
             2,
             "region parameters survive"
@@ -1074,15 +1065,9 @@ mod tests {
         })
         .unwrap();
         let nodes_before = count_nodes(&m, |_| true);
-        let alive: Vec<bool> = graph(&m)
-            .value_kinds
-            .iter()
-            .map(|v| !matches!(v, ValueKind::RegionResult { .. }))
-            .collect();
+        let alive = vec![true; graph(&m).value_kinds.len()];
 
-        graph_mut(&mut m)
-            .remove_dead_nodes(&alive, &mut DneEffects::default())
-            .unwrap();
+        graph_mut(&mut m).remove_dead_nodes(&alive, &mut DneEffects::default());
 
         assert_verified(&m);
         assert_eq!(count_nodes(&m, |_| true), nodes_before);
@@ -1144,9 +1129,11 @@ mod tests {
             region_pool_before,
             graph(&m).region_pool.len()
         );
-        // Only the function region's results span (one entry) remains
-        // in the value pool.
-        assert_eq!(graph(&m).value_pool.len(), 1);
+        // The pool holds exactly the body region's rebuilt blocks: two
+        // params + one result (the interface block) + the one live node
+        // (the returned Add). The dead gamma's spans and blocks are all
+        // reclaimed.
+        assert_eq!(graph(&m).value_pool.len(), 4);
         assert_eq!(graph(&m).region_pool.len(), 0);
     }
 
@@ -1555,7 +1542,7 @@ mod tests {
         };
         for &arm in g.region_pool.get(regions) {
             assert_eq!(
-                g.value_pool.get(g.regions[arm.0 as usize].results).len(),
+                g.region_results(arm).len(),
                 1,
                 "unused result slot removed from every arm"
             );
@@ -1627,7 +1614,7 @@ mod tests {
         );
         for &arm in g.region_pool.get(*regions) {
             assert_eq!(
-                g.regions[arm.0 as usize].params.len(),
+                g.region_params(arm).len(),
                 0,
                 "matching arm parameter removed"
             );
@@ -1687,10 +1674,13 @@ mod tests {
             1,
             "pass-through loop variable removed from the theta inputs"
         );
-        let body = &g.regions[region_id.0 as usize];
-        assert_eq!(body.params.len(), 1, "matching body parameter removed");
         assert_eq!(
-            g.value_pool.get(body.results).len(),
+            g.region_params(region_id).len(),
+            1,
+            "matching body parameter removed"
+        );
+        assert_eq!(
+            g.region_results(region_id).len(),
             1,
             "matching body result slot removed"
         );

@@ -29,7 +29,28 @@ impl FunctionGraph {
     #[tracing::instrument(skip_all)]
     pub fn verify(&self, module_tables: &ModuleTables) -> Vec<RVSDGVerificationError> {
         let mut errs = vec![];
+        // Structural precondition, checked before anything else: every
+        // pass below reads region lists through the sealed pool handles,
+        // so an unsealed region would panic on a bogus slice instead of
+        // reporting. Like the other finaliser obligations (exit state,
+        // owner), a missed seal is a verification error, not a crash.
+        for (index, region) in self.regions.iter().enumerate() {
+            if !region.is_sealed() {
+                errs.push(RVSDGVerificationError::RegionUnsealed(RegionId(
+                    index as u32,
+                )));
+            }
+        }
+        if !errs.is_empty() {
+            return errs;
+        }
         self.verify_ids(module_tables, &mut errs);
+        // Id validity is a precondition for every pass below: they index
+        // the value arrays with operand ids, so an out-of-range id would
+        // panic there instead of being reported.
+        if !errs.is_empty() {
+            return errs;
+        }
         let ownership = self.build_value_ownership(&mut errs);
         self.verify_scope(&ownership, &mut errs);
         self.verify_state(&ownership, &mut errs);
@@ -96,6 +117,9 @@ pub enum RVSDGVerificationError {
          state-producing node of that region"
     )]
     RegionExitStateInvalid { region: RegionId, operand: ValueId },
+
+    #[error("region {0} was never sealed")]
+    RegionUnsealed(RegionId),
 
     #[error("region {0}'s exit state was never set by its finaliser")]
     RegionExitStateUnset(RegionId),

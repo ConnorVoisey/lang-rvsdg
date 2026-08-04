@@ -1,6 +1,6 @@
 use crate::rvsdg::{
-    RegionId, ValueId, ValueKind, function_graph::FunctionGraph, module_tables::ModuleTables,
-    verify::RVSDGVerificationError,
+    RegionId, State, ValueId, ValueKind, function_graph::FunctionGraph,
+    module_tables::ModuleTables, verify::RVSDGVerificationError,
 };
 
 impl FunctionGraph {
@@ -231,13 +231,115 @@ impl FunctionGraph {
                 ValueKind::Project { call, .. } => {
                     self.valid_val(errs, call);
                 }
-                ValueKind::RegionResult { values, state } => {
-                    for val_id in self.value_pool.get(values).iter() {
-                        self.valid_val(errs, *val_id);
-                    }
-                    self.valid_val(errs, state.0);
-                }
             }
         }
+
+        // Region interfaces: results and the entry/exit states are ids
+        // like any value operand, but they live on Region rather than a
+        // ValueKind, so the value loop above never sees them.
+        for index in 0..self.regions.len() {
+            let region_id = RegionId(index as u32);
+            for &result in self.region_results(region_id) {
+                self.valid_val(errs, result);
+            }
+            self.valid_val(errs, self.regions[index].entry_state.0);
+            let exit = self.regions[index].exit_state;
+            // An unset exit state is its own error (RegionExitStateUnset).
+            if exit != State::INVALID {
+                self.valid_val(errs, exit.0);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::rvsdg::{
+        ConstValue, Linkage, RVSDGMod, State, ValueId,
+        builder::BranchResult,
+        func::FnResult,
+        types::{BOOL, I32},
+        verify::RVSDGVerificationError,
+    };
+
+    /// One function with a gamma, for corrupting region interface ids.
+    fn build_gamma_module() -> RVSDGMod {
+        let mut m = RVSDGMod::new_host(String::from("test"));
+        let f = m.declare_fn(String::from("f"), &[I32, I32], &[I32], Linkage::Internal);
+        m.define_fn(f, |rb, state| {
+            let x = rb.param(0);
+            let y = rb.param(1);
+            let flag = rb.constant(BOOL, ConstValue::Int(1));
+            let predicate = rb.bool_predicate(flag);
+            let picked = rb.gamma(
+                predicate,
+                state,
+                &[x, y],
+                |rb| {
+                    Ok(BranchResult {
+                        state,
+                        values: vec![rb.param(0)],
+                    })
+                },
+                |rb| {
+                    Ok(BranchResult {
+                        state,
+                        values: vec![rb.param(1)],
+                    })
+                },
+            )?;
+            Ok(FnResult {
+                state: picked.state,
+                values: vec![picked.result(0)],
+            })
+        })
+        .unwrap();
+        m
+    }
+
+    /// Region interface ids get the same range validation as value
+    /// operands: a dangling exit-state id is reported as InvalidValueId
+    /// (and the verifier stops there, so no downstream pass indexes
+    /// out of range with it).
+    #[test]
+    fn dangling_region_exit_state_id_is_reported() {
+        let mut m = build_gamma_module();
+        let graph = m.graphs[0].as_mut().unwrap();
+        graph.regions[1].exit_state = State(ValueId(0xFFFF_0000));
+        let errs = m.verify();
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, RVSDGVerificationError::InvalidValueId(_))),
+            "expected an invalid-id error, got: {errs:?}"
+        );
+    }
+
+    /// Same range validation for a dangling entry-state id.
+    #[test]
+    fn dangling_region_entry_state_id_is_reported() {
+        let mut m = build_gamma_module();
+        let graph = m.graphs[0].as_mut().unwrap();
+        graph.regions[2].entry_state = State(ValueId(0xFFFF_0000));
+        let errs = m.verify();
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, RVSDGVerificationError::InvalidValueId(_))),
+            "expected an invalid-id error, got: {errs:?}"
+        );
+    }
+
+    /// A region whose seal never happened is a verification error, not
+    /// an out-of-bounds panic inside a downstream pass.
+    #[test]
+    fn unsealed_region_is_reported() {
+        let mut m = build_gamma_module();
+        let graph = m.graphs[0].as_mut().unwrap();
+        graph.regions[1].interface_start = crate::rvsdg::Region::UNSEALED;
+        let errs = m.verify();
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, RVSDGVerificationError::RegionUnsealed(_))),
+            "expected an unsealed-region error, got: {errs:?}"
+        );
     }
 }

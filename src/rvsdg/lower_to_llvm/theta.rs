@@ -50,15 +50,14 @@ impl<'m, 'a, 'ctx> FunctionLowerer<'m, 'a, 'ctx> {
         }
 
         // Bind region params to phi outputs (not initial values)
-        let region = graph.get_region(region_id);
         for (j, phi) in phis.iter().enumerate() {
-            let param_id = region.params[j];
+            let param_id = graph.region_params(region_id)[j];
             self.set_val(param_id, phi.as_basic_value());
         }
 
         // Lower region, get results
-        self.lower_region(region)?;
-        let result_ids = graph.value_pool.get(region.results);
+        self.lower_region(region_id)?;
+        let result_ids = graph.region_results(region_id);
         let mut results: Vec<BasicValueEnum> = Vec::with_capacity(result_ids.len());
         for &rid in result_ids {
             if let Some(value) = self.lowered_result(rid)? {

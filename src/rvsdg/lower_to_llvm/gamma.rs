@@ -78,20 +78,18 @@ impl<'m, 'a, 'ctx> FunctionLowerer<'m, 'a, 'ctx> {
             let bb = region_bbs[i];
             self.builder.position_at_end(bb);
 
-            let region = graph.get_region(region_id);
-
             // Bind gamma inputs to this region's params
-            for (j, &param_id) in region.params.iter().enumerate() {
+            for (j, &param_id) in graph.region_params(region_id).iter().enumerate() {
                 if j < input_ids.len() {
                     let input_val = self.expect_value(input_ids[j])?;
                     self.set_val(param_id, input_val);
                 }
             }
 
-            self.lower_region(region)?;
+            self.lower_region(region_id)?;
 
             // Collect result values from the region
-            let result_ids = graph.value_pool.get(region.results);
+            let result_ids = graph.region_results(region_id);
             let mut results: Vec<BasicValueEnum<'ctx>> = Vec::with_capacity(result_ids.len());
             for &rid in result_ids {
                 if let Some(value) = self.lowered_result(rid)? {

@@ -201,10 +201,10 @@ fn fmt_region_body(
         write!(f, "state_in {}\n", region.entry_state)?;
     }
 
-    if print_args && !region.params.is_empty() {
+    if print_args && !graph.region_params(region_id).is_empty() {
         pad(f, indent)?;
         f.write_str("args [ ")?;
-        for (i, &param_id) in region.params.iter().enumerate() {
+        for (i, &param_id) in graph.region_params(region_id).iter().enumerate() {
             if i != 0 {
                 f.write_str(", ")?;
             }
@@ -215,14 +215,13 @@ fn fmt_region_body(
         f.write_str(" ]\n")?;
     }
 
-    for &node_id in &region.nodes {
+    for &node_id in graph.region_nodes(region_id) {
         // Structural scaffolding never prints as a body line: the lambda owns
         // this region, region params are shown in `args`, projects are folded
         // into `%vNODE#K` references, and the region result is the terminator.
         if matches!(
             graph.get_value_kind(node_id),
-            |ValueKind::Project { .. }| ValueKind::RegionParam { .. }
-                | ValueKind::RegionResult { .. }
+            ValueKind::Project { .. } | ValueKind::RegionParam { .. }
         ) {
             continue;
         }
@@ -241,7 +240,7 @@ fn fmt_region_body(
 
     pad(f, indent)?;
     write!(f, "{} [ ", terminator.keyword())?;
-    for (i, &result) in graph.value_pool.get(region.results).iter().enumerate() {
+    for (i, &result) in graph.region_results(region_id).iter().enumerate() {
         if i != 0 {
             f.write_str(", ")?;
         }
@@ -351,8 +350,7 @@ fn fmt_node(
             }
 
             // All arms share output arity/types; take them from the first arm.
-            let outputs = graph.get_region(region_ids[0]).results;
-            fmt_struct_outputs(f, m, graph, node_id, outputs, indent)
+            fmt_struct_outputs(f, m, graph, node_id, region_ids[0], indent)
         }
         ValueKind::Theta {
             loop_vars,
@@ -379,8 +377,7 @@ fn fmt_node(
                 Terminator::Yield,
             )?;
 
-            let outputs = graph.get_region(*region_id).results;
-            fmt_struct_outputs(f, m, graph, node_id, outputs, indent)
+            fmt_struct_outputs(f, m, graph, node_id, *region_id, indent)
         }
         // Remaining kinds are not yet given a bespoke rendering. Fall back to a
         // debug print so the dump degrades gracefully instead of panicking on
@@ -397,12 +394,12 @@ fn fmt_struct_outputs(
     m: &RVSDGMod,
     graph: &FunctionGraph,
     node_id: ValueId,
-    result_values: crate::rvsdg::ValuesSpan,
+    result_region: RegionId,
     indent: usize,
 ) -> std::fmt::Result {
     pad(f, indent)?;
     f.write_str("} -> ( ")?;
-    for (i, &result) in graph.value_pool.get(result_values).iter().enumerate() {
+    for (i, &result) in graph.region_results(result_region).iter().enumerate() {
         if i != 0 {
             f.write_str(", ")?;
         }

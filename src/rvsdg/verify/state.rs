@@ -23,11 +23,6 @@
 //! Every region also carries an `exit_state` closing its chain (checked
 //! here against the same rule), so edge-following passes reach subregion
 //! state ops without positional scans.
-//!
-//! One structural limit: a function's `RegionResult` value records the
-//! function's final state, but RegionResult values are not members of any
-//! region's node list, so their owning region is unrepresented. Their
-//! state operand gets the weaker, region-less check at the bottom.
 
 use crate::rvsdg::{
     RegionId, State, ValueId, ValueKind, function_graph::FunctionGraph,
@@ -83,7 +78,7 @@ impl FunctionGraph {
                 }
             }
 
-            for (position, &user) in region.nodes.iter().enumerate() {
+            for (position, &user) in self.region_nodes(RegionId(user_region)).iter().enumerate() {
                 // Exhaustive over ValueKind: every variant either names its
                 // state operand or is listed as pure, so adding a variant
                 // forces a decision here.
@@ -101,10 +96,6 @@ impl FunctionGraph {
                     | ValueKind::CallIndirect { state, .. }
                     | ValueKind::Gamma { state, .. }
                     | ValueKind::Theta { state, .. } => *state,
-                    // RegionResult is never a region node today (see the
-                    // module docs); if one ever is, its state gets the
-                    // region-less check below rather than silence.
-                    ValueKind::RegionResult { .. } => continue,
                     // Pure values: no state operand.
                     ValueKind::Const(_)
                     | ValueKind::ConstPoolRef(_)
@@ -153,24 +144,6 @@ impl FunctionGraph {
                         operand: state.0,
                         region: RegionId(user_region),
                     }),
-                }
-            }
-        }
-
-        // RegionResult values (function final states) have no owning-region
-        // link, so the strongest sound check is region-less: the final
-        // state must be SOME region's entry state or a state-producing
-        // node. Wrong-region chains through a valid state node pass here;
-        // garbage (a Binary, a dangling id) does not.
-        for (index, value) in self.value_kinds.iter().enumerate() {
-            if let ValueKind::RegionResult { state, .. } = value {
-                let valid =
-                    self.regions.iter().any(|r| r.entry_state == *state) || produces_state(state.0);
-                if !valid {
-                    errs.push(RVSDGVerificationError::StateEdgeFromNonStateNode {
-                        user: ValueId(index as u32),
-                        operand: state.0,
-                    });
                 }
             }
         }
@@ -289,7 +262,7 @@ mod tests {
         let arm = graph
             .regions
             .iter()
-            .position(|region| region.params.is_empty() && region.nodes.is_empty())
+            .position(|region| region.params_len == 0 && region.nodes_len == 0)
             .expect("gamma arm region exists");
         graph.regions[arm].exit_state = first_fence.get().unwrap();
 

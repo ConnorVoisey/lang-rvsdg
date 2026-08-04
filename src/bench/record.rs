@@ -33,7 +33,12 @@ use crate::stats::EmittedIrStats;
 ///
 /// v4: `ConfigRecord` gained `cachegrind_total_accesses` (Ir + Dr + Dw),
 /// the denominator that turns the raw LL miss count into a miss rate.
-pub const SCHEMA_VERSION: u32 = 4;
+///
+/// v5: `MetricSamples` gained `allocations` and `alloc_bytes` -- Rust-heap
+/// allocation events and cumulative bytes handed out, from the counting
+/// allocator, per phase. Populated only for our in-process phases in a
+/// `--wall` run; `None` everywhere else (older runs simply lack them).
+pub const SCHEMA_VERSION: u32 = 5;
 
 #[derive(Debug, Serialize)]
 pub struct RunRecord {
@@ -162,6 +167,13 @@ pub struct MetricSamples {
     pub instructions: Option<Vec<u64>>,
     pub cache_misses: Option<Vec<u64>>,
     pub cache_references: Option<Vec<u64>>,
+    /// Rust-heap allocator calls during the phase. Near-deterministic
+    /// for a given compile, so treat like an instruction count, not a
+    /// timing.
+    pub allocations: Option<Vec<u64>>,
+    /// Bytes handed out during the phase (cumulative churn; a realloc
+    /// counts its full new size).
+    pub alloc_bytes: Option<Vec<u64>>,
 }
 
 impl RunMeta {
