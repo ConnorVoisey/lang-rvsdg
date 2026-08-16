@@ -92,7 +92,6 @@ impl<'m, 'a, 'ctx> FunctionLowerer<'m, 'a, 'ctx> {
 mod tests {
     use crate::rvsdg::{
         ArithFlags, BinaryOp, Linkage, RVSDGMod,
-        func::FnResult,
         lower_to_llvm::test_utils::test_utils::{jit_run_f32, jit_run_i32},
         types::{F32, I32},
         value::ConstValue,
@@ -102,14 +101,11 @@ mod tests {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg
-            .define_fn(func_id, |rb, state| {
+            .define_fn(func_id, |rb| {
                 let a = rb.const_i32(lhs);
                 let b = rb.const_i32(rhs);
                 let result = rb.binary(op, flags, a, b, I32);
-                Ok(FnResult {
-                    state,
-                    values: vec![result],
-                })
+                Ok(vec![result])
             })
             .unwrap();
         jit_run_i32(&rvsdg, "test")
@@ -119,14 +115,11 @@ mod tests {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[F32], Linkage::External);
         rvsdg
-            .define_fn(func_id, |rb, state| {
+            .define_fn(func_id, |rb| {
                 let a = rb.constant(F32, ConstValue::f32_from_native(lhs));
                 let b = rb.constant(F32, ConstValue::f32_from_native(rhs));
                 let result = rb.binary(op, ArithFlags::default(), a, b, F32);
-                Ok(FnResult {
-                    state,
-                    values: vec![result],
-                })
+                Ok(vec![result])
             })
             .unwrap();
         jit_run_f32(&rvsdg, "test")

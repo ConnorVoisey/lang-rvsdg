@@ -305,6 +305,7 @@ pub struct ModuleSummaryRow {
 pub fn kind_name(kind: &ValueKind) -> &'static str {
     match kind {
         ValueKind::Const(_) => "Const",
+        ValueKind::StateMerge { .. } => "StateMerge",
         ValueKind::ConstPoolRef(_) => "ConstPoolRef",
         ValueKind::GlobalRef(_) => "GlobalRef",
         ValueKind::FuncAddr(_) => "FuncAddr",
@@ -1054,7 +1055,8 @@ pub fn collect(m: &RVSDGMod) -> ModuleCensus {
         budget.values_bytes += graph.value_kinds.len() * size_of::<ValueKind>()
             + graph.value_types.len() * size_of::<TypeRef>();
         budget.value_pool_bytes += graph.value_pool.len() * size_of::<ValueId>();
-        budget.region_structs_bytes += graph.regions.len() * size_of::<crate::rvsdg::Region>();
+        budget.region_structs_bytes +=
+            graph.regions.len() * size_of::<crate::rvsdg::region::Region>();
         // Region interface and node blocks live in the value pool, so
         // their bytes are counted in value_pool_bytes; this field breaks
         // out the block subtotal (a SUBSET, never added to a total).
@@ -1091,8 +1093,8 @@ pub fn collect(m: &RVSDGMod) -> ModuleCensus {
             }
         }
         for region in &graph.regions {
-            spans.region_params += region.params_len as usize;
-            spans.region_results += region.results_len as usize;
+            spans.region_params += region.params_len as usize + region.state_params_len as usize;
+            spans.region_results += region.results_len as usize + region.state_results_len as usize;
             spans.region_nodes += region.nodes_len as usize;
         }
 
@@ -1108,11 +1110,12 @@ pub fn collect(m: &RVSDGMod) -> ModuleCensus {
         };
         for region_index in 0..graph.regions.len() {
             let region_id = RegionId(region_index as u32);
-            mark(
-                &mut live,
-                &mut worklist,
-                graph.regions[region_index].entry_state.0,
-            );
+            for &state_param in graph.region_state_params(region_id) {
+                mark(&mut live, &mut worklist, state_param);
+            }
+            for &state_result in graph.region_state_results(region_id) {
+                mark(&mut live, &mut worklist, state_result);
+            }
             for &param in graph.region_params(region_id) {
                 mark(&mut live, &mut worklist, param);
             }
@@ -1401,7 +1404,6 @@ mod tests {
     use crate::rvsdg::{
         ArithFlags, BinaryOp, ICmpPred, Linkage, RVSDGMod,
         builder::LoopResult,
-        func::FnResult,
         types::{I32, PtrType, TypeRef},
     };
 
@@ -1422,34 +1424,29 @@ mod tests {
         let ptr = ptr_ty(&mut rvsdg);
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg
-            .define_fn(func_id, |rb, state| {
+            .define_fn(func_id, |rb| {
                 let one = rb.const_i32(1);
-                let alloc = rb.alloca(state, I32, one, ptr, None);
+                let alloc = rb.alloca(I32, one, ptr, None);
                 let zero = rb.const_i32(0);
-                let s1 = rb.store(alloc.state, alloc.ptr, zero, None, false);
+                rb.store(alloc, zero, None, false);
                 let i = rb.const_i32(0);
-                let res = rb.theta(s1, &[i], |rb| {
+                rb.theta(&[i], |rb| {
                     let loop_i = rb.param(0);
-                    let cur = rb.load(s1, alloc.ptr, I32, None, false);
+                    let cur = rb.load(alloc, I32, None, false);
                     let ten = rb.const_i32(10);
-                    let next_val =
-                        rb.binary(BinaryOp::Add, ArithFlags::default(), cur.value, ten, I32);
-                    let s2 = rb.store(cur.state, alloc.ptr, next_val, None, false);
+                    let next_val = rb.binary(BinaryOp::Add, ArithFlags::default(), cur, ten, I32);
+                    rb.store(alloc, next_val, None, false);
                     let one = rb.const_i32(1);
                     let next_i = rb.binary(BinaryOp::Add, ArithFlags::default(), loop_i, one, I32);
                     let five = rb.const_i32(5);
                     let cond = rb.icmp(ICmpPred::SignedLt, next_i, five);
                     Ok(LoopResult {
                         condition: cond,
-                        next_state: s2,
                         next_vars: vec![next_i],
                     })
                 })?;
-                let final_val = rb.load(res.state, alloc.ptr, I32, None, false);
-                Ok(FnResult {
-                    state: final_val.state,
-                    values: vec![final_val.value],
-                })
+                let final_val = rb.load(alloc, I32, None, false);
+                Ok(vec![final_val])
             })
             .unwrap();
 
@@ -1485,27 +1482,23 @@ mod tests {
         let ptr = ptr_ty(&mut rvsdg);
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg
-            .define_fn(func_id, |rb, state| {
+            .define_fn(func_id, |rb| {
                 let i = rb.const_i32(0);
-                let res = rb.theta(state, &[i], |rb| {
+                rb.theta(&[i], |rb| {
                     let loop_i = rb.param(0);
                     let one = rb.const_i32(1);
-                    let alloc = rb.alloca(state, I32, one, ptr, None);
-                    let s2 = rb.store(alloc.state, alloc.ptr, loop_i, None, false);
+                    let alloc = rb.alloca(I32, one, ptr, None);
+                    rb.store(alloc, loop_i, None, false);
                     let next_i = rb.binary(BinaryOp::Add, ArithFlags::default(), loop_i, one, I32);
                     let five = rb.const_i32(5);
                     let cond = rb.icmp(ICmpPred::SignedLt, next_i, five);
                     Ok(LoopResult {
                         condition: cond,
-                        next_state: s2,
                         next_vars: vec![next_i],
                     })
                 })?;
                 let zero = rb.const_i32(0);
-                Ok(FnResult {
-                    state: res.state,
-                    values: vec![zero],
-                })
+                Ok(vec![zero])
             })
             .unwrap();
 

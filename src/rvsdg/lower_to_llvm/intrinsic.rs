@@ -276,7 +276,6 @@ impl<'m, 'a, 'ctx> FunctionLowerer<'m, 'a, 'ctx> {
 mod tests {
     use crate::rvsdg::{
         IntrinsicOp, Linkage, RVSDGMod,
-        func::FnResult,
         lower_to_llvm::test_utils::test_utils::{jit_run_f32, jit_run_i32},
         types::{F32, I32},
         value::ConstValue,
@@ -289,13 +288,10 @@ mod tests {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg
-            .define_fn(func_id, |rb, state| {
+            .define_fn(func_id, |rb| {
                 let v = rb.const_i32(42);
-                let res = rb.intrinsic(IntrinsicOp::IntAbs, state, &[v], I32);
-                Ok(FnResult {
-                    state: res.state,
-                    values: vec![res.value],
-                })
+                let res = rb.intrinsic(IntrinsicOp::IntAbs, &[v], I32);
+                Ok(vec![res])
             })
             .unwrap();
         assert_eq!(jit_run_i32(&rvsdg, "test"), 42);
@@ -306,13 +302,10 @@ mod tests {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg
-            .define_fn(func_id, |rb, state| {
+            .define_fn(func_id, |rb| {
                 let v = rb.const_i32(-42);
-                let res = rb.intrinsic(IntrinsicOp::IntAbs, state, &[v], I32);
-                Ok(FnResult {
-                    state: res.state,
-                    values: vec![res.value],
-                })
+                let res = rb.intrinsic(IntrinsicOp::IntAbs, &[v], I32);
+                Ok(vec![res])
             })
             .unwrap();
         assert_eq!(jit_run_i32(&rvsdg, "test"), 42);
@@ -325,14 +318,11 @@ mod tests {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg
-            .define_fn(func_id, |rb, state| {
+            .define_fn(func_id, |rb| {
                 let a = rb.const_i32(10);
                 let b = rb.const_i32(-5);
-                let res = rb.intrinsic(IntrinsicOp::SignedMin, state, &[a, b], I32);
-                Ok(FnResult {
-                    state: res.state,
-                    values: vec![res.value],
-                })
+                let res = rb.intrinsic(IntrinsicOp::SignedMin, &[a, b], I32);
+                Ok(vec![res])
             })
             .unwrap();
         assert_eq!(jit_run_i32(&rvsdg, "test"), -5);
@@ -343,14 +333,11 @@ mod tests {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg
-            .define_fn(func_id, |rb, state| {
+            .define_fn(func_id, |rb| {
                 let a = rb.const_i32(10);
                 let b = rb.const_i32(-5);
-                let res = rb.intrinsic(IntrinsicOp::SignedMax, state, &[a, b], I32);
-                Ok(FnResult {
-                    state: res.state,
-                    values: vec![res.value],
-                })
+                let res = rb.intrinsic(IntrinsicOp::SignedMax, &[a, b], I32);
+                Ok(vec![res])
             })
             .unwrap();
         assert_eq!(jit_run_i32(&rvsdg, "test"), 10);
@@ -361,14 +348,11 @@ mod tests {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg
-            .define_fn(func_id, |rb, state| {
+            .define_fn(func_id, |rb| {
                 let a = rb.const_i32(3);
                 let b = rb.const_i32(7);
-                let res = rb.intrinsic(IntrinsicOp::UnsignedMin, state, &[a, b], I32);
-                Ok(FnResult {
-                    state: res.state,
-                    values: vec![res.value],
-                })
+                let res = rb.intrinsic(IntrinsicOp::UnsignedMin, &[a, b], I32);
+                Ok(vec![res])
             })
             .unwrap();
         assert_eq!(jit_run_i32(&rvsdg, "test"), 3);
@@ -379,14 +363,11 @@ mod tests {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg
-            .define_fn(func_id, |rb, state| {
+            .define_fn(func_id, |rb| {
                 let a = rb.const_i32(3);
                 let b = rb.const_i32(7);
-                let res = rb.intrinsic(IntrinsicOp::UnsignedMax, state, &[a, b], I32);
-                Ok(FnResult {
-                    state: res.state,
-                    values: vec![res.value],
-                })
+                let res = rb.intrinsic(IntrinsicOp::UnsignedMax, &[a, b], I32);
+                Ok(vec![res])
             })
             .unwrap();
         assert_eq!(jit_run_i32(&rvsdg, "test"), 7);
@@ -399,14 +380,11 @@ mod tests {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg
-            .define_fn(func_id, |rb, state| {
+            .define_fn(func_id, |rb| {
                 let a = rb.const_i32(100);
                 let b = rb.const_i32(200);
-                let res = rb.intrinsic(IntrinsicOp::SignedAddSaturate, state, &[a, b], I32);
-                Ok(FnResult {
-                    state: res.state,
-                    values: vec![res.value],
-                })
+                let res = rb.intrinsic(IntrinsicOp::SignedAddSaturate, &[a, b], I32);
+                Ok(vec![res])
             })
             .unwrap();
         assert_eq!(jit_run_i32(&rvsdg, "test"), 300);
@@ -418,14 +396,11 @@ mod tests {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg
-            .define_fn(func_id, |rb, state| {
+            .define_fn(func_id, |rb| {
                 let a = rb.const_i32(i32::MAX);
                 let b = rb.const_i32(1);
-                let res = rb.intrinsic(IntrinsicOp::SignedAddSaturate, state, &[a, b], I32);
-                Ok(FnResult {
-                    state: res.state,
-                    values: vec![res.value],
-                })
+                let res = rb.intrinsic(IntrinsicOp::SignedAddSaturate, &[a, b], I32);
+                Ok(vec![res])
             })
             .unwrap();
         assert_eq!(jit_run_i32(&rvsdg, "test"), i32::MAX);
@@ -437,14 +412,11 @@ mod tests {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg
-            .define_fn(func_id, |rb, state| {
+            .define_fn(func_id, |rb| {
                 let a = rb.const_i32(3);
                 let b = rb.const_i32(10);
-                let res = rb.intrinsic(IntrinsicOp::UnsignedSubSaturate, state, &[a, b], I32);
-                Ok(FnResult {
-                    state: res.state,
-                    values: vec![res.value],
-                })
+                let res = rb.intrinsic(IntrinsicOp::UnsignedSubSaturate, &[a, b], I32);
+                Ok(vec![res])
             })
             .unwrap();
         assert_eq!(jit_run_i32(&rvsdg, "test"), 0);
@@ -457,14 +429,11 @@ mod tests {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[F32], Linkage::External);
         rvsdg
-            .define_fn(func_id, |rb, state| {
+            .define_fn(func_id, |rb| {
                 let a = rb.constant(F32, ConstValue::f32_from_native(3.5));
                 let b = rb.constant(F32, ConstValue::f32_from_native(1.5));
-                let res = rb.intrinsic(IntrinsicOp::FloatMin, state, &[a, b], F32);
-                Ok(FnResult {
-                    state: res.state,
-                    values: vec![res.value],
-                })
+                let res = rb.intrinsic(IntrinsicOp::FloatMin, &[a, b], F32);
+                Ok(vec![res])
             })
             .unwrap();
         assert_eq!(jit_run_f32(&rvsdg, "test"), 1.5);
@@ -475,14 +444,11 @@ mod tests {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[F32], Linkage::External);
         rvsdg
-            .define_fn(func_id, |rb, state| {
+            .define_fn(func_id, |rb| {
                 let a = rb.constant(F32, ConstValue::f32_from_native(3.5));
                 let b = rb.constant(F32, ConstValue::f32_from_native(1.5));
-                let res = rb.intrinsic(IntrinsicOp::FloatMax, state, &[a, b], F32);
-                Ok(FnResult {
-                    state: res.state,
-                    values: vec![res.value],
-                })
+                let res = rb.intrinsic(IntrinsicOp::FloatMax, &[a, b], F32);
+                Ok(vec![res])
             })
             .unwrap();
         assert_eq!(jit_run_f32(&rvsdg, "test"), 3.5);
@@ -494,15 +460,12 @@ mod tests {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[F32], Linkage::External);
         rvsdg
-            .define_fn(func_id, |rb, state| {
+            .define_fn(func_id, |rb| {
                 let a = rb.constant(F32, ConstValue::f32_from_native(2.0));
                 let b = rb.constant(F32, ConstValue::f32_from_native(3.0));
                 let c = rb.constant(F32, ConstValue::f32_from_native(4.0));
-                let res = rb.intrinsic(IntrinsicOp::FloatFma, state, &[a, b, c], F32);
-                Ok(FnResult {
-                    state: res.state,
-                    values: vec![res.value],
-                })
+                let res = rb.intrinsic(IntrinsicOp::FloatFma, &[a, b, c], F32);
+                Ok(vec![res])
             })
             .unwrap();
         assert_eq!(jit_run_f32(&rvsdg, "test"), 10.0);
@@ -514,14 +477,11 @@ mod tests {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[F32], Linkage::External);
         rvsdg
-            .define_fn(func_id, |rb, state| {
+            .define_fn(func_id, |rb| {
                 let mag = rb.constant(F32, ConstValue::f32_from_native(5.0));
                 let sign = rb.constant(F32, ConstValue::f32_from_native(-1.0));
-                let res = rb.intrinsic(IntrinsicOp::FloatCopySign, state, &[mag, sign], F32);
-                Ok(FnResult {
-                    state: res.state,
-                    values: vec![res.value],
-                })
+                let res = rb.intrinsic(IntrinsicOp::FloatCopySign, &[mag, sign], F32);
+                Ok(vec![res])
             })
             .unwrap();
         assert_eq!(jit_run_f32(&rvsdg, "test"), -5.0);
@@ -535,15 +495,11 @@ mod tests {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg
-            .define_fn(func_id, |rb, state| {
+            .define_fn(func_id, |rb| {
                 let a = rb.const_i32(100);
                 let b = rb.const_i32(200);
-                let res =
-                    rb.intrinsic_overflow(IntrinsicOp::SignedAddOverflow, state, &[a, b], I32);
-                Ok(FnResult {
-                    state: res.state,
-                    values: vec![res.value],
-                })
+                let res = rb.intrinsic_overflow(IntrinsicOp::SignedAddOverflow, &[a, b], I32);
+                Ok(vec![res.value])
             })
             .unwrap();
         assert_eq!(jit_run_i32(&rvsdg, "test"), 300);
@@ -555,17 +511,13 @@ mod tests {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg
-            .define_fn(func_id, |rb, state| {
+            .define_fn(func_id, |rb| {
                 let a = rb.const_i32(i32::MAX);
                 let b = rb.const_i32(1);
-                let res =
-                    rb.intrinsic_overflow(IntrinsicOp::SignedAddOverflow, state, &[a, b], I32);
+                let res = rb.intrinsic_overflow(IntrinsicOp::SignedAddOverflow, &[a, b], I32);
                 // overflow flag is i1, zero-extend to i32 to return it
                 let flag = rb.cast(crate::rvsdg::CastOp::ZeroExtend, res.overflow, I32);
-                Ok(FnResult {
-                    state: res.state,
-                    values: vec![flag],
-                })
+                Ok(vec![flag])
             })
             .unwrap();
         assert_eq!(jit_run_i32(&rvsdg, "test"), 1);
@@ -577,16 +529,12 @@ mod tests {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg
-            .define_fn(func_id, |rb, state| {
+            .define_fn(func_id, |rb| {
                 let a = rb.const_i32(1);
                 let b = rb.const_i32(2);
-                let res =
-                    rb.intrinsic_overflow(IntrinsicOp::SignedAddOverflow, state, &[a, b], I32);
+                let res = rb.intrinsic_overflow(IntrinsicOp::SignedAddOverflow, &[a, b], I32);
                 let flag = rb.cast(crate::rvsdg::CastOp::ZeroExtend, res.overflow, I32);
-                Ok(FnResult {
-                    state: res.state,
-                    values: vec![flag],
-                })
+                Ok(vec![flag])
             })
             .unwrap();
         assert_eq!(jit_run_i32(&rvsdg, "test"), 0);
@@ -598,16 +546,12 @@ mod tests {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg
-            .define_fn(func_id, |rb, state| {
+            .define_fn(func_id, |rb| {
                 let a = rb.const_i32(0x40000000);
                 let b = rb.const_i32(4);
-                let res =
-                    rb.intrinsic_overflow(IntrinsicOp::UnsignedMulOverflow, state, &[a, b], I32);
+                let res = rb.intrinsic_overflow(IntrinsicOp::UnsignedMulOverflow, &[a, b], I32);
                 let flag = rb.cast(crate::rvsdg::CastOp::ZeroExtend, res.overflow, I32);
-                Ok(FnResult {
-                    state: res.state,
-                    values: vec![flag],
-                })
+                Ok(vec![flag])
             })
             .unwrap();
         // 0x40000000 * 4 = 0x100000000 which overflows u32

@@ -193,6 +193,11 @@ impl FunctionGraph {
                             visit(errs, arg);
                         }
                     }
+                    ValueKind::StateMerge { inputs } => {
+                        for &input in self.value_pool.get(*inputs) {
+                            visit(errs, input);
+                        }
+                    }
                     ValueKind::CallIndirect { callee, args, .. } => {
                         visit(errs, *callee);
                         for &arg in self.value_pool.get(*args) {
@@ -265,8 +270,6 @@ impl FunctionGraph {
 mod tests {
     use crate::rvsdg::{
         ConstValue, Linkage, RVSDGMod,
-        builder::BranchResult,
-        func::FnResult,
         types::{BOOL, I32},
         verify::RVSDGVerificationError,
     };
@@ -279,7 +282,7 @@ mod tests {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
         let main_fn = rvsdg.declare_fn(String::from("main"), &[], &[I32], Linkage::Internal);
         rvsdg
-            .define_fn(main_fn, |rb, state| {
+            .define_fn(main_fn, |rb| {
                 let outer = rb.const_i32(7);
                 let outer_sum = rb.binary(
                     crate::rvsdg::BinaryOp::Add,
@@ -292,27 +295,17 @@ mod tests {
                 let predicate = rb.bool_predicate(flag);
                 let res = rb.gamma(
                     predicate,
-                    state,
                     &[],
                     |_rb| {
                         // Violation: uses the enclosing region's node.
-                        Ok(BranchResult {
-                            state,
-                            values: vec![outer_sum],
-                        })
+                        Ok(vec![outer_sum])
                     },
                     |rb| {
                         let zero = rb.const_i32(0);
-                        Ok(BranchResult {
-                            state,
-                            values: vec![zero],
-                        })
+                        Ok(vec![zero])
                     },
                 )?;
-                Ok(FnResult {
-                    state: res.state,
-                    values: vec![res.result(0)],
-                })
+                Ok(vec![res.result(0)])
             })
             .unwrap();
 

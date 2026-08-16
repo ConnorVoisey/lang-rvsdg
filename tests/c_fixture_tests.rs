@@ -236,8 +236,8 @@ fn test_17_break_before_body() {
 }
 
 // ---------------------------------------------------------------------------
-// Remaining construction gaps (see gap.md). Each fixture below fails today;
-// uncomment as the corresponding stage lands.
+// The harder restructuring shapes, tagged with the Bahmann/Reissmann 2015
+// section whose rule handles them (4.1 loops, 4.2 branches).
 // ---------------------------------------------------------------------------
 
 // §4.2: switch fall-through (shared continuation tail). Handled via

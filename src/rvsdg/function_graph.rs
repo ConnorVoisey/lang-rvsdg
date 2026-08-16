@@ -1,36 +1,19 @@
 use rustc_hash::FxHashMap;
-use smallvec::SmallVec;
 
 use crate::rvsdg::{
-    ConstId, ConstValue, FuncId, GlobalId, MatchArmPool, Region, RegionId, RegionPool, State,
-    U32Pool, Value, ValueId, ValueKind, ValuePool, types::TypeRef,
+    ConstId, ConstValue, FuncId, GlobalId, MatchArmPool, RegionId, RegionPool, StateKind, U32Pool,
+    Value, ValueId, ValueKind, ValuePool,
+    region::{Region, RegionBuilding},
+    state::StateGroup,
+    types::TypeRef,
 };
 
-/// Growing lists of one OPEN region (created but not yet sealed).
-/// Region lifetimes nest, but a parent's parameter list keeps growing
-/// while children are open (capture-on-demand appends parameters to
-/// every region between a binding and its use), so each open region
-/// owns its own buffers; the free list recycles them so steady-state
-/// construction allocates nothing per region.
-/// Both lists are SmallVecs deliberately: the inline slots mean a fresh
-/// scratch never allocates for the common shallow region (measured: a
-/// plain Vec for params costs about 22k extra allocations on a sqlite
-/// compile), while heavy regions grow past them either way.
-#[derive(Debug, Default)]
-struct RegionScratch {
-    params: SmallVec<[ValueId; 8]>,
-    nodes: SmallVec<[ValueId; 8]>,
-}
-
-/// Construction-time scratch for open regions, indexed by RegionId.
-/// Freed when construction attaches the finished graph: sealed blocks
-/// are write-once, so a pass that changes a region's interface writes
-/// replacement blocks at the pool tail and restamps the handles rather
-/// than reopening scratch.
-#[derive(Debug, Default)]
-pub(crate) struct RegionBuilding {
-    open: Vec<Option<RegionScratch>>,
-    free: Vec<RegionScratch>,
+/// A construct's per-chain state projections; either may be absent once
+/// a bypassed chain's projection has been removed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConstructStateProjections {
+    pub memory: Option<ValueId>,
+    pub io: Option<ValueId>,
 }
 
 #[derive(Debug)]
@@ -53,7 +36,7 @@ pub struct FunctionGraph {
     interned_values: FxHashMap<Value, ValueId>,
     /// Open-region scratch; empty between construction and pass
     /// mutations.
-    building: RegionBuilding,
+    pub(crate) building: RegionBuilding,
 }
 
 impl FunctionGraph {
@@ -83,27 +66,32 @@ impl FunctionGraph {
     // pool segments for sealed ones, so callers never care which phase
     // they are in.
 
-    /// Create a new open region. Its owner and exit state are stamped by
-    /// the construct's finaliser; its lists accumulate in scratch until
-    /// [`FunctionGraph::seal_region`].
-    pub fn create_region(&mut self, entry_state: State) -> RegionId {
+    /// Create a new open region. Its owner is stamped by the construct's
+    /// finaliser; its lists accumulate in scratch until
+    /// [`FunctionGraph::seal_region`]. `entry` seeds both chains (see
+    /// [`FunctionGraph::entry_seeds`] for subregions).
+    pub fn create_region(&mut self, entry: StateGroup) -> RegionId {
         let region = RegionId(self.regions.len() as u32);
-        self.regions.push(Region::new_open(entry_state));
+        self.regions.push(Region::new_open());
         let index = region.0 as usize;
         if self.building.open.len() <= index {
             self.building.open.resize_with(index + 1, || None);
         }
         debug_assert!(self.building.open[index].is_none());
         self.building.open[index] = Some(self.building.free.pop().unwrap_or_default());
+        self.set_scratch_entry_state(region, entry);
         region
     }
 
     /// Write the region's interface block (params from scratch, the
-    /// given final results) and nodes block into the value pool, stamp
-    /// the exit state, and release the scratch. Callable exactly once
-    /// per open region; every finaliser obligation lands in this one
-    /// call, so a sealed region is always fully stamped.
-    pub fn seal_region(&mut self, region: RegionId, results: &[ValueId], exit_state: State) {
+    /// given final value results) and nodes block into the value pool,
+    /// and release the scratch. Callable exactly once per open region.
+    pub fn seal_region(&mut self, region: RegionId, results: &[ValueId]) {
+        // Trailing reads (pending after the last write) fold into the
+        // memory exit: a parent-side write after this construct is
+        // ordered behind them through the exported merge. Tail order is
+        // [memory, io] on both the params and results side.
+        let exit_memory = self.state_read_flatten(region);
         let mut scratch = self.building.open[region.0 as usize]
             .take()
             .unwrap_or_else(|| {
@@ -112,17 +100,53 @@ impl FunctionGraph {
                     self.func_id
                 )
             });
+        let entry = scratch.entry_state;
+        let exit_io = scratch.exit_state.io;
         let r = &mut self.regions[region.0 as usize];
         r.write_blocks(
             &mut self.value_pool,
             &scratch.params,
+            &[entry.memory.write.0, entry.io.0],
             results,
+            &[exit_memory.0, exit_io.0],
             &scratch.nodes,
         );
-        r.exit_state = exit_state;
         scratch.params.clear();
         scratch.nodes.clear();
         self.building.free.push(scratch);
+    }
+
+    /// Record an open region's entry state in its scratch, and start the
+    /// exit registers as a copy: a region is pure until something
+    /// threads a chain, and each chain's current is valid from birth.
+    pub(crate) fn set_scratch_entry_state(&mut self, region: RegionId, entry: StateGroup) {
+        let scratch = self.get_scratch(region);
+        scratch.entry_state = entry;
+        scratch.exit_state = entry;
+    }
+
+    /// The region's state params: the tail of the params block.
+    #[inline]
+    pub fn region_state_params(&self, region: RegionId) -> &[ValueId] {
+        let r = &self.regions[region.0 as usize];
+        assert!(
+            r.is_sealed(),
+            "state params of unsealed {region:?} in {:?} read",
+            self.func_id
+        );
+        r.state_params(&self.value_pool)
+    }
+
+    /// The region's state results: the tail of the results block.
+    #[inline]
+    pub fn region_state_results(&self, region: RegionId) -> &[ValueId] {
+        let r = &self.regions[region.0 as usize];
+        assert!(
+            r.is_sealed(),
+            "state results of unsealed {region:?} in {:?} read",
+            self.func_id
+        );
+        r.state_results(&self.value_pool)
     }
 
     /// Release the construction scratch, called once when construction
@@ -146,9 +170,7 @@ impl FunctionGraph {
     pub fn region_params(&self, region: RegionId) -> &[ValueId] {
         let r = &self.regions[region.0 as usize];
         if r.is_sealed() {
-            return self
-                .value_pool
-                .slice(r.interface_start, r.params_len as usize);
+            return r.params(&self.value_pool);
         }
         self.building.open[region.0 as usize]
             .as_ref()
@@ -167,10 +189,7 @@ impl FunctionGraph {
             "results of unsealed {region:?} in {:?} read",
             self.func_id
         );
-        self.value_pool.slice(
-            r.interface_start + r.params_len as u32,
-            r.results_len as usize,
-        )
+        r.results(&self.value_pool)
     }
 
     /// The region's nodes, in topological (emission) order. Same sealed
@@ -185,6 +204,18 @@ impl FunctionGraph {
             .as_ref()
             .map(|scratch| scratch.nodes.as_slice())
             .unwrap_or_else(|| panic!("open {region:?} in {:?} has no scratch", self.func_id))
+    }
+
+    /// Push a value and record it as a node of `region` (emission
+    /// order). The single creation path for region-owned values; the
+    /// builder and the state threading both go through it.
+    #[inline]
+    pub(crate) fn add_region_value(&mut self, region: RegionId, value: Value) -> ValueId {
+        let id = ValueId(self.value_kinds.len() as u32);
+        self.value_kinds.push(value.kind);
+        self.value_types.push(value.ty);
+        self.push_region_node(region, id);
+        id
     }
 
     /// Record a value in an open region's node list (emission order).
@@ -431,6 +462,11 @@ impl FunctionGraph {
                     f(arg);
                 }
             }
+            ValueKind::StateMerge { inputs } => {
+                for &input in self.value_pool.get(*inputs) {
+                    f(input);
+                }
+            }
             ValueKind::CallIndirect { callee, args, .. } => {
                 f(*callee);
                 for &arg in self.value_pool.get(*args) {
@@ -464,6 +500,44 @@ impl FunctionGraph {
         }
     }
 
+    /// The subregions of a construct value, empty for non-constructs.
+    pub(crate) fn construct_subregions(&self, construct: ValueId) -> &[RegionId] {
+        match self.get_value_kind(construct) {
+            ValueKind::Gamma { regions, .. } => self.region_pool.get(*regions),
+            ValueKind::Theta { region_id, .. } => std::slice::from_ref(region_id),
+            _ => &[],
+        }
+    }
+
+    /// A construct's per-chain state projections, found among its
+    /// adjacent projections by their State type. Type-keyed rather than
+    /// positional because a bypassed chain's projection is removable:
+    /// after dead node elimination a construct may keep one, both, or
+    /// neither.
+    pub(crate) fn construct_state_projections(
+        &self,
+        construct: ValueId,
+    ) -> ConstructStateProjections {
+        let mut found = ConstructStateProjections {
+            memory: None,
+            io: None,
+        };
+        let mut id = ValueId(construct.0 + 1);
+        while (id.0 as usize) < self.value_kinds.len()
+            && matches!(self.get_value_kind(id), ValueKind::Project { call, .. } if *call == construct)
+        {
+            match self.get_value_type(id) {
+                TypeRef::State(StateKind::MemoryRead(_) | StateKind::MemoryWrite(_)) => {
+                    found.memory = Some(id);
+                }
+                TypeRef::State(StateKind::InputOutput) => found.io = Some(id),
+                _ => {}
+            }
+            id = ValueId(id.0 + 1);
+        }
+        found
+    }
+
     /// The `index`th projection of a multi-output node (loads, calls,
     /// compare-and-swap, gammas, thetas, ...). Every builder allocates a
     /// node's projections immediately after the node itself; this accessor
@@ -485,9 +559,7 @@ impl FunctionGraph {
 
 #[cfg(test)]
 mod tests {
-    use crate::rvsdg::{
-        ArithFlags, BinaryOp, Linkage, RVSDGMod, RegionId, ValueKind, func::FnResult, types::I32,
-    };
+    use crate::rvsdg::{ArithFlags, BinaryOp, Linkage, RVSDGMod, RegionId, ValueKind, types::I32};
 
     /// Seal-layout round trip across the scratch SmallVec inline
     /// boundary: ten parameters and nine body nodes read back through
@@ -499,7 +571,7 @@ mod tests {
         let mut m = RVSDGMod::new_host(String::from("test"));
         let param_tys = [I32; 10];
         let f = m.declare_fn(String::from("f"), &param_tys, &[I32], Linkage::Internal);
-        m.define_fn(f, |rb, state| {
+        m.define_fn(f, |rb| {
             let params: Vec<_> = (0..10).map(|i| rb.param(i)).collect();
             let mut acc = params[0];
             for &param in &params[1..] {
@@ -512,10 +584,7 @@ mod tests {
             let nodes = rb.graph.region_nodes(RegionId(0));
             assert_eq!(nodes.len(), 9);
             assert_eq!(*nodes.last().unwrap(), acc);
-            Ok(FnResult {
-                state,
-                values: vec![acc],
-            })
+            Ok(vec![acc])
         })
         .unwrap();
 

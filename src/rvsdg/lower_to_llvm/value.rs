@@ -1,7 +1,7 @@
 use crate::rvsdg::{
     FCmpPred, ICmpPred, ValueId, ValueKind,
     lower_to_llvm::{FunctionLowerer, memory::ordering_to_llvm},
-    types::VOID,
+    types::{TypeRef, VOID},
 };
 use color_eyre::eyre::{bail, eyre};
 use inkwell::{
@@ -28,6 +28,8 @@ impl<'m, 'a, 'ctx> FunctionLowerer<'m, 'a, 'ctx> {
                 Some(self.mod_lower.lower_const_value(&const_value, value_type)?)
             }
             ValueKind::ConstPoolRef(const_id) => Some(self.mod_lower.lower_const_id(const_id)?),
+            // Ordering only; emits no instruction.
+            ValueKind::StateMerge { .. } => None,
             ValueKind::GlobalRef(global_id) => {
                 let glob = self
                     .mod_lower
@@ -377,7 +379,6 @@ impl<'m, 'a, 'ctx> FunctionLowerer<'m, 'a, 'ctx> {
             ValueKind::Theta {
                 loop_vars,
                 condition,
-                state: _,
                 region_id: region,
             } => {
                 self.begin_control(value_id)?;
@@ -388,7 +389,6 @@ impl<'m, 'a, 'ctx> FunctionLowerer<'m, 'a, 'ctx> {
             ValueKind::Gamma {
                 condition,
                 inputs,
-                state: _,
                 regions,
             } => {
                 self.begin_control(value_id)?;
@@ -398,6 +398,7 @@ impl<'m, 'a, 'ctx> FunctionLowerer<'m, 'a, 'ctx> {
             }
             ValueKind::Call {
                 state: _,
+                io_state: _,
                 fn_id,
                 sig,
                 args,
@@ -423,6 +424,7 @@ impl<'m, 'a, 'ctx> FunctionLowerer<'m, 'a, 'ctx> {
             }
             ValueKind::CallIndirect {
                 state: _,
+                io_state: _,
                 callee,
                 sig,
                 args,
@@ -467,6 +469,12 @@ impl<'m, 'a, 'ctx> FunctionLowerer<'m, 'a, 'ctx> {
                     LLVMValueKind::Instruction(_) => None,
                 }
             }
+            // A construct's state projections order chains only: no
+            // instruction, and no demand on the construct either --
+            // positional lowering already emitted it, and multi-output
+            // nodes are not memoised as single values, so touching the
+            // construct here would lower it a second time.
+            ValueKind::Project { .. } if matches!(value_type, TypeRef::State(_)) => None,
             ValueKind::Project { call, index: _ } => {
                 // Ensure the parent node has been lowered.
                 // Multi-output nodes (gamma, theta, call) write their results

@@ -341,15 +341,15 @@ impl RVSDGMod {
             .chain(std::iter::once(false))
             .collect();
         let overlay = control_flow::build_overlay(&bb_mapper, &scc_tree, diverging);
-        self.define_fn(fn_id, |rb, state| {
-            let mut scopes = SymbolScopes::new(rb.region_id());
+        self.define_fn(fn_id, |rb| {
+            let mut scopes = SymbolScopes::new(rb.region_id);
             // Register function parameters as root-frame bindings.
             for (i, param) in func.parameters.iter().enumerate() {
                 let value = rb.param(i as u32);
                 scopes.bind_name(&param.name, value);
             }
             let mut builder = RegionLowerer::new(rb, &mut scopes, &fn_ctx);
-            control_flow::emit::emit_function_body(&mut builder, &overlay, state)
+            control_flow::emit::emit_function_body(&mut builder, &overlay)
         })
     }
 }

@@ -157,7 +157,6 @@ impl<'m, 'a, 'ctx> FunctionLowerer<'m, 'a, 'ctx> {
 mod tests {
     use crate::rvsdg::{
         Linkage, RVSDGMod, UnaryOp,
-        func::FnResult,
         lower_to_llvm::test_utils::test_utils::{jit_run_f32, jit_run_i32},
         types::{F32, I32},
         value::ConstValue,
@@ -167,13 +166,10 @@ mod tests {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg
-            .define_fn(func_id, |rb, state| {
+            .define_fn(func_id, |rb| {
                 let v = rb.const_i32(input);
                 let result = rb.unary(op, v, I32);
-                Ok(FnResult {
-                    state,
-                    values: vec![result],
-                })
+                Ok(vec![result])
             })
             .unwrap();
         jit_run_i32(&rvsdg, "test")
@@ -183,13 +179,10 @@ mod tests {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[F32], Linkage::External);
         rvsdg
-            .define_fn(func_id, |rb, state| {
+            .define_fn(func_id, |rb| {
                 let v = rb.constant(F32, ConstValue::f32_from_native(input));
                 let result = rb.unary(op, v, F32);
-                Ok(FnResult {
-                    state,
-                    values: vec![result],
-                })
+                Ok(vec![result])
             })
             .unwrap();
         jit_run_f32(&rvsdg, "test")
@@ -283,14 +276,11 @@ mod tests {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg
-            .define_fn(func_id, |rb, state| {
+            .define_fn(func_id, |rb| {
                 let v = rb.const_i32(0xDEADBEEF_u32 as i32);
                 let swapped = rb.unary(UnaryOp::ByteSwap, v, I32);
                 let result = rb.unary(UnaryOp::ByteSwap, swapped, I32);
-                Ok(FnResult {
-                    state,
-                    values: vec![result],
-                })
+                Ok(vec![result])
             })
             .unwrap();
         assert_eq!(jit_run_i32(&rvsdg, "test"), 0xDEADBEEF_u32 as i32);
@@ -309,14 +299,11 @@ mod tests {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg
-            .define_fn(func_id, |rb, state| {
+            .define_fn(func_id, |rb| {
                 let v = rb.const_i32(0x12345678);
                 let rev = rb.unary(UnaryOp::BitReverse, v, I32);
                 let result = rb.unary(UnaryOp::BitReverse, rev, I32);
-                Ok(FnResult {
-                    state,
-                    values: vec![result],
-                })
+                Ok(vec![result])
             })
             .unwrap();
         assert_eq!(jit_run_i32(&rvsdg, "test"), 0x12345678);
@@ -401,14 +388,11 @@ mod tests {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[F32], Linkage::External);
         rvsdg
-            .define_fn(func_id, |rb, state| {
+            .define_fn(func_id, |rb| {
                 let v = rb.constant(F32, ConstValue::f32_from_native(42.0));
                 let neg = rb.unary(UnaryOp::FloatNeg, v, F32);
                 let result = rb.unary(UnaryOp::FloatAbs, neg, F32);
-                Ok(FnResult {
-                    state,
-                    values: vec![result],
-                })
+                Ok(vec![result])
             })
             .unwrap();
         assert_eq!(jit_run_f32(&rvsdg, "test"), 42.0);

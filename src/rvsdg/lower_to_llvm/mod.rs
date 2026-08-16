@@ -584,7 +584,7 @@ impl<'a, 'ctx> ModuleLowerer<'a, 'ctx> {
     fn type_to_basic_type_llvm(&self, ty: TypeRef) -> color_eyre::Result<BasicTypeEnum<'ctx>> {
         let context = self.context;
         let basic = match ty {
-            TypeRef::State => bail!("`state` is an IR-only type with no LLVM basic type"),
+            TypeRef::State(_) => bail!("`state` is an IR-only type with no LLVM basic type"),
             TypeRef::Scalar(scalar_type) => match scalar_type {
                 ScalarType::Bool => BasicTypeEnum::IntType(context.bool_type()),
                 ScalarType::I8 => BasicTypeEnum::IntType(context.i8_type()),

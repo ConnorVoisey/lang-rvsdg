@@ -72,8 +72,7 @@ mod tests {
     use crate::rvsdg::{
         ArithFlags, BinaryOp, ConstValue, ICmpPred, Linkage, RVSDGMod, RegionId, ValueId,
         ValueKind,
-        builder::{BranchResult, LoopResult},
-        func::FnResult,
+        builder::LoopResult,
         types::{BOOL, I32},
         verify::RVSDGVerificationError,
     };
@@ -84,48 +83,35 @@ mod tests {
     fn build_gamma_theta_module() -> RVSDGMod {
         let mut m = RVSDGMod::new_host(String::from("test"));
         let f = m.declare_fn(String::from("f"), &[I32, I32], &[I32], Linkage::Internal);
-        m.define_fn(f, |rb, state| {
+        m.define_fn(f, |rb| {
             let x = rb.param(0);
             let y = rb.param(1);
             let flag = rb.constant(BOOL, ConstValue::Int(1));
             let predicate = rb.bool_predicate(flag);
             let picked = rb.gamma(
                 predicate,
-                state,
                 &[x, y],
                 |rb| {
                     let a = rb.param(0);
-                    Ok(BranchResult {
-                        state,
-                        values: vec![a],
-                    })
+                    Ok(vec![a])
                 },
                 |rb| {
                     let b = rb.param(1);
-                    Ok(BranchResult {
-                        state,
-                        values: vec![b],
-                    })
+                    Ok(vec![b])
                 },
             )?;
-            let looped = rb.theta(picked.state, &[picked.result(0)], |rb| {
+            let looped = rb.theta(&[picked.result(0)], |rb| {
                 let i = rb.param(0);
                 let one = rb.const_i32(1);
                 let next_i = rb.binary(BinaryOp::Add, ArithFlags::default(), i, one, I32);
                 let five = rb.const_i32(5);
                 let condition = rb.icmp(ICmpPred::SignedLt, next_i, five);
-                // The body is pure: its chain ends on its entry state,
-                // which is the state the theta was created with.
                 Ok(LoopResult {
                     condition,
-                    next_state: picked.state,
                     next_vars: vec![next_i],
                 })
             })?;
-            Ok(FnResult {
-                state: looped.state,
-                values: vec![looped.result(0)],
-            })
+            Ok(vec![looped.result(0)])
         })
         .unwrap();
         m

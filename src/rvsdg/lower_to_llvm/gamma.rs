@@ -146,8 +146,6 @@ impl<'m, 'a, 'ctx> FunctionLowerer<'m, 'a, 'ctx> {
 mod tests {
     use crate::rvsdg::{
         ArithFlags, BinaryOp, ICmpPred, Linkage, MatchArm, RVSDGMod,
-        builder::BranchResult,
-        func::FnResult,
         lower_to_llvm::test_utils::test_utils::jit_run_i32,
         types::{BOOL, I32},
         value::ConstValue,
@@ -160,7 +158,7 @@ mod tests {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg
-            .define_fn(func_id, |rb, state| {
+            .define_fn(func_id, |rb| {
                 let input = rb.const_i32(1);
                 let pred = rb.match_op(
                     input,
@@ -183,33 +181,14 @@ mod tests {
                 );
                 let res = rb.gamma_n(
                     pred,
-                    state,
                     &[],
                     &[
-                        &|rb| {
-                            Ok(BranchResult {
-                                state,
-                                values: vec![rb.const_i32(10)],
-                            })
-                        },
-                        &|rb| {
-                            Ok(BranchResult {
-                                state,
-                                values: vec![rb.const_i32(20)],
-                            })
-                        },
-                        &|rb| {
-                            Ok(BranchResult {
-                                state,
-                                values: vec![rb.const_i32(30)],
-                            })
-                        },
+                        &|rb| Ok(vec![rb.const_i32(10)]),
+                        &|rb| Ok(vec![rb.const_i32(20)]),
+                        &|rb| Ok(vec![rb.const_i32(30)]),
                     ],
                 )?;
-                Ok(FnResult {
-                    state: res.state,
-                    values: vec![res.result(0)],
-                })
+                Ok(vec![res.result(0)])
             })
             .unwrap();
 
@@ -226,7 +205,7 @@ mod tests {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg
-            .define_fn(func_id, |rb, state| {
+            .define_fn(func_id, |rb| {
                 let x = rb.const_i32(5);
                 let y = rb.const_i32(3);
                 let cond = rb.icmp(ICmpPred::SignedGt, x, y);
@@ -241,25 +220,11 @@ mod tests {
                 );
                 let res = rb.gamma(
                     pred,
-                    state,
                     &[],
-                    |rb| {
-                        Ok(BranchResult {
-                            state,
-                            values: vec![rb.const_i32(42)],
-                        })
-                    },
-                    |rb| {
-                        Ok(BranchResult {
-                            state,
-                            values: vec![rb.const_i32(99)],
-                        })
-                    },
+                    |rb| Ok(vec![rb.const_i32(42)]),
+                    |rb| Ok(vec![rb.const_i32(99)]),
                 )?;
-                Ok(FnResult {
-                    state: res.state,
-                    values: vec![res.result(0)],
-                })
+                Ok(vec![res.result(0)])
             })
             .unwrap();
 
@@ -272,29 +237,15 @@ mod tests {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg
-            .define_fn(func_id, |rb, state| {
+            .define_fn(func_id, |rb| {
                 let cond = rb.constant(BOOL, ConstValue::Int(1));
                 let res = rb.gamma(
                     cond,
-                    state,
                     &[],
-                    |rb| {
-                        Ok(BranchResult {
-                            state,
-                            values: vec![rb.const_i32(42)],
-                        })
-                    },
-                    |rb| {
-                        Ok(BranchResult {
-                            state,
-                            values: vec![rb.const_i32(99)],
-                        })
-                    },
+                    |rb| Ok(vec![rb.const_i32(42)]),
+                    |rb| Ok(vec![rb.const_i32(99)]),
                 )?;
-                Ok(FnResult {
-                    state: res.state,
-                    values: vec![res.result(0)],
-                })
+                Ok(vec![res.result(0)])
             })
             .unwrap();
 
@@ -307,29 +258,15 @@ mod tests {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg
-            .define_fn(func_id, |rb, state| {
+            .define_fn(func_id, |rb| {
                 let cond = rb.constant(BOOL, ConstValue::Int(0));
                 let res = rb.gamma(
                     cond,
-                    state,
                     &[],
-                    |rb| {
-                        Ok(BranchResult {
-                            state,
-                            values: vec![rb.const_i32(42)],
-                        })
-                    },
-                    |rb| {
-                        Ok(BranchResult {
-                            state,
-                            values: vec![rb.const_i32(99)],
-                        })
-                    },
+                    |rb| Ok(vec![rb.const_i32(42)]),
+                    |rb| Ok(vec![rb.const_i32(99)]),
                 )?;
-                Ok(FnResult {
-                    state: res.state,
-                    values: vec![res.result(0)],
-                })
+                Ok(vec![res.result(0)])
             })
             .unwrap();
 
@@ -342,32 +279,20 @@ mod tests {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg
-            .define_fn(func_id, |rb, state| {
+            .define_fn(func_id, |rb| {
                 let cond = rb.constant(BOOL, ConstValue::Int(1));
                 let res = rb.gamma(
                     cond,
-                    state,
                     &[],
                     |rb| {
                         let a = rb.const_i32(10);
                         let b = rb.const_i32(20);
                         let sum = rb.binary(BinaryOp::Add, ArithFlags::default(), a, b, I32);
-                        Ok(BranchResult {
-                            state,
-                            values: vec![sum],
-                        })
+                        Ok(vec![sum])
                     },
-                    |rb| {
-                        Ok(BranchResult {
-                            state,
-                            values: vec![rb.const_i32(0)],
-                        })
-                    },
+                    |rb| Ok(vec![rb.const_i32(0)]),
                 )?;
-                Ok(FnResult {
-                    state: res.state,
-                    values: vec![res.result(0)],
-                })
+                Ok(vec![res.result(0)])
             })
             .unwrap();
 
@@ -380,31 +305,17 @@ mod tests {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg
-            .define_fn(func_id, |rb, state| {
+            .define_fn(func_id, |rb| {
                 let x = rb.const_i32(5);
                 let y = rb.const_i32(3);
                 let cond = rb.icmp(ICmpPred::SignedGt, x, y);
                 let res = rb.gamma(
                     cond,
-                    state,
                     &[],
-                    |rb| {
-                        Ok(BranchResult {
-                            state,
-                            values: vec![rb.const_i32(1)],
-                        })
-                    },
-                    |rb| {
-                        Ok(BranchResult {
-                            state,
-                            values: vec![rb.const_i32(0)],
-                        })
-                    },
+                    |rb| Ok(vec![rb.const_i32(1)]),
+                    |rb| Ok(vec![rb.const_i32(0)]),
                 )?;
-                Ok(FnResult {
-                    state: res.state,
-                    values: vec![res.result(0)],
-                })
+                Ok(vec![res.result(0)])
             })
             .unwrap();
 
@@ -417,37 +328,18 @@ mod tests {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg
-            .define_fn(func_id, |rb, state| {
+            .define_fn(func_id, |rb| {
                 let cond = rb.const_i32(0);
                 let res = rb.gamma_n(
                     cond,
-                    state,
                     &[],
                     &[
-                        &|rb| {
-                            Ok(BranchResult {
-                                state,
-                                values: vec![rb.const_i32(10)],
-                            })
-                        },
-                        &|rb| {
-                            Ok(BranchResult {
-                                state,
-                                values: vec![rb.const_i32(20)],
-                            })
-                        },
-                        &|rb| {
-                            Ok(BranchResult {
-                                state,
-                                values: vec![rb.const_i32(30)],
-                            })
-                        },
+                        &|rb| Ok(vec![rb.const_i32(10)]),
+                        &|rb| Ok(vec![rb.const_i32(20)]),
+                        &|rb| Ok(vec![rb.const_i32(30)]),
                     ],
                 )?;
-                Ok(FnResult {
-                    state: res.state,
-                    values: vec![res.result(0)],
-                })
+                Ok(vec![res.result(0)])
             })
             .unwrap();
 
@@ -460,37 +352,18 @@ mod tests {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg
-            .define_fn(func_id, |rb, state| {
+            .define_fn(func_id, |rb| {
                 let cond = rb.const_i32(1);
                 let res = rb.gamma_n(
                     cond,
-                    state,
                     &[],
                     &[
-                        &|rb| {
-                            Ok(BranchResult {
-                                state,
-                                values: vec![rb.const_i32(10)],
-                            })
-                        },
-                        &|rb| {
-                            Ok(BranchResult {
-                                state,
-                                values: vec![rb.const_i32(20)],
-                            })
-                        },
-                        &|rb| {
-                            Ok(BranchResult {
-                                state,
-                                values: vec![rb.const_i32(30)],
-                            })
-                        },
+                        &|rb| Ok(vec![rb.const_i32(10)]),
+                        &|rb| Ok(vec![rb.const_i32(20)]),
+                        &|rb| Ok(vec![rb.const_i32(30)]),
                     ],
                 )?;
-                Ok(FnResult {
-                    state: res.state,
-                    values: vec![res.result(0)],
-                })
+                Ok(vec![res.result(0)])
             })
             .unwrap();
 
@@ -503,37 +376,18 @@ mod tests {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg
-            .define_fn(func_id, |rb, state| {
+            .define_fn(func_id, |rb| {
                 let cond = rb.const_i32(2);
                 let res = rb.gamma_n(
                     cond,
-                    state,
                     &[],
                     &[
-                        &|rb| {
-                            Ok(BranchResult {
-                                state,
-                                values: vec![rb.const_i32(10)],
-                            })
-                        },
-                        &|rb| {
-                            Ok(BranchResult {
-                                state,
-                                values: vec![rb.const_i32(20)],
-                            })
-                        },
-                        &|rb| {
-                            Ok(BranchResult {
-                                state,
-                                values: vec![rb.const_i32(30)],
-                            })
-                        },
+                        &|rb| Ok(vec![rb.const_i32(10)]),
+                        &|rb| Ok(vec![rb.const_i32(20)]),
+                        &|rb| Ok(vec![rb.const_i32(30)]),
                     ],
                 )?;
-                Ok(FnResult {
-                    state: res.state,
-                    values: vec![res.result(0)],
-                })
+                Ok(vec![res.result(0)])
             })
             .unwrap();
 
@@ -546,47 +400,25 @@ mod tests {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg
-            .define_fn(func_id, |rb, state| {
+            .define_fn(func_id, |rb| {
                 let cond = rb.const_i32(1);
                 let res = rb.gamma_n(
                     cond,
-                    state,
                     &[],
                     &[
-                        &|rb| {
-                            Ok(BranchResult {
-                                state,
-                                values: vec![rb.const_i32(100)],
-                            })
-                        },
+                        &|rb| Ok(vec![rb.const_i32(100)]),
                         &|rb| {
                             let a = rb.const_i32(3);
                             let b = rb.const_i32(7);
                             let product =
                                 rb.binary(BinaryOp::Mul, ArithFlags::default(), a, b, I32);
-                            Ok(BranchResult {
-                                state,
-                                values: vec![product],
-                            })
+                            Ok(vec![product])
                         },
-                        &|rb| {
-                            Ok(BranchResult {
-                                state,
-                                values: vec![rb.const_i32(0)],
-                            })
-                        },
-                        &|rb| {
-                            Ok(BranchResult {
-                                state,
-                                values: vec![rb.const_i32(-1)],
-                            })
-                        },
+                        &|rb| Ok(vec![rb.const_i32(0)]),
+                        &|rb| Ok(vec![rb.const_i32(-1)]),
                     ],
                 )?;
-                Ok(FnResult {
-                    state: res.state,
-                    values: vec![res.result(0)],
-                })
+                Ok(vec![res.result(0)])
             })
             .unwrap();
 
@@ -599,37 +431,27 @@ mod tests {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg
-            .define_fn(func_id, |rb, state| {
+            .define_fn(func_id, |rb| {
                 let a = rb.const_i32(10);
                 let b = rb.const_i32(20);
                 let cond = rb.constant(BOOL, ConstValue::Int(1));
                 let res = rb.gamma(
                     cond,
-                    state,
                     &[a, b],
                     |rb| {
                         let x = rb.param(0);
                         let y = rb.param(1);
                         let sum = rb.binary(BinaryOp::Add, ArithFlags::default(), x, y, I32);
-                        Ok(BranchResult {
-                            state,
-                            values: vec![sum],
-                        })
+                        Ok(vec![sum])
                     },
                     |rb| {
                         let x = rb.param(0);
                         let y = rb.param(1);
                         let diff = rb.binary(BinaryOp::Sub, ArithFlags::default(), x, y, I32);
-                        Ok(BranchResult {
-                            state,
-                            values: vec![diff],
-                        })
+                        Ok(vec![diff])
                     },
                 )?;
-                Ok(FnResult {
-                    state: res.state,
-                    values: vec![res.result(0)],
-                })
+                Ok(vec![res.result(0)])
             })
             .unwrap();
 
@@ -643,49 +465,36 @@ mod tests {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg
-            .define_fn(func_id, |rb, state| {
+            .define_fn(func_id, |rb| {
                 let a = rb.const_i32(10);
                 let b = rb.const_i32(20);
                 let cond = rb.const_i32(2);
                 let res = rb.gamma_n(
                     cond,
-                    state,
                     &[a, b],
                     &[
                         &|rb| {
                             let x = rb.param(0);
                             let y = rb.param(1);
                             let sum = rb.binary(BinaryOp::Add, ArithFlags::default(), x, y, I32);
-                            Ok(BranchResult {
-                                state,
-                                values: vec![sum],
-                            })
+                            Ok(vec![sum])
                         },
                         &|rb| {
                             let x = rb.param(0);
                             let y = rb.param(1);
                             let diff = rb.binary(BinaryOp::Sub, ArithFlags::default(), x, y, I32);
-                            Ok(BranchResult {
-                                state,
-                                values: vec![diff],
-                            })
+                            Ok(vec![diff])
                         },
                         &|rb| {
                             let x = rb.param(0);
                             let y = rb.param(1);
                             let product =
                                 rb.binary(BinaryOp::Mul, ArithFlags::default(), x, y, I32);
-                            Ok(BranchResult {
-                                state,
-                                values: vec![product],
-                            })
+                            Ok(vec![product])
                         },
                     ],
                 )?;
-                Ok(FnResult {
-                    state: res.state,
-                    values: vec![res.result(0)],
-                })
+                Ok(vec![res.result(0)])
             })
             .unwrap();
 
@@ -699,32 +508,18 @@ mod tests {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg
-            .define_fn(func_id, |rb, state| {
+            .define_fn(func_id, |rb| {
                 let cond = rb.constant(BOOL, ConstValue::Int(1));
                 let res = rb.gamma(
                     cond,
-                    state,
                     &[],
-                    |rb| {
-                        Ok(BranchResult {
-                            state,
-                            values: vec![rb.const_i32(10), rb.const_i32(20)],
-                        })
-                    },
-                    |rb| {
-                        Ok(BranchResult {
-                            state,
-                            values: vec![rb.const_i32(1), rb.const_i32(2)],
-                        })
-                    },
+                    |rb| Ok(vec![rb.const_i32(10), rb.const_i32(20)]),
+                    |rb| Ok(vec![rb.const_i32(1), rb.const_i32(2)]),
                 )?;
                 let a = res.result(0);
                 let b = res.result(1);
                 let product = rb.binary(BinaryOp::Mul, ArithFlags::default(), a, b, I32);
-                Ok(FnResult {
-                    state: res.state,
-                    values: vec![product],
-                })
+                Ok(vec![product])
             })
             .unwrap();
 

@@ -11,6 +11,7 @@ pub mod ownership;
 pub mod predicate_form;
 pub mod scope;
 pub mod state;
+pub mod typing;
 
 impl RVSDGMod {
     #[tracing::instrument(skip_all)]
@@ -54,6 +55,8 @@ impl FunctionGraph {
         let ownership = self.build_value_ownership(&mut errs);
         self.verify_scope(&ownership, &mut errs);
         self.verify_state(&ownership, &mut errs);
+        self.verify_chain_continuity(&mut errs);
+        self.verify_typing(&mut errs);
         self.verify_region_ownership(&mut errs);
         self.verify_predicate_form(&mut errs);
         errs
@@ -142,6 +145,70 @@ pub enum RVSDGVerificationError {
         input_count: usize,
         output_count: usize,
     },
+
+    #[error("state producer {value} has type {ty:?}, expected {expected}")]
+    StateProducerTypeWrong {
+        value: ValueId,
+        ty: crate::rvsdg::types::TypeRef,
+        expected: &'static str,
+    },
+
+    #[error("value {0} is State-typed but is not a state producer or a state tail parameter")]
+    StateTypedNonProducer(ValueId),
+
+    #[error("state merge {merge} joins input {input}, which is not a read of its alias class")]
+    StateMergeClassMismatch { merge: ValueId, input: ValueId },
+
+    #[error(
+        "state-typed value {value} appears in region {region}'s value interface; state crosses \
+         region boundaries only through the state tails"
+    )]
+    StateTypedRegionInterface { region: RegionId, value: ValueId },
+
+    #[error(
+        "state-typed value {operand} flows into a data operand of {user}; state travels only \
+         through state operands and region state tails"
+    )]
+    StateTypedDataOperand { user: ValueId, operand: ValueId },
+
+    #[error(
+        "region {region}'s state {side} tail has {len} entries; construction threads exactly \
+         two chains (memory, io)"
+    )]
+    StateTailWrongArity {
+        region: RegionId,
+        side: &'static str,
+        len: usize,
+    },
+
+    #[error("region {region}'s state tail entry {value} is not a value of the {chain} chain")]
+    StateTailWrongChain {
+        region: RegionId,
+        value: ValueId,
+        chain: &'static str,
+    },
+
+    #[error(
+        "construct {construct}'s projections are malformed: expected data projections, then at \
+         most one memory state projection, then at most one io projection"
+    )]
+    ConstructStateProjectionsMalformed { construct: ValueId },
+
+    #[error(
+        "construct {construct}'s subregion {region} carries entry state tails that differ from \
+         its first subregion's; a construct's chain inputs must be identical across its \
+         subregions"
+    )]
+    ConstructEntryTailsDisagree {
+        construct: ValueId,
+        region: RegionId,
+    },
+
+    #[error(
+        "effectful state value {value} is not reachable from any region's {chain} exit; the \
+         chain skips its effect, so ordering is lost and elimination would delete it"
+    )]
+    StateEffectUnrooted { value: ValueId, chain: &'static str },
 
     #[error(
         "predicate {0} flows into an ordinary operand slot; predicates may only feed a gamma \

@@ -131,12 +131,12 @@ impl BasicBlockMapper {
     /// components are included; callers filter for the kind they want.
     ///
     /// This is the analysis backbone for nested loop discovery in the
-    /// paper-faithful construction (see construction_plan.md, section
-    /// 4.9). After the whole-function strongly connected components have
-    /// been identified, recursing into each non-trivial component's
-    /// block set with that component's repetition arcs excluded reveals
-    /// the inner loops without ever re-running Tarjan over the full
-    /// function.
+    /// paper-faithful construction (Bahmann/Reissmann 2015's loop
+    /// restructuring). After the whole-function strongly connected
+    /// components have been identified, recursing into each non-trivial
+    /// component's block set with that component's repetition arcs
+    /// excluded reveals the inner loops without ever re-running Tarjan
+    /// over the full function.
     ///
     /// Complexity: O(|blocks| + |edges-in-subgraph|) per call, plus an
     /// O(N) zero-fill of three working arrays sized for the whole

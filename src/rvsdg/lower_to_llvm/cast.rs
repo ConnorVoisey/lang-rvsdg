@@ -77,7 +77,6 @@ impl<'m, 'a, 'ctx> FunctionLowerer<'m, 'a, 'ctx> {
 mod tests {
     use crate::rvsdg::{
         CastOp, Linkage, RVSDGMod,
-        func::FnResult,
         lower_to_llvm::test_utils::test_utils::{
             jit_run_f32, jit_run_f64, jit_run_i32, jit_run_i64,
         },
@@ -93,13 +92,10 @@ mod tests {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg
-            .define_fn(func_id, |rb, state| {
+            .define_fn(func_id, |rb| {
                 let v = rb.constant(I8, ConstValue::Int(-1i8 as i64));
                 let result = rb.cast(CastOp::SignExtend, v, I32);
-                Ok(FnResult {
-                    state,
-                    values: vec![result],
-                })
+                Ok(vec![result])
             })
             .unwrap();
         assert_eq!(jit_run_i32(&rvsdg, "test"), -1);
@@ -111,13 +107,10 @@ mod tests {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg
-            .define_fn(func_id, |rb, state| {
+            .define_fn(func_id, |rb| {
                 let v = rb.constant(I8, ConstValue::Int(100));
                 let result = rb.cast(CastOp::SignExtend, v, I32);
-                Ok(FnResult {
-                    state,
-                    values: vec![result],
-                })
+                Ok(vec![result])
             })
             .unwrap();
         assert_eq!(jit_run_i32(&rvsdg, "test"), 100);
@@ -129,13 +122,10 @@ mod tests {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg
-            .define_fn(func_id, |rb, state| {
+            .define_fn(func_id, |rb| {
                 let v = rb.constant(I8, ConstValue::Int(0xFF));
                 let result = rb.cast(CastOp::ZeroExtend, v, I32);
-                Ok(FnResult {
-                    state,
-                    values: vec![result],
-                })
+                Ok(vec![result])
             })
             .unwrap();
         assert_eq!(jit_run_i32(&rvsdg, "test"), 255);
@@ -146,13 +136,10 @@ mod tests {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I64], Linkage::External);
         rvsdg
-            .define_fn(func_id, |rb, state| {
+            .define_fn(func_id, |rb| {
                 let v = rb.constant(I16, ConstValue::Int(50000));
                 let result = rb.cast(CastOp::ZeroExtend, v, I64);
-                Ok(FnResult {
-                    state,
-                    values: vec![result],
-                })
+                Ok(vec![result])
             })
             .unwrap();
         assert_eq!(jit_run_i64(&rvsdg, "test"), 50000);
@@ -167,14 +154,11 @@ mod tests {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg
-            .define_fn(func_id, |rb, state| {
+            .define_fn(func_id, |rb| {
                 let v = rb.const_i32(0x1FF);
                 let truncated = rb.cast(CastOp::Truncate, v, I8);
                 let result = rb.cast(CastOp::ZeroExtend, truncated, I32);
-                Ok(FnResult {
-                    state,
-                    values: vec![result],
-                })
+                Ok(vec![result])
             })
             .unwrap();
         assert_eq!(jit_run_i32(&rvsdg, "test"), 255);
@@ -185,13 +169,10 @@ mod tests {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg
-            .define_fn(func_id, |rb, state| {
+            .define_fn(func_id, |rb| {
                 let v = rb.const_i64(0x1_0000_002A); // lower 32 bits = 42
                 let result = rb.cast(CastOp::Truncate, v, I32);
-                Ok(FnResult {
-                    state,
-                    values: vec![result],
-                })
+                Ok(vec![result])
             })
             .unwrap();
         assert_eq!(jit_run_i32(&rvsdg, "test"), 42);
@@ -204,13 +185,10 @@ mod tests {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[F64], Linkage::External);
         rvsdg
-            .define_fn(func_id, |rb, state| {
+            .define_fn(func_id, |rb| {
                 let v = rb.constant(F32, ConstValue::f32_from_native(3.5));
                 let result = rb.cast(CastOp::FloatExtend, v, F64);
-                Ok(FnResult {
-                    state,
-                    values: vec![result],
-                })
+                Ok(vec![result])
             })
             .unwrap();
         assert_eq!(jit_run_f64(&rvsdg, "test"), 3.5);
@@ -221,13 +199,10 @@ mod tests {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[F32], Linkage::External);
         rvsdg
-            .define_fn(func_id, |rb, state| {
+            .define_fn(func_id, |rb| {
                 let v = rb.constant(F64, ConstValue::f64_from_native(2.5));
                 let result = rb.cast(CastOp::FloatTruncate, v, F32);
-                Ok(FnResult {
-                    state,
-                    values: vec![result],
-                })
+                Ok(vec![result])
             })
             .unwrap();
         assert_eq!(jit_run_f32(&rvsdg, "test"), 2.5);
@@ -240,13 +215,10 @@ mod tests {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[F32], Linkage::External);
         rvsdg
-            .define_fn(func_id, |rb, state| {
+            .define_fn(func_id, |rb| {
                 let v = rb.const_i32(-42);
                 let result = rb.cast(CastOp::SignedToFloat, v, F32);
-                Ok(FnResult {
-                    state,
-                    values: vec![result],
-                })
+                Ok(vec![result])
             })
             .unwrap();
         assert_eq!(jit_run_f32(&rvsdg, "test"), -42.0);
@@ -257,14 +229,11 @@ mod tests {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[F32], Linkage::External);
         rvsdg
-            .define_fn(func_id, |rb, state| {
+            .define_fn(func_id, |rb| {
                 // 3_000_000_000 doesn't fit in signed i32 but is a valid u32
                 let v = rb.const_i32(3_000_000_000u32 as i32);
                 let result = rb.cast(CastOp::UnsignedToFloat, v, F32);
-                Ok(FnResult {
-                    state,
-                    values: vec![result],
-                })
+                Ok(vec![result])
             })
             .unwrap();
         assert_eq!(jit_run_f32(&rvsdg, "test"), 3_000_000_000.0f32);
@@ -275,13 +244,10 @@ mod tests {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg
-            .define_fn(func_id, |rb, state| {
+            .define_fn(func_id, |rb| {
                 let v = rb.constant(F32, ConstValue::f32_from_native(-7.9));
                 let result = rb.cast(CastOp::FloatToSigned, v, I32);
-                Ok(FnResult {
-                    state,
-                    values: vec![result],
-                })
+                Ok(vec![result])
             })
             .unwrap();
         // truncates toward zero
@@ -293,13 +259,10 @@ mod tests {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg
-            .define_fn(func_id, |rb, state| {
+            .define_fn(func_id, |rb| {
                 let v = rb.constant(F32, ConstValue::f32_from_native(42.7));
                 let result = rb.cast(CastOp::FloatToUnsigned, v, I32);
-                Ok(FnResult {
-                    state,
-                    values: vec![result],
-                })
+                Ok(vec![result])
             })
             .unwrap();
         assert_eq!(jit_run_i32(&rvsdg, "test"), 42);
@@ -328,20 +291,17 @@ mod tests {
         );
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg
-            .define_fn(func_id, |rb, state| {
+            .define_fn(func_id, |rb| {
                 let ptr = rb.global_ref(global_id, ptr_ty);
                 // ptr -> int -> ptr roundtrip
                 let as_int = rb.cast(CastOp::PtrToInt, ptr, I64);
                 let as_ptr = rb.cast(CastOp::IntToPtr, as_int, ptr_ty);
                 // store 99 through the roundtripped pointer
                 let ninety_nine = rb.const_i32(99);
-                let s1 = rb.store(state, as_ptr, ninety_nine, None, false);
+                rb.store(as_ptr, ninety_nine, None, false);
                 // load from original pointer
-                let loaded = rb.load(s1, ptr, I32, None, false);
-                Ok(FnResult {
-                    state: loaded.state,
-                    values: vec![loaded.value],
-                })
+                let loaded = rb.load(ptr, I32, None, false);
+                Ok(vec![loaded])
             })
             .unwrap();
         assert_eq!(jit_run_i32(&rvsdg, "test"), 99);
@@ -355,15 +315,12 @@ mod tests {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg
-            .define_fn(func_id, |rb, state| {
+            .define_fn(func_id, |rb| {
                 let v = rb.const_i32(42);
                 let as_f64 = rb.cast(CastOp::SignedToFloat, v, F64);
                 let as_f32 = rb.cast(CastOp::FloatTruncate, as_f64, F32);
                 let result = rb.cast(CastOp::FloatToSigned, as_f32, I32);
-                Ok(FnResult {
-                    state,
-                    values: vec![result],
-                })
+                Ok(vec![result])
             })
             .unwrap();
         assert_eq!(jit_run_i32(&rvsdg, "test"), 42);
@@ -375,15 +332,12 @@ mod tests {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg
-            .define_fn(func_id, |rb, state| {
+            .define_fn(func_id, |rb| {
                 let v = rb.constant(I8, ConstValue::Int(77));
                 let wide = rb.cast(CastOp::SignExtend, v, I32);
                 let narrow = rb.cast(CastOp::Truncate, wide, I8);
                 let result = rb.cast(CastOp::ZeroExtend, narrow, I32);
-                Ok(FnResult {
-                    state,
-                    values: vec![result],
-                })
+                Ok(vec![result])
             })
             .unwrap();
         assert_eq!(jit_run_i32(&rvsdg, "test"), 77);

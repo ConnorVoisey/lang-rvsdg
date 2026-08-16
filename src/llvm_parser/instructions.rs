@@ -2,8 +2,7 @@ use crate::{
     llvm_parser::{FnCtx, block_mapper::BasicBlockId, control_flow::scopes::SymbolScopes},
     rvsdg::{
         ArithFlags, AtomicRMWOp, BinaryOp, CastOp, FCmpPred, ICmpPred, MatchArm, MemoryOrdering,
-        State, UnaryOp, ValueId,
-        builder::{AllocaResult, LoadResult, RegionBuilder},
+        UnaryOp, ValueId, builder::RegionBuilder,
     },
 };
 use llvm_ir::{
@@ -133,107 +132,81 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
         Self { rb, scopes, fn_ctx }
     }
 
-    /// Lower one LLVM instruction, threading state through.
-    ///
-    /// Pure ops (arithmetic, casts, comparisons, etc.) leave state unchanged
-    /// and return `state` directly. Side-effecting ops (load, store, alloca,
-    /// fence, call, atomic ops) consume the state and produce a new one.
-    /// Phi nodes are skipped -- they're absorbed into region parameters at
-    /// region boundaries, not lowered as instructions.
-    pub(crate) fn lower_instruction(
-        &mut self,
-        state: State,
-        inst: &Instruction,
-    ) -> color_eyre::Result<State> {
-        let new_state = match inst {
+    /// Lower one LLVM instruction. State ordering is the builder's
+    /// concern (side-effecting ops thread the region's chain
+    /// internally); this only maps instructions to builder calls and
+    /// binds destinations. Phi nodes are skipped -- they're absorbed
+    /// into region parameters at region boundaries, not lowered as
+    /// instructions.
+    pub(crate) fn lower_instruction(&mut self, inst: &Instruction) -> color_eyre::Result<()> {
+        match inst {
             // ---- Pure integer binary ops ----------------------------------
             Instruction::Add(i) => {
                 self.binary(i, BinaryOp::Add, ArithFlags::wrap(i.nsw, i.nuw))?;
-                state
             }
             Instruction::Sub(i) => {
                 self.binary(i, BinaryOp::Sub, ArithFlags::wrap(i.nsw, i.nuw))?;
-                state
             }
             Instruction::Mul(i) => {
                 self.binary(i, BinaryOp::Mul, ArithFlags::wrap(i.nsw, i.nuw))?;
-                state
             }
             Instruction::UDiv(i) => {
                 self.binary(i, BinaryOp::UnsignedDiv, ArithFlags::exact(i.exact))?;
-                state
             }
             Instruction::SDiv(i) => {
                 self.binary(i, BinaryOp::SignedDiv, ArithFlags::exact(i.exact))?;
-                state
             }
             Instruction::URem(i) => {
                 self.binary(i, BinaryOp::UnsignedRem, ArithFlags::default())?;
-                state
             }
             Instruction::SRem(i) => {
                 self.binary(i, BinaryOp::SignedRem, ArithFlags::default())?;
-                state
             }
             Instruction::And(i) => {
                 self.binary(i, BinaryOp::And, ArithFlags::default())?;
-                state
             }
             Instruction::Or(i) => {
                 self.binary(i, BinaryOp::Or, ArithFlags::default())?;
-                state
             }
             Instruction::Xor(i) => {
                 self.binary(i, BinaryOp::Xor, ArithFlags::default())?;
-                state
             }
             Instruction::Shl(i) => {
                 self.binary(i, BinaryOp::ShiftLeft, ArithFlags::wrap(i.nsw, i.nuw))?;
-                state
             }
             Instruction::LShr(i) => {
                 self.binary(i, BinaryOp::LogicalShiftRight, ArithFlags::exact(i.exact))?;
-                state
             }
             Instruction::AShr(i) => {
                 self.binary(i, BinaryOp::ArithShiftRight, ArithFlags::exact(i.exact))?;
-                state
             }
 
             // ---- Pure float binary ops ------------------------------------
             Instruction::FAdd(i) => {
                 self.binary(i, BinaryOp::FloatAdd, ArithFlags::default())?;
-                state
             }
             Instruction::FSub(i) => {
                 self.binary(i, BinaryOp::FloatSub, ArithFlags::default())?;
-                state
             }
             Instruction::FMul(i) => {
                 self.binary(i, BinaryOp::FloatMul, ArithFlags::default())?;
-                state
             }
             Instruction::FDiv(i) => {
                 self.binary(i, BinaryOp::FloatDiv, ArithFlags::default())?;
-                state
             }
             Instruction::FRem(i) => {
                 self.binary(i, BinaryOp::FloatRem, ArithFlags::default())?;
-                state
             }
             Instruction::FNeg(i) => {
                 self.unary(i, UnaryOp::FloatNeg)?;
-                state
             }
 
             // ---- Pure vector / aggregate ops ------------------------------
             Instruction::ExtractElement(i) => {
                 self.extract_element(i)?;
-                state
             }
             Instruction::InsertElement(i) => {
                 self.insert_element(i)?;
-                state
             }
             Instruction::ShuffleVector(_) => {
                 // Mask is a constant vector -- needs per-element decomposition.
@@ -242,65 +215,64 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
             }
             Instruction::ExtractValue(i) => {
                 self.extract_value(i)?;
-                state
             }
             Instruction::InsertValue(i) => {
                 self.insert_value(i)?;
-                state
             }
 
-            // ---- Memory ops (state-threading) -----------------------------
-            Instruction::Alloca(i) => self.alloca(state, i)?.state,
-            Instruction::Load(i) => self.load(state, i)?.state,
-            Instruction::Store(i) => self.store(state, i)?,
-            Instruction::Fence(i) => self.fence(state, i),
-            Instruction::CmpXchg(i) => self.compare_and_swap(state, i)?,
-            Instruction::AtomicRMW(i) => self.atomic_read_modify_write(state, i)?,
+            // ---- Memory ops -------------------------------------------------
+            Instruction::Alloca(i) => {
+                self.alloca(i)?;
+            }
+            Instruction::Load(i) => {
+                self.load(i)?;
+            }
+            Instruction::Store(i) => {
+                self.store(i)?;
+            }
+            Instruction::Fence(i) => {
+                self.fence(i);
+            }
+            Instruction::CmpXchg(i) => {
+                self.compare_and_swap(i)?;
+            }
+            Instruction::AtomicRMW(i) => {
+                self.atomic_read_modify_write(i)?;
+            }
             Instruction::GetElementPtr(i) => {
                 self.get_element_ptr(i)?;
-                state
             }
 
             // ---- Pure casts ------------------------------------------------
             Instruction::Trunc(i) => {
                 self.cast(i, CastOp::Truncate)?;
-                state
             }
             Instruction::ZExt(i) => {
                 self.cast(i, CastOp::ZeroExtend)?;
-                state
             }
             Instruction::SExt(i) => {
                 self.cast(i, CastOp::SignExtend)?;
-                state
             }
             Instruction::FPTrunc(i) => {
                 self.cast(i, CastOp::FloatTruncate)?;
-                state
             }
             Instruction::FPExt(i) => {
                 self.cast(i, CastOp::FloatExtend)?;
-                state
             }
             Instruction::FPToUI(i) => {
                 self.cast(i, CastOp::FloatToUnsigned)?;
-                state
             }
             Instruction::FPToSI(i) => {
                 self.cast(i, CastOp::FloatToSigned)?;
-                state
             }
             Instruction::UIToFP(i) => {
                 self.cast(i, CastOp::UnsignedToFloat)?;
-                state
             }
             Instruction::SIToFP(i) => {
                 self.cast(i, CastOp::SignedToFloat)?;
-                state
             }
             Instruction::PtrToInt(i) => {
                 self.cast(i, CastOp::PtrToInt)?;
-                state
             }
             // LLVM 22 instruction (address extraction for fat/tagged
             // pointers); cannot occur in LLVM 19 input, which is the only
@@ -312,47 +284,42 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
             }
             Instruction::IntToPtr(i) => {
                 self.cast(i, CastOp::IntToPtr)?;
-                state
             }
             Instruction::BitCast(i) => {
                 self.cast(i, CastOp::Bitcast)?;
-                state
             }
             Instruction::AddrSpaceCast(i) => {
                 self.cast(i, CastOp::Bitcast)?;
-                state
             }
 
             // ---- Pure comparisons / select / freeze -----------------------
             Instruction::ICmp(i) => {
                 self.icmp(i)?;
-                state
             }
             Instruction::FCmp(i) => {
                 self.fcmp(i)?;
-                state
             }
             // Phi nodes are absorbed into region parameters elsewhere; no-op here.
-            Instruction::Phi(_) => state,
+            Instruction::Phi(_) => {}
             Instruction::Select(i) => {
                 self.select(i)?;
-                state
             }
             Instruction::Freeze(i) => {
                 self.freeze(i)?;
-                state
             }
 
-            // ---- Call (state-threading) ------------------------------------
-            Instruction::Call(i) => self.call(state, i)?,
+            // ---- Call -------------------------------------------------------
+            Instruction::Call(i) => {
+                self.call(i)?;
+            }
 
             // ---- Unmodelled ------------------------------------------------
             Instruction::VAArg(_) => todo!("VAArg"),
             Instruction::LandingPad(_) => todo!("LandingPad"),
             Instruction::CatchPad(_) => todo!("CatchPad"),
             Instruction::CleanupPad(_) => todo!("CleanupPad"),
-        };
-        Ok(new_state)
+        }
+        Ok(())
     }
 
     fn binary<I>(
@@ -515,11 +482,7 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
         Ok(val)
     }
 
-    fn load(
-        &mut self,
-        state: State,
-        inst: &llvm_ir::instruction::Load,
-    ) -> color_eyre::Result<LoadResult> {
+    fn load(&mut self, inst: &llvm_ir::instruction::Load) -> color_eyre::Result<ValueId> {
         let addr = self.operand(&inst.address)?;
         let loaded_type = self
             .rb
@@ -528,48 +491,39 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
             .convert_type_ref(&inst.loaded_ty, self.fn_ctx.llvm_mod)?;
         let align = (inst.alignment != 0).then_some(inst.alignment);
 
-        let result = match &inst.atomicity {
+        let value = match &inst.atomicity {
             Some(at) => self.rb.atomic_load(
-                state,
                 addr,
                 loaded_type,
                 convert_mem_ordering(at.mem_ordering),
                 align,
                 inst.volatile,
             ),
-            None => self.rb.load(state, addr, loaded_type, align, inst.volatile),
+            None => self.rb.load(addr, loaded_type, align, inst.volatile),
         };
-        self.scopes.bind_name(&inst.dest, result.value);
-        Ok(result)
+        self.scopes.bind_name(&inst.dest, value);
+        Ok(value)
     }
 
-    fn store(
-        &mut self,
-        state: State,
-        inst: &llvm_ir::instruction::Store,
-    ) -> color_eyre::Result<State> {
+    fn store(&mut self, inst: &llvm_ir::instruction::Store) -> color_eyre::Result<()> {
         let addr = self.operand(&inst.address)?;
         let value = self.operand(&inst.value)?;
         let align = (inst.alignment != 0).then_some(inst.alignment);
 
-        Ok(match &inst.atomicity {
+        match &inst.atomicity {
             Some(at) => self.rb.atomic_store(
-                state,
                 addr,
                 value,
                 convert_mem_ordering(at.mem_ordering),
                 align,
                 inst.volatile,
             ),
-            None => self.rb.store(state, addr, value, align, inst.volatile),
-        })
+            None => self.rb.store(addr, value, align, inst.volatile),
+        }
+        Ok(())
     }
 
-    fn alloca(
-        &mut self,
-        state: State,
-        inst: &llvm_ir::instruction::Alloca,
-    ) -> color_eyre::Result<AllocaResult> {
+    fn alloca(&mut self, inst: &llvm_ir::instruction::Alloca) -> color_eyre::Result<ValueId> {
         let count = self.operand(&inst.num_elements)?;
         let elem_type = self
             .rb
@@ -586,22 +540,18 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
         // Zero means "no explicit alignment" in LLVM; natural alignment
         // applies. clang stamps every local's alloca explicitly.
         let align = (inst.alignment != 0).then_some(inst.alignment);
-        let result = self.rb.alloca(state, elem_type, count, ptr_type, align);
-        self.scopes.bind_name(&inst.dest, result.ptr);
-        Ok(result)
+        let ptr = self.rb.alloca(elem_type, count, ptr_type, align);
+        self.scopes.bind_name(&inst.dest, ptr);
+        Ok(ptr)
     }
 
-    fn fence(&mut self, state: State, inst: &llvm_ir::instruction::Fence) -> State {
+    fn fence(&mut self, inst: &llvm_ir::instruction::Fence) {
         let ordering = convert_mem_ordering(inst.atomicity.mem_ordering);
-        self.rb.fence(state, ordering)
+        self.rb.fence(ordering);
     }
 
     /// Lower an LLVM `cmpxchg` instruction: an atomic compare-and-swap.
-    fn compare_and_swap(
-        &mut self,
-        state: State,
-        inst: &llvm_ir::instruction::CmpXchg,
-    ) -> color_eyre::Result<State> {
+    fn compare_and_swap(&mut self, inst: &llvm_ir::instruction::CmpXchg) -> color_eyre::Result<()> {
         let addr = self.operand(&inst.address)?;
         let expected = self.operand(&inst.expected)?;
         let desired = self.operand(&inst.replacement)?;
@@ -617,7 +567,6 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
         // instruction; inkwell has no wrapper but its AsValueRef trait is
         // public).
         let result = self.rb.compare_and_swap(
-            state,
             addr,
             expected,
             desired,
@@ -631,23 +580,21 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
         // fields are the node's two projections. The destination binds the
         // NODE so `extract_value` can recognise the kind and route to the
         // matching projection.
-        self.scopes.bind_name(&inst.dest, result.state.0);
-        Ok(result.state)
+        self.scopes.bind_name(&inst.dest, result.node);
+        Ok(())
     }
 
     /// Lower an LLVM `atomicrmw` instruction: an atomic read-modify-write
     /// returning the value the memory held before the operation.
     fn atomic_read_modify_write(
         &mut self,
-        state: State,
         inst: &llvm_ir::instruction::AtomicRMW,
-    ) -> color_eyre::Result<State> {
+    ) -> color_eyre::Result<ValueId> {
         let addr = self.operand(&inst.address)?;
         let value = self.operand(&inst.value)?;
         let value_type = self.rb.graph.get_value_type(value);
         let op = convert_atomic_read_modify_write_op(inst.operation)?;
-        let result = self.rb.atomic_read_modify_write(
-            state,
+        let old_value = self.rb.atomic_read_modify_write(
             addr,
             value,
             op,
@@ -655,8 +602,8 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
             *value_type,
             inst.volatile,
         );
-        self.scopes.bind_name(&inst.dest, result.value);
-        Ok(result.state)
+        self.scopes.bind_name(&inst.dest, old_value);
+        Ok(old_value)
     }
 
     fn select(&mut self, inst: &llvm_ir::instruction::Select) -> color_eyre::Result<ValueId> {

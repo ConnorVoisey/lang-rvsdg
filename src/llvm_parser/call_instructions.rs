@@ -1,7 +1,7 @@
 use crate::{
     llvm_parser::{convert_calling_convention, convert_param_attrs, instructions::RegionLowerer},
     rvsdg::{
-        State, ValueId,
+        ValueId,
         func::{Signature, SignatureId},
         types::TypeRef,
     },
@@ -68,13 +68,8 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
         }))
     }
 
-    /// Lower a Call instruction. Threads state through (calls are side-effecting).
-    /// Returns the new state after the call completes.
-    pub(super) fn call(
-        &mut self,
-        state: State,
-        inst: &llvm_ir::instruction::Call,
-    ) -> color_eyre::Result<State> {
+    /// Lower a Call instruction and bind its destination, if any.
+    pub(super) fn call(&mut self, inst: &llvm_ir::instruction::Call) -> color_eyre::Result<()> {
         let callee_operand = match &inst.function {
             // A call whose callee is an inline-assembly blob. Common in
             // real inputs through force-inline header helpers whose bodies
@@ -98,7 +93,7 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
         if let Some(name) = callee_as_global_name(callee_operand)
             && crate::llvm_parser::global_name_string(name).starts_with("llvm.lifetime.")
         {
-            return Ok(state);
+            return Ok(());
         }
 
         let args: Vec<ValueId> = inst
@@ -120,10 +115,10 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
                 .fn_map
                 .get(&crate::llvm_parser::global_name_string(name))
         {
-            self.rb.call_with_signature(fn_id, state, &args, sig)
+            self.rb.call_with_signature(fn_id, &args, sig)
         } else {
             let callee_val = self.operand(callee_operand)?;
-            self.rb.call_indirect(callee_val, state, &args, sig)
+            self.rb.call_indirect(callee_val, &args, sig)
         };
 
         if let Some(dest) = &inst.dest {
@@ -139,6 +134,6 @@ impl<'rb, 'g, 'm> RegionLowerer<'rb, 'g, 'm> {
                 ),
             }
         }
-        Ok(result.state)
+        Ok(())
     }
 }

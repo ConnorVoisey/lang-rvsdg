@@ -48,7 +48,7 @@ use crate::{
         scc::SccTreeNodeId,
     },
     rvsdg::{
-        ConstValue, MatchArm, RegionId, State, ValueId, builder::RegionBuilder, func::FnResult,
+        ConstValue, MatchArm, RegionId, ValueId, builder::RegionBuilder,
         function_graph::FunctionGraph, module_tables::ModuleTables, types::TypeRef,
     },
 };
@@ -72,14 +72,14 @@ impl EmitRegion<'_> {
     }
 }
 
-/// Emit one function's body from its restructuring overlay. The caller has
-/// seeded the root frame with the function parameters.
+/// Emit one function's body from its restructuring overlay, returning the
+/// function's result values. The caller has seeded the root frame with the
+/// function parameters.
 #[tracing::instrument(name = "emit", skip_all, fields(blocks = lowerer.fn_ctx.bb_mapper.blocks.len()))]
 pub(in crate::llvm_parser) fn emit_function_body(
     lowerer: &mut RegionLowerer<'_, '_, '_>,
     overlay: &Overlay,
-    state: State,
-) -> color_eyre::Result<FnResult> {
+) -> color_eyre::Result<Vec<ValueId>> {
     let fn_ctx = lowerer.fn_ctx;
     let tree = fn_ctx.scc_tree;
     let emitter = Emitter {
@@ -95,7 +95,7 @@ pub(in crate::llvm_parser) fn emit_function_body(
         collapse: &root_collapse,
         body_of: None,
     };
-    let state = emitter.emit_region(lowerer, &root, Vertex::Block(BasicBlockId(0)), state)?;
+    emitter.emit_region(lowerer, &root, Vertex::Block(BasicBlockId(0)))?;
 
     let values = if matches!(fn_ctx.func.return_type.as_ref(), llvm_ir::Type::VoidType) {
         Vec::new()
@@ -114,7 +114,7 @@ pub(in crate::llvm_parser) fn emit_function_body(
         };
         vec![value]
     };
-    Ok(FnResult { state, values })
+    Ok(values)
 }
 
 struct Emitter<'m> {
@@ -163,27 +163,26 @@ impl<'m> Emitter<'m> {
         }
     }
 
-    /// Walk one region from `entry`, emitting as it goes. Returns the state
-    /// after the region; every value result is a symbol binding the
-    /// caller's frame observes.
+    /// Walk one region from `entry`, emitting as it goes. Every value
+    /// result is a symbol binding the caller's frame observes; state
+    /// ordering lives in the builder's scratch registers.
     fn emit_region(
         &self,
         lowerer: &mut RegionLowerer<'_, '_, '_>,
         region: &EmitRegion<'_>,
         entry: Vertex,
-        mut state: State,
-    ) -> color_eyre::Result<State> {
+    ) -> color_eyre::Result<()> {
         let exit_block = self.overlay.exit_block;
         let mut current = entry;
         loop {
             match current {
                 Vertex::Block(block) => {
                     if block != exit_block {
-                        state = self.lower_block_instructions(lowerer, state, block)?;
+                        self.lower_block_instructions(lowerer, block)?;
                     }
                 }
                 Vertex::Loop(scc) => {
-                    state = self.emit_theta(lowerer, region, scc, state)?;
+                    self.emit_theta(lowerer, scc)?;
                 }
                 Vertex::Aux(aux_id) => {
                     if let AuxVertexKind::PromotedAssign { assignments } =
@@ -207,46 +206,44 @@ impl<'m> Emitter<'m> {
                 (arcs.len(), single)
             };
             match arc_count {
-                0 => return Ok(state),
+                0 => return Ok(()),
                 1 => {
                     let (payload, target) = single.expect("collected above");
                     payload.apply(self, lowerer)?;
                     if !region.contains(target) {
-                        return Ok(state);
+                        return Ok(());
                     }
                     current = target;
                 }
                 _ => {
-                    let (next_state, join) = self.emit_gamma(lowerer, region, current, state)?;
-                    state = next_state;
+                    let join = self.emit_gamma(lowerer, region, current)?;
                     match join {
                         Some(join) if region.contains(join) => current = join,
                         // No continuation point (every alternative ends the
                         // region within itself) or an exterior one: the
                         // region is done either way.
-                        _ => return Ok(state),
+                        _ => return Ok(()),
                     }
                 }
             }
         }
     }
 
-    /// Lower every non-phi instruction of `block`, threading state. Phis
-    /// are bindings applied at arc traversal, never instructions.
+    /// Lower every non-phi instruction of `block`. Phis are bindings
+    /// applied at arc traversal, never instructions.
     fn lower_block_instructions(
         &self,
         lowerer: &mut RegionLowerer<'_, '_, '_>,
-        mut state: State,
         block: BasicBlockId,
-    ) -> color_eyre::Result<State> {
+    ) -> color_eyre::Result<()> {
         let bb = &self.fn_ctx.func.basic_blocks[block.0 as usize];
         for inst in &bb.instrs {
             if matches!(inst, Instruction::Phi(_)) {
                 continue;
             }
-            state = lowerer.lower_instruction(state, inst)?;
+            lowerer.lower_instruction(inst)?;
         }
-        Ok(state)
+        Ok(())
     }
 
     /// The exit block's "phi": bind the return value from `from`'s `ret`
@@ -273,15 +270,14 @@ impl<'m> Emitter<'m> {
 
     /// Emit the gamma for the branch at `branch`: process each alternative
     /// in its own region and frame, then assemble the node from the frames'
-    /// captures (inputs) and writes (outputs). Returns the post-gamma state
-    /// and the branch's single continuation point.
+    /// captures (inputs) and writes (outputs). Returns the branch's single
+    /// continuation point.
     fn emit_gamma(
         &self,
         lowerer: &mut RegionLowerer<'_, '_, '_>,
         region: &EmitRegion<'_>,
         branch: Vertex,
-        state: State,
-    ) -> color_eyre::Result<(State, Option<Vertex>)> {
+    ) -> color_eyre::Result<Option<Vertex>> {
         let (partition, seed_payloads) = {
             let view = self.view(region);
             let arcs = view.arcs_out(branch);
@@ -322,13 +318,12 @@ impl<'m> Emitter<'m> {
 
         // Process each alternative in its own region under its own frame.
         let mut arm_regions: Vec<RegionId> = Vec::with_capacity(partition.arms.len());
-        let mut arm_exits: Vec<State> = Vec::with_capacity(partition.arms.len());
         let mut arm_frames: Vec<Frame> = Vec::with_capacity(partition.arms.len());
         for (index, arm) in partition.arms.iter().enumerate() {
-            let region_id = lowerer.rb.add_region(state);
+            let region_id = lowerer.rb.add_region();
             arm_regions.push(region_id);
             lowerer.scopes.push_frame(region_id);
-            let arm_exit = {
+            {
                 let mut arm_rb = RegionBuilder::over(
                     &mut *lowerer.rb.graph,
                     &mut *lowerer.rb.module_tables,
@@ -337,20 +332,17 @@ impl<'m> Emitter<'m> {
                 let mut arm_lowerer =
                     RegionLowerer::new(&mut arm_rb, &mut *lowerer.scopes, self.fn_ctx);
                 seed_payloads[index].apply(self, &mut arm_lowerer)?;
+                // A seed-only arm (no members) emits nothing and stays
+                // pure; its exit state is its entry state at seal.
                 if !arm.members.is_empty() {
                     let arm_region = EmitRegion {
                         members: Some(&arm_sets[index]),
                         collapse: region.collapse,
                         body_of: region.body_of,
                     };
-                    Some(self.emit_region(&mut arm_lowerer, &arm_region, arm.seed.target, state)?)
-                } else {
-                    // Seed-only arm: nothing state-producing was emitted,
-                    // so the arm is pure and exits on its entry state.
-                    None
+                    self.emit_region(&mut arm_lowerer, &arm_region, arm.seed.target)?;
                 }
-            };
-            arm_exits.push(arm_exit.unwrap_or(state));
+            }
             arm_frames.push(lowerer.scopes.pop_frame());
         }
 
@@ -451,23 +443,20 @@ impl<'m> Emitter<'m> {
                 };
                 results.push(value);
             }
-            graph.seal_region(region_id, results, arm_exits[index]);
+            graph.seal_region(region_id, results);
         }
 
-        let result = lowerer.rb.finish_gamma(
-            predicate,
-            state,
-            input_values,
-            &arm_regions,
-            outputs.len() as u16,
-        );
+        let result =
+            lowerer
+                .rb
+                .finish_gamma(predicate, input_values, &arm_regions, outputs.len() as u16);
         for (o, &symbol) in outputs.iter().enumerate() {
             lowerer.scopes.bind_id(symbol, result.result(o as u16));
         }
         for frame in arm_frames {
             lowerer.scopes.recycle_frame(frame);
         }
-        Ok((result.state, join))
+        Ok(join)
     }
 
     /// The gamma predicate for `branch`: a block's terminator condition or
@@ -525,11 +514,8 @@ impl<'m> Emitter<'m> {
     fn emit_theta(
         &self,
         lowerer: &mut RegionLowerer<'_, '_, '_>,
-        region: &EmitRegion<'_>,
         scc: SccTreeNodeId,
-        state: State,
-    ) -> color_eyre::Result<State> {
-        let _ = region;
+    ) -> color_eyre::Result<()> {
         let tree = self.fn_ctx.scc_tree;
         let record = self.overlay.loops[scc.0 as usize]
             .as_ref()
@@ -556,9 +542,9 @@ impl<'m> Emitter<'m> {
                 body_members.insert(vertex);
             });
 
-        let body_region_id = lowerer.rb.add_region(state);
+        let body_region_id = lowerer.rb.add_region();
         lowerer.scopes.push_frame(body_region_id);
-        let (condition, body_exit) = {
+        let condition = {
             let mut body_rb = RegionBuilder::over(
                 &mut *lowerer.rb.graph,
                 &mut *lowerer.rb.module_tables,
@@ -571,7 +557,7 @@ impl<'m> Emitter<'m> {
                 collapse: &child_collapse,
                 body_of: Some(scc),
             };
-            let body_exit = self.emit_region(&mut body_lowerer, &body_region, entry, state)?;
+            self.emit_region(&mut body_lowerer, &body_region, entry)?;
 
             // A structured loop's hidden back edge still defines the
             // next-iteration values: apply its phi copies at the body's end.
@@ -586,7 +572,7 @@ impl<'m> Emitter<'m> {
             }
 
             // The repetition predicate: alternative 1 repeats.
-            let condition = if is_restructured {
+            if is_restructured {
                 let repeat = body_lowerer
                     .scopes
                     .resolve_aux(body_lowerer.rb.graph, repeat_var)
@@ -632,8 +618,7 @@ impl<'m> Emitter<'m> {
                     0,
                     2,
                 )
-            };
-            (condition, body_exit)
+            }
         };
         let frame = lowerer.scopes.pop_frame();
 
@@ -696,14 +681,11 @@ impl<'m> Emitter<'m> {
             }
         }
         lowerer.rb.graph.set_region_params(body_region_id, &params);
-        lowerer
-            .rb
-            .graph
-            .seal_region(body_region_id, next_values, body_exit);
+        lowerer.rb.graph.seal_region(body_region_id, next_values);
 
         let result = lowerer
             .rb
-            .finish_theta(state, loop_var_inputs, body_region_id, condition);
+            .finish_theta(loop_var_inputs, body_region_id, condition);
 
         // Only written symbols rebind (a capture that was never written
         // just passed through; its enclosing binding is still the value).
@@ -716,7 +698,7 @@ impl<'m> Emitter<'m> {
             }
         }
         lowerer.scopes.recycle_frame(frame);
-        Ok(result.state)
+        Ok(())
     }
 }
 

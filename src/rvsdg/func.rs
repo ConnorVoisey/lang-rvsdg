@@ -1,5 +1,5 @@
 use crate::rvsdg::{
-    FuncId, InlineHint, Linkage, RVSDGMod, State, ValueId, Visibility,
+    FuncId, InlineHint, Linkage, RVSDGMod, ValueId, Visibility,
     builder::RegionBuilder,
     function_graph::FunctionGraph,
     global::DllStorageClass,
@@ -310,7 +310,7 @@ impl RVSDGMod {
     pub fn define_fn(
         &mut self,
         func_id: FuncId,
-        rb_fn: impl FnOnce(&mut RegionBuilder, State) -> color_eyre::Result<FnResult>,
+        rb_fn: impl FnOnce(&mut RegionBuilder) -> color_eyre::Result<Vec<ValueId>>,
     ) -> color_eyre::Result<()> {
         debug_assert_eq!(
             self.graphs.len(),
@@ -321,10 +321,9 @@ impl RVSDGMod {
 
         let mut graph = FunctionGraph::new(func_id);
         let mut rb = RegionBuilder::new_from_func(&mut graph, &mut self.tables, func_id);
-        let region_id = rb.region_id();
-        let state = rb.graph.regions[region_id.0 as usize].entry_state;
-        let fn_res = rb_fn(&mut rb, state)?;
-        graph.seal_region(region_id, &fn_res.values, fn_res.state);
+        let region_id = rb.region_id;
+        let values = rb_fn(&mut rb)?;
+        graph.seal_region(region_id, &values);
         graph.finish_building();
 
         // TODO: if in debug mode check that the return values match the declerations return types
@@ -349,26 +348,4 @@ pub struct FnDecl {
     pub attrs: FnAttrs,
     /// Windows import/export storage class.
     pub dll_storage_class: DllStorageClass,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct CallResult {
-    pub state: State,
-    pub first_result: ValueId,
-    pub result_count: u16,
-}
-
-// TODO: Same short-lived Vec allocation as BranchResult/LoopResult -- see
-// builder/mod.rs for the profiling note about SmallVec.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FnResult {
-    pub state: State,
-    pub values: Vec<ValueId>,
-}
-
-impl CallResult {
-    pub fn result(&self, index: u16) -> ValueId {
-        debug_assert!(index < self.result_count);
-        ValueId(self.first_result.0 + index as u32)
-    }
 }

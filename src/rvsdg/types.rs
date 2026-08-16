@@ -1,5 +1,7 @@
 use rustc_hash::FxHashMap;
 
+use crate::rvsdg::state::StateKind;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PtrTypeId(pub(crate) u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -52,9 +54,15 @@ pub enum ScalarType {
     Void,
 }
 
+// Guarded: value_types is a per-value parallel array, so TypeRef's size
+// is a cache-density budget. The state refactor's nested StateKind
+// depends on niche folding keeping this at 8; if a compiler change
+// stops folding, fail the build instead of growing the array by half.
+const _: () = assert!(size_of::<TypeRef>() == 8);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TypeRef {
-    State,
+    State(StateKind),
     Scalar(ScalarType),
     Ptr(PtrTypeId),
     Array(ArrayTypeId),

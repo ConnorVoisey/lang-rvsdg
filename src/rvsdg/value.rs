@@ -16,13 +16,36 @@ pub struct Value {
     pub kind: ValueKind,
 }
 
+// Construction threads two state chains through every function: memory
+// (alias class 0, the undivided escaped world until the post-DNE class
+// split) and io. Memory-only ops carry a `state` operand; calls (which
+// may touch memory and perform io, and have no region to carry slots)
+// carry one operand per chain. For both, the node itself is the output
+// state of every chain it consumes. Gamma and theta carry NO state
+// operands: their state interface lives on their subregions -- the
+// entry tails hold the parent-side values the construct chains from
+// (identical across arms), and per-chain state projections after the
+// data projections pair with the exit tails to continue the parent's
+// chains.
+
 // A Value (this kind plus its 8-byte TypeRef) measures 40 bytes; the
 // census's memory-budget table tracks the real figure. The size is
 // driven by the memory-op variants; most variants are 4-16 bytes, but
 // boxing the large ones would add pointer chases on the most frequently
 // accessed operations -- not worth the tradeoff.
+//
+// Guarded: the widest variants are the memory ops and calls (Load at
+// 29 bytes; Alloca and the calls at 28), just under the 32-byte
+// budget, so a grown variant (or a compiler layout change) must fail
+// the build loudly instead of silently widening the hottest array.
+const _: () = assert!(size_of::<ValueKind>() == 32);
+const _: () = assert!(size_of::<Value>() == 40);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ValueKind {
+    StateMerge {
+        inputs: ValuesSpan,
+    },
     Const(ConstValue),
     /// Reference to a constant in the constant pool (aggregates, strings, etc.)
     ConstPoolRef(ConstId),
@@ -218,7 +241,6 @@ pub enum ValueKind {
     Theta {
         loop_vars: ValuesSpan,
         condition: ValueId,
-        state: State,
         region_id: RegionId,
     },
     /// N-way conditional branch. The condition selects which region to execute:
@@ -226,7 +248,6 @@ pub enum ValueKind {
     Gamma {
         condition: ValueId,
         inputs: ValuesSpan,
-        state: State,
         /// One region per branch, all must produce the same number/types of results
         regions: RegionsSpan,
     },
@@ -239,6 +260,7 @@ pub enum ValueKind {
     /// entries for them.
     Call {
         state: State,
+        io_state: State,
         fn_id: FuncId,
         sig: SignatureId,
         args: ValuesSpan,
@@ -251,6 +273,7 @@ pub enum ValueKind {
     /// instructions carry their own function type.
     CallIndirect {
         state: State,
+        io_state: State,
         callee: ValueId,
         sig: SignatureId,
         args: ValuesSpan,
@@ -285,6 +308,120 @@ impl ValueKind {
                 | ValueKind::GlobalRef(_)
                 | ValueKind::FuncAddr(_)
         )
+    }
+
+    /// Memory ops: the kinds that carry a memory `state` operand and
+    /// whose node is its own output state on the memory chain. Calls
+    /// and merges also produce on the chain but are classified apart
+    /// (calls advance io too; merges are ordering structure).
+    pub fn is_memory_op(&self) -> bool {
+        matches!(
+            self,
+            ValueKind::Load { .. }
+                | ValueKind::Store { .. }
+                | ValueKind::Alloca { .. }
+                | ValueKind::AtomicLoad { .. }
+                | ValueKind::AtomicStore { .. }
+                | ValueKind::AtomicReadModifyWrite { .. }
+                | ValueKind::CompareAndSwap { .. }
+                | ValueKind::Fence { .. }
+                | ValueKind::Intrinsic { .. }
+        )
+    }
+
+    pub fn is_call(&self) -> bool {
+        matches!(
+            self,
+            ValueKind::Call { .. } | ValueKind::CallIndirect { .. }
+        )
+    }
+
+    pub fn is_construct(&self) -> bool {
+        matches!(self, ValueKind::Gamma { .. } | ValueKind::Theta { .. })
+    }
+
+    /// The value's memory chain operand, if its kind carries one. The
+    /// single definition of which kinds consume the memory chain
+    /// through an operand; deliberately exhaustive so a new variant
+    /// forces a decision here rather than silently counting as pure.
+    /// (Constructs consume chains through their subregions' entry
+    /// tails, not operands; merges join reads through their inputs.)
+    pub fn memory_state_operand(&self) -> Option<State> {
+        match self {
+            ValueKind::Load { state, .. }
+            | ValueKind::Store { state, .. }
+            | ValueKind::Alloca { state, .. }
+            | ValueKind::AtomicLoad { state, .. }
+            | ValueKind::AtomicStore { state, .. }
+            | ValueKind::AtomicReadModifyWrite { state, .. }
+            | ValueKind::CompareAndSwap { state, .. }
+            | ValueKind::Fence { state, .. }
+            | ValueKind::Intrinsic { state, .. }
+            | ValueKind::Call { state, .. }
+            | ValueKind::CallIndirect { state, .. } => Some(*state),
+            ValueKind::StateMerge { .. }
+            | ValueKind::Gamma { .. }
+            | ValueKind::Theta { .. }
+            | ValueKind::Const(_)
+            | ValueKind::ConstPoolRef(_)
+            | ValueKind::GlobalRef(_)
+            | ValueKind::FuncAddr(_)
+            | ValueKind::Unary { .. }
+            | ValueKind::Binary { .. }
+            | ValueKind::ICmp { .. }
+            | ValueKind::FCmp { .. }
+            | ValueKind::Ternary { .. }
+            | ValueKind::Cast { .. }
+            | ValueKind::ExtractLane { .. }
+            | ValueKind::InsertLane { .. }
+            | ValueKind::ShuffleLanes { .. }
+            | ValueKind::ExtractField { .. }
+            | ValueKind::InsertField { .. }
+            | ValueKind::PtrOffset { .. }
+            | ValueKind::Freeze { .. }
+            | ValueKind::Match { .. }
+            | ValueKind::Project { .. }
+            | ValueKind::RegionParam { .. } => None,
+        }
+    }
+
+    /// The value's io chain operand: calls only (the io ops).
+    pub fn io_state_operand(&self) -> Option<State> {
+        match self {
+            ValueKind::Call { io_state, .. } | ValueKind::CallIndirect { io_state, .. } => {
+                Some(*io_state)
+            }
+            _ => None,
+        }
+    }
+
+    /// Visit every state operand mutably (memory and io; not merge
+    /// inputs, which live in the value pool as an ordinary span).
+    /// Kept in lockstep with [`ValueKind::memory_state_operand`] /
+    /// [`ValueKind::io_state_operand`] -- the read side is the
+    /// exhaustive definition.
+    pub(crate) fn for_each_state_operand_mut(&mut self, mut f: impl FnMut(&mut State)) {
+        match self {
+            ValueKind::Load { state, .. }
+            | ValueKind::Store { state, .. }
+            | ValueKind::Alloca { state, .. }
+            | ValueKind::AtomicLoad { state, .. }
+            | ValueKind::AtomicStore { state, .. }
+            | ValueKind::AtomicReadModifyWrite { state, .. }
+            | ValueKind::CompareAndSwap { state, .. }
+            | ValueKind::Fence { state, .. }
+            | ValueKind::Intrinsic { state, .. } => f(state),
+            ValueKind::Call {
+                state, io_state, ..
+            }
+            | ValueKind::CallIndirect {
+                state, io_state, ..
+            } => {
+                f(state);
+                f(io_state);
+            }
+            _ => {}
+        }
     }
 }
 

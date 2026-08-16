@@ -19,23 +19,32 @@ use crate::rvsdg::RVSDGMod;
 use crate::stats::heap;
 
 pub mod dead_node_elimination;
+pub mod passthrough_reroute;
 
 pub use dead_node_elimination::DneEffects;
+pub use passthrough_reroute::PassthroughEffects;
 
 #[derive(Debug)]
 pub enum OptPass {
+    /// Steps state chains around constructs they merely pass through,
+    /// so the following liveness pass can collect pure constructs.
+    PassthroughReroute,
     DeadNodeElimination,
 }
 
 impl OptPass {
     pub fn name(&self) -> &'static str {
         match self {
+            OptPass::PassthroughReroute => "PassthroughReroute",
             OptPass::DeadNodeElimination => "DeadNodeElimination",
         }
     }
 
     fn run_pass(&self, rvsdg_mod: &mut RVSDGMod) -> color_eyre::Result<PassEffects> {
         match self {
+            OptPass::PassthroughReroute => Ok(PassEffects::PassthroughReroute(
+                rvsdg_mod.opt_passthrough_reroute()?,
+            )),
             OptPass::DeadNodeElimination => Ok(PassEffects::DeadNodeElimination(
                 rvsdg_mod.opt_dead_node_elimination()?,
             )),
@@ -82,6 +91,7 @@ impl GraphShape {
 /// forces a decision about what it reports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum PassEffects {
+    PassthroughReroute(PassthroughEffects),
     DeadNodeElimination(DneEffects),
 }
 
@@ -143,6 +153,11 @@ impl std::fmt::Display for PassReport {
             )?;
         }
         match &self.effects {
+            PassEffects::PassthroughReroute(effects) => write!(
+                f,
+                ", slots rerouted: memory {}, io {}",
+                effects.memory_slots_rerouted, effects.io_slots_rerouted,
+            ),
             PassEffects::DeadNodeElimination(effects) => write!(
                 f,
                 ", slots dropped: gamma inputs {}, theta loop vars {}, result entries {}; pinned projections {}",
@@ -237,7 +252,9 @@ impl RVSDGMod {
     }
 
     pub fn optimise_default(&mut self, verify_all: bool) -> color_eyre::Result<PipelineReport> {
-        let passes = vec![OptPass::DeadNodeElimination];
+        // Reroute first: it is what turns pure constructs into dead ones
+        // for the liveness pass to collect.
+        let passes = vec![OptPass::PassthroughReroute, OptPass::DeadNodeElimination];
         self.optimise(passes, verify_all)
     }
 

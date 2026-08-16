@@ -8,6 +8,8 @@ pub mod global;
 pub mod lower_to_llvm;
 pub mod module_tables;
 pub mod ops;
+pub mod region;
+pub mod state;
 pub mod types;
 pub mod value;
 pub mod verify;
@@ -18,6 +20,7 @@ pub use ops::{
     ArithFlags, AtomicRMWOp, BinaryOp, CastOp, FCmpPred, ICmpPred, IntrinsicOp, MemoryOrdering,
     UnaryOp,
 };
+pub use state::{AliasClassId, State, StateKind};
 pub use target_lexicon::Triple;
 pub use value::{ConstValue, Value, ValueKind};
 
@@ -101,6 +104,21 @@ impl ValuePool {
         }
     }
 
+    pub fn push_iter(&mut self, values: impl Iterator<Item = ValueId>) -> ValuesSpan {
+        let start = self.0.len() as u32;
+        let mut len = 0;
+        for val in values {
+            self.0.push(val);
+            len += 1;
+        }
+        ValuesSpan {
+            start,
+            // Checked: a silent wrap here would alias someone else's
+            // entries through a corrupted span length.
+            len: u16::try_from(len).expect("span exceeds u16 entries"),
+        }
+    }
+
     pub fn get(&self, values: ValuesSpan) -> &[ValueId] {
         &self.0[values.start as usize..(values.start as usize + values.len as usize)]
     }
@@ -117,6 +135,13 @@ impl ValuePool {
     /// A raw (start, len) slice, for region block segments.
     pub(crate) fn slice(&self, start: u32, len: usize) -> &[ValueId] {
         &self.0[start as usize..start as usize + len]
+    }
+
+    /// Mutable view of a block segment. Every block is uniquely owned by
+    /// the Region holding its handles, so an owner mutating its segment
+    /// never aliases another owner's.
+    pub(crate) fn slice_mut(&mut self, start: u32, len: usize) -> &mut [ValueId] {
+        &mut self.0[start as usize..start as usize + len]
     }
 
     /// Total pooled entries (live and dead spans alike).
@@ -154,7 +179,7 @@ impl RegionPool {
     /// place pattern. Every span is uniquely owned by the field holding
     /// it (`push_slice` always appends), so an owner mutating its span
     /// never aliases another owner's.
-    pub fn get_mut(&mut self, span: RegionsSpan) -> &mut [RegionId] {
+    pub(crate) fn get_mut(&mut self, span: RegionsSpan) -> &mut [RegionId] {
         &mut self.0[span.start as usize..(span.start as usize + span.len as usize)]
     }
 
@@ -240,112 +265,6 @@ impl MatchArmPool {
 pub struct MatchArmSpan {
     pub start: u32,
     pub len: u16,
-}
-
-/// State edge -- a newtype over Value for type safety.
-/// Prevents accidentally passing a state where data is expected and vice versa.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct State(pub ValueId);
-
-impl State {
-    /// Placeholder for a not-yet-set state slot (regions are created
-    /// with this exit state and every finaliser must overwrite it, pure
-    /// regions included). Forgetting to set it panics at the first
-    /// indexed use instead of silently reading a real value, and the
-    /// verifier reports any that survive to a checkpoint.
-    pub const INVALID: State = State(ValueId::INVALID);
-}
-
-#[derive(Debug, Clone)]
-pub struct Region {
-    /// The gamma/theta value this region belongs to. The graph only
-    /// stores the forward direction during emission (the construct value
-    /// does not exist until its regions are finished), so like
-    /// `exit_state` this is created as [`ValueId::INVALID`] and stamped
-    /// by the construct's finaliser. Region 0 is the function body and
-    /// stays owner-less; the verifier enforces both directions.
-    pub owner: ValueId,
-    pub entry_state: State,
-    /// Equal to `entry_state` when the region is pure. A field rather
-    /// than a results entry so slot machinery (projections, dead slot
-    /// elimination) never has to special-case a state slot. Created as
-    /// [`State::INVALID`]; every finaliser must set it explicitly, and
-    /// the verifier rejects any region still unset.
-    pub exit_state: State,
-    /// Start of this region's INTERFACE BLOCK in the value pool:
-    /// parameters then results, contiguous, written once when the region
-    /// is sealed (construct assembly; define_fn's end for the body).
-    /// [`Region::UNSEALED`] until then -- an open region's growing lists
-    /// live in the graph's construction scratch and every consumer reads
-    /// them through the `region_params`/`region_results`/`region_nodes`
-    /// accessors, never these fields directly.
-    ///
-    /// Parameters are appended on demand during emission (the emitter
-    /// captures outer values into a region while its body is being
-    /// built), so parameter VALUES interleave with body values in the
-    /// value arrays; consumers identify a parameter by its position in
-    /// the params segment, never by value-id arithmetic.
-    pub interface_start: u32,
-    pub params_len: u16,
-    pub results_len: u16,
-    /// This region's nodes in topological (emission) order, as a span in
-    /// the value pool, written at seal. Node IDS need not be ascending
-    /// (passes append replacement values at high ids); the list order is
-    /// the truth for emission and state order.
-    pub nodes_start: u32,
-    pub nodes_len: u32,
-}
-
-impl Region {
-    /// Sentinel for a region whose interface block has not been sealed
-    /// yet. Accessors panic on a pool read of an unsealed region instead
-    /// of slicing from a bogus offset.
-    pub const UNSEALED: u32 = u32::MAX;
-
-    /// A freshly created, open region: owner and exit state stamped by
-    /// the finaliser, lists living in construction scratch until seal.
-    /// Crate-private so `FunctionGraph::create_region` (which registers
-    /// the scratch) stays the single way a region comes to exist.
-    pub(crate) fn new_open(entry_state: State) -> Self {
-        Region {
-            owner: ValueId::INVALID,
-            entry_state,
-            exit_state: State::INVALID,
-            interface_start: Region::UNSEALED,
-            params_len: 0,
-            results_len: 0,
-            nodes_start: 0,
-            nodes_len: 0,
-        }
-    }
-
-    pub fn is_sealed(&self) -> bool {
-        self.interface_start != Region::UNSEALED
-    }
-
-    /// Write this region's sealed storage into `pool` and stamp the
-    /// handles: the interface block (params then results, contiguous)
-    /// followed by the nodes block. The single definition of the sealed
-    /// layout; construction's seal and compaction's rebuild both go
-    /// through it, so a layout change cannot diverge between them.
-    pub(crate) fn write_blocks(
-        &mut self,
-        pool: &mut ValuePool,
-        params: &[ValueId],
-        results: &[ValueId],
-        nodes: &[ValueId],
-    ) {
-        self.interface_start = pool.extend(params);
-        // A pool at exactly u32::MAX entries would hand out a start that
-        // collides with the UNSEALED sentinel, leaving the region
-        // permanently "open".
-        debug_assert!(self.interface_start != Region::UNSEALED);
-        pool.extend(results);
-        self.nodes_start = pool.extend(nodes);
-        self.params_len = u16::try_from(params.len()).expect("region parameter count exceeds u16");
-        self.results_len = u16::try_from(results.len()).expect("region result count exceeds u16");
-        self.nodes_len = u32::try_from(nodes.len()).expect("region node count exceeds u32");
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

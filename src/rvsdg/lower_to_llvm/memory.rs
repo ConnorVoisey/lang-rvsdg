@@ -296,9 +296,8 @@ pub(crate) fn ordering_to_llvm(ordering: MemoryOrdering) -> AtomicOrdering {
 #[cfg(test)]
 mod tests {
     use crate::rvsdg::{
-        ArithFlags, BinaryOp, GlobalInit, ICmpPred, Linkage, RVSDGMod,
+        ArithFlags, BinaryOp, GlobalInit, ICmpPred, Linkage, RVSDGMod, StateKind,
         builder::LoopResult,
-        func::FnResult,
         lower_to_llvm::test_utils::test_utils::jit_run_i32,
         types::{I32, PtrType, TypeRef},
         value::ConstValue,
@@ -330,15 +329,12 @@ mod tests {
         let ptr_ty = make_ptr_ty(&mut rvsdg, I32);
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg
-            .define_fn(func_id, |rb, state| {
+            .define_fn(func_id, |rb| {
                 let ptr = rb.global_ref(global_id, ptr_ty);
                 let val = rb.const_i32(42);
-                let s1 = rb.store(state, ptr, val, None, false);
-                let loaded = rb.load(s1, ptr, I32, None, false);
-                Ok(FnResult {
-                    state: loaded.state,
-                    values: vec![loaded.value],
-                })
+                rb.store(ptr, val, None, false);
+                let loaded = rb.load(ptr, I32, None, false);
+                Ok(vec![loaded])
             })
             .unwrap();
         assert_eq!(jit_run_i32(&rvsdg, "test"), 42);
@@ -359,17 +355,14 @@ mod tests {
         let ptr_ty = make_ptr_ty(&mut rvsdg, I32);
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg
-            .define_fn(func_id, |rb, state| {
+            .define_fn(func_id, |rb| {
                 let ptr = rb.global_ref(global_id, ptr_ty);
                 let ten = rb.const_i32(10);
-                let s1 = rb.store(state, ptr, ten, None, false);
+                rb.store(ptr, ten, None, false);
                 let ninety_nine = rb.const_i32(99);
-                let s2 = rb.store(s1, ptr, ninety_nine, None, false);
-                let loaded = rb.load(s2, ptr, I32, None, false);
-                Ok(FnResult {
-                    state: loaded.state,
-                    values: vec![loaded.value],
-                })
+                rb.store(ptr, ninety_nine, None, false);
+                let loaded = rb.load(ptr, I32, None, false);
+                Ok(vec![loaded])
             })
             .unwrap();
         assert_eq!(jit_run_i32(&rvsdg, "test"), 99);
@@ -397,26 +390,17 @@ mod tests {
         let ptr_ty = make_ptr_ty(&mut rvsdg, I32);
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg
-            .define_fn(func_id, |rb, state| {
+            .define_fn(func_id, |rb| {
                 let ptr_a = rb.global_ref(g_a, ptr_ty);
                 let ptr_b = rb.global_ref(g_b, ptr_ty);
                 let thirty = rb.const_i32(30);
                 let twelve = rb.const_i32(12);
-                let s1 = rb.store(state, ptr_a, thirty, None, false);
-                let s2 = rb.store(s1, ptr_b, twelve, None, false);
-                let la = rb.load(s2, ptr_a, I32, None, false);
-                let lb = rb.load(la.state, ptr_b, I32, None, false);
-                let sum = rb.binary(
-                    BinaryOp::Add,
-                    ArithFlags::default(),
-                    la.value,
-                    lb.value,
-                    I32,
-                );
-                Ok(FnResult {
-                    state: lb.state,
-                    values: vec![sum],
-                })
+                rb.store(ptr_a, thirty, None, false);
+                rb.store(ptr_b, twelve, None, false);
+                let la = rb.load(ptr_a, I32, None, false);
+                let lb = rb.load(ptr_b, I32, None, false);
+                let sum = rb.binary(BinaryOp::Add, ArithFlags::default(), la, lb, I32);
+                Ok(vec![sum])
             })
             .unwrap();
         assert_eq!(jit_run_i32(&rvsdg, "test"), 42);
@@ -431,16 +415,13 @@ mod tests {
         let ptr_ty = make_ptr_ty(&mut rvsdg, I32);
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg
-            .define_fn(func_id, |rb, state| {
+            .define_fn(func_id, |rb| {
                 let one = rb.const_i32(1);
-                let alloc = rb.alloca(state, I32, one, ptr_ty, None);
+                let alloc = rb.alloca(I32, one, ptr_ty, None);
                 let val = rb.const_i32(77);
-                let s1 = rb.store(alloc.state, alloc.ptr, val, None, false);
-                let loaded = rb.load(s1, alloc.ptr, I32, None, false);
-                Ok(FnResult {
-                    state: loaded.state,
-                    values: vec![loaded.value],
-                })
+                rb.store(alloc, val, None, false);
+                let loaded = rb.load(alloc, I32, None, false);
+                Ok(vec![loaded])
             })
             .unwrap();
         assert_eq!(jit_run_i32(&rvsdg, "test"), 77);
@@ -454,22 +435,21 @@ mod tests {
         let ptr_ty = make_ptr_ty(&mut rvsdg, I32);
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg
-            .define_fn(func_id, |rb, state| {
+            .define_fn(func_id, |rb| {
                 let one = rb.const_i32(1);
-                let alloc = rb.alloca(state, I32, one, ptr_ty, None);
+                let alloc = rb.alloca(I32, one, ptr_ty, None);
                 let zero = rb.const_i32(0);
-                let s1 = rb.store(alloc.state, alloc.ptr, zero, None, false);
+                rb.store(alloc, zero, None, false);
 
                 // Loop counter as a loop var, accumulator via store/load on the alloca
                 let i = rb.const_i32(0);
-                let res = rb.theta(s1, &[i], |rb| {
+                rb.theta(&[i], |rb| {
                     let loop_i = rb.param(0);
                     // load current value, add 10, store back
-                    let cur = rb.load(s1, alloc.ptr, I32, None, false);
+                    let cur = rb.load(alloc, I32, None, false);
                     let ten = rb.const_i32(10);
-                    let next_val =
-                        rb.binary(BinaryOp::Add, ArithFlags::default(), cur.value, ten, I32);
-                    let s2 = rb.store(cur.state, alloc.ptr, next_val, None, false);
+                    let next_val = rb.binary(BinaryOp::Add, ArithFlags::default(), cur, ten, I32);
+                    rb.store(alloc, next_val, None, false);
 
                     let one = rb.const_i32(1);
                     let next_i = rb.binary(BinaryOp::Add, ArithFlags::default(), loop_i, one, I32);
@@ -477,16 +457,12 @@ mod tests {
                     let cond = rb.icmp(ICmpPred::SignedLt, next_i, five);
                     Ok(LoopResult {
                         condition: cond,
-                        next_state: s2,
                         next_vars: vec![next_i],
                     })
                 })?;
 
-                let final_val = rb.load(res.state, alloc.ptr, I32, None, false);
-                Ok(FnResult {
-                    state: final_val.state,
-                    values: vec![final_val.value],
-                })
+                let final_val = rb.load(alloc, I32, None, false);
+                Ok(vec![final_val])
             })
             .unwrap();
         assert_eq!(jit_run_i32(&rvsdg, "test"), 50);
@@ -499,38 +475,29 @@ mod tests {
         let ptr_ty = make_ptr_ty(&mut rvsdg, I32);
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg
-            .define_fn(func_id, |rb, state| {
+            .define_fn(func_id, |rb| {
                 let one = rb.const_i32(1);
-                let a = rb.alloca(state, I32, one, ptr_ty, None);
-                let b = rb.alloca(a.state, I32, one, ptr_ty, None);
+                let a = rb.alloca(I32, one, ptr_ty, None);
+                let b = rb.alloca(I32, one, ptr_ty, None);
 
                 // a = 10, b = 20
                 let ten = rb.const_i32(10);
                 let twenty = rb.const_i32(20);
-                let s1 = rb.store(b.state, a.ptr, ten, None, false);
-                let s2 = rb.store(s1, b.ptr, twenty, None, false);
+                rb.store(a, ten, None, false);
+                rb.store(b, twenty, None, false);
 
                 // swap: tmp = *a; *a = *b; *b = tmp
-                let tmp = rb.load(s2, a.ptr, I32, None, false);
-                let b_val = rb.load(tmp.state, b.ptr, I32, None, false);
-                let s3 = rb.store(b_val.state, a.ptr, b_val.value, None, false);
-                let s4 = rb.store(s3, b.ptr, tmp.value, None, false);
+                let tmp = rb.load(a, I32, None, false);
+                let b_val = rb.load(b, I32, None, false);
+                rb.store(a, b_val, None, false);
+                rb.store(b, tmp, None, false);
 
                 // *a should now be 20, *b should be 10
                 // return *a - *b = 20 - 10 = 10
-                let la = rb.load(s4, a.ptr, I32, None, false);
-                let lb = rb.load(la.state, b.ptr, I32, None, false);
-                let diff = rb.binary(
-                    BinaryOp::Sub,
-                    ArithFlags::default(),
-                    la.value,
-                    lb.value,
-                    I32,
-                );
-                Ok(FnResult {
-                    state: lb.state,
-                    values: vec![diff],
-                })
+                let la = rb.load(a, I32, None, false);
+                let lb = rb.load(b, I32, None, false);
+                let diff = rb.binary(BinaryOp::Sub, ArithFlags::default(), la, lb, I32);
+                Ok(vec![diff])
             })
             .unwrap();
         assert_eq!(jit_run_i32(&rvsdg, "test"), 10);
@@ -552,16 +519,15 @@ mod tests {
         let ptr_ty = make_ptr_ty(&mut rvsdg, I32);
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg
-            .define_fn(func_id, |rb, state| {
+            .define_fn(func_id, |rb| {
                 let ptr = rb.global_ref(global_id, ptr_ty);
                 let i = rb.const_i32(0);
-                let res = rb.theta(state, &[i], |rb| {
+                rb.theta(&[i], |rb| {
                     let loop_i = rb.param(0);
-                    let cur = rb.load(state, ptr, I32, None, false);
+                    let cur = rb.load(ptr, I32, None, false);
                     let three = rb.const_i32(3);
-                    let next_val =
-                        rb.binary(BinaryOp::Add, ArithFlags::default(), cur.value, three, I32);
-                    let s2 = rb.store(cur.state, ptr, next_val, None, false);
+                    let next_val = rb.binary(BinaryOp::Add, ArithFlags::default(), cur, three, I32);
+                    rb.store(ptr, next_val, None, false);
 
                     let one = rb.const_i32(1);
                     let next_i = rb.binary(BinaryOp::Add, ArithFlags::default(), loop_i, one, I32);
@@ -569,16 +535,12 @@ mod tests {
                     let cond = rb.icmp(ICmpPred::SignedLt, next_i, ten);
                     Ok(LoopResult {
                         condition: cond,
-                        next_state: s2,
                         next_vars: vec![next_i],
                     })
                 })?;
 
-                let final_val = rb.load(res.state, ptr, I32, None, false);
-                Ok(FnResult {
-                    state: final_val.state,
-                    values: vec![final_val.value],
-                })
+                let final_val = rb.load(ptr, I32, None, false);
+                Ok(vec![final_val])
             })
             .unwrap();
         assert_eq!(jit_run_i32(&rvsdg, "test"), 30);
@@ -612,17 +574,14 @@ mod tests {
         let i32_ptr_ty = make_ptr_ty(&mut rvsdg, I32);
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg
-            .define_fn(func_id, |rb, state| {
+            .define_fn(func_id, |rb| {
                 let ptr = rb.global_ref(global_id, ptr_ty);
                 let zero = rb.const_i32(0);
                 let idx = rb.const_i32(2);
                 // GEP [4 x i32]* ptr, 0, 2 => i32*
                 let elem_ptr = rb.ptr_offset(ptr, arr_ty, &[zero, idx], i32_ptr_ty, true);
-                let loaded = rb.load(state, elem_ptr, I32, None, false);
-                Ok(FnResult {
-                    state: loaded.state,
-                    values: vec![loaded.value],
-                })
+                let loaded = rb.load(elem_ptr, I32, None, false);
+                Ok(vec![loaded])
             })
             .unwrap();
         assert_eq!(jit_run_i32(&rvsdg, "test"), 30);
@@ -642,9 +601,9 @@ mod tests {
         let i32_ptr_ty = make_ptr_ty(&mut rvsdg, I32);
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg
-            .define_fn(func_id, |rb, state| {
+            .define_fn(func_id, |rb| {
                 let one = rb.const_i32(1);
-                let alloc = rb.alloca(state, arr_ty, one, arr_ptr_ty, None);
+                let alloc = rb.alloca(arr_ty, one, arr_ptr_ty, None);
 
                 let zero = rb.const_i32(0);
                 let idx0 = rb.const_i32(0);
@@ -652,33 +611,24 @@ mod tests {
                 let idx2 = rb.const_i32(2);
 
                 // GEP to each element and store
-                let p0 = rb.ptr_offset(alloc.ptr, arr_ty, &[zero, idx0], i32_ptr_ty, true);
-                let p1 = rb.ptr_offset(alloc.ptr, arr_ty, &[zero, idx1], i32_ptr_ty, true);
-                let p2 = rb.ptr_offset(alloc.ptr, arr_ty, &[zero, idx2], i32_ptr_ty, true);
+                let p0 = rb.ptr_offset(alloc, arr_ty, &[zero, idx0], i32_ptr_ty, true);
+                let p1 = rb.ptr_offset(alloc, arr_ty, &[zero, idx1], i32_ptr_ty, true);
+                let p2 = rb.ptr_offset(alloc, arr_ty, &[zero, idx2], i32_ptr_ty, true);
 
                 let v100 = rb.const_i32(100);
                 let v200 = rb.const_i32(200);
                 let v300 = rb.const_i32(300);
-                let s1 = rb.store(alloc.state, p0, v100, None, false);
-                let s2 = rb.store(s1, p1, v200, None, false);
-                let s3 = rb.store(s2, p2, v300, None, false);
+                rb.store(p0, v100, None, false);
+                rb.store(p1, v200, None, false);
+                rb.store(p2, v300, None, false);
 
                 // Load all three and sum
-                let l0 = rb.load(s3, p0, I32, None, false);
-                let l1 = rb.load(l0.state, p1, I32, None, false);
-                let l2 = rb.load(l1.state, p2, I32, None, false);
-                let sum01 = rb.binary(
-                    BinaryOp::Add,
-                    ArithFlags::default(),
-                    l0.value,
-                    l1.value,
-                    I32,
-                );
-                let total = rb.binary(BinaryOp::Add, ArithFlags::default(), sum01, l2.value, I32);
-                Ok(FnResult {
-                    state: l2.state,
-                    values: vec![total],
-                })
+                let l0 = rb.load(p0, I32, None, false);
+                let l1 = rb.load(p1, I32, None, false);
+                let l2 = rb.load(p2, I32, None, false);
+                let sum01 = rb.binary(BinaryOp::Add, ArithFlags::default(), l0, l1, I32);
+                let total = rb.binary(BinaryOp::Add, ArithFlags::default(), sum01, l2, I32);
+                Ok(vec![total])
             })
             .unwrap();
         assert_eq!(jit_run_i32(&rvsdg, "test"), 600);
@@ -709,27 +659,22 @@ mod tests {
         let i32_ptr_ty = make_ptr_ty(&mut rvsdg, I32);
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg
-            .define_fn(func_id, |rb, state| {
+            .define_fn(func_id, |rb| {
                 let arr_ptr = rb.global_ref(global_id, ptr_ty);
                 let zero_idx = rb.const_i32(0);
                 // i = 0, sum = 0
                 let i = rb.const_i32(0);
                 let sum = rb.const_i32(0);
-                let res = rb.theta(state, &[i, sum], |rb| {
+                let res = rb.theta(&[i, sum], |rb| {
                     let loop_i = rb.param(0);
                     let loop_sum = rb.param(1);
 
                     // GEP arr[loop_i]
                     let elem_ptr =
                         rb.ptr_offset(arr_ptr, arr_ty, &[zero_idx, loop_i], i32_ptr_ty, true);
-                    let loaded = rb.load(state, elem_ptr, I32, None, false);
-                    let next_sum = rb.binary(
-                        BinaryOp::Add,
-                        ArithFlags::default(),
-                        loop_sum,
-                        loaded.value,
-                        I32,
-                    );
+                    let loaded = rb.load(elem_ptr, I32, None, false);
+                    let next_sum =
+                        rb.binary(BinaryOp::Add, ArithFlags::default(), loop_sum, loaded, I32);
 
                     let one = rb.const_i32(1);
                     let next_i = rb.binary(BinaryOp::Add, ArithFlags::default(), loop_i, one, I32);
@@ -737,14 +682,10 @@ mod tests {
                     let cond = rb.icmp(ICmpPred::SignedLt, next_i, five);
                     Ok(LoopResult {
                         condition: cond,
-                        next_state: loaded.state,
                         next_vars: vec![next_i, next_sum],
                     })
                 })?;
-                Ok(FnResult {
-                    state: res.state,
-                    values: vec![res.result(1)],
-                })
+                Ok(vec![res.result(1)])
             })
             .unwrap();
         assert_eq!(jit_run_i32(&rvsdg, "test"), 15);
@@ -770,7 +711,7 @@ mod tests {
         let agg_id = rvsdg.tables.constants.aggregate(arr_ty, &elems);
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg
-            .define_fn(func_id, |rb, state| {
+            .define_fn(func_id, |rb| {
                 let arr = rb.const_pool_ref(agg_id, arr_ty);
                 let new_val = rb.const_i32(99);
                 let modified = rb.insert_field(arr, new_val, &[1], arr_ty);
@@ -779,10 +720,7 @@ mod tests {
                 let e2 = rb.extract_field(modified, &[2], I32);
                 let sum01 = rb.binary(BinaryOp::Add, ArithFlags::default(), e0, e1, I32);
                 let total = rb.binary(BinaryOp::Add, ArithFlags::default(), sum01, e2, I32);
-                Ok(FnResult {
-                    state,
-                    values: vec![total],
-                })
+                Ok(vec![total])
             })
             .unwrap();
         assert_eq!(jit_run_i32(&rvsdg, "test"), 103);
@@ -795,20 +733,21 @@ mod tests {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
         let e0 = rvsdg.tables.constants.scalar(I32, ConstValue::Int(10));
         let e1 = rvsdg.tables.constants.scalar(I32, ConstValue::Int(20));
-        let agg_id = rvsdg.tables.constants.aggregate(TypeRef::State, &[e0, e1]);
+        let agg_id = rvsdg
+            .tables
+            .constants
+            .aggregate(TypeRef::State(StateKind::InputOutput), &[e0, e1]);
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg
-            .define_fn(func_id, |rb, state| {
-                let s = rb.const_pool_ref(agg_id, TypeRef::State);
+            .define_fn(func_id, |rb| {
+                let s = rb.const_pool_ref(agg_id, TypeRef::State(StateKind::InputOutput));
                 let new_val = rb.const_i32(50);
-                let modified = rb.insert_field(s, new_val, &[0], TypeRef::State);
+                let modified =
+                    rb.insert_field(s, new_val, &[0], TypeRef::State(StateKind::InputOutput));
                 let a = rb.extract_field(modified, &[0], I32);
                 let b = rb.extract_field(modified, &[1], I32);
                 let sum = rb.binary(BinaryOp::Add, ArithFlags::default(), a, b, I32);
-                Ok(FnResult {
-                    state,
-                    values: vec![sum],
-                })
+                Ok(vec![sum])
             })
             .unwrap();
         assert_eq!(jit_run_i32(&rvsdg, "test"), 70);
@@ -824,21 +763,19 @@ mod tests {
         let agg_id = rvsdg
             .tables
             .constants
-            .aggregate(TypeRef::State, &[e0, e1, e2]);
+            .aggregate(TypeRef::State(StateKind::InputOutput), &[e0, e1, e2]);
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg
-            .define_fn(func_id, |rb, state| {
-                let s = rb.const_pool_ref(agg_id, TypeRef::State);
+            .define_fn(func_id, |rb| {
+                let s = rb.const_pool_ref(agg_id, TypeRef::State(StateKind::InputOutput));
                 let new_val = rb.const_i32(999);
-                let modified = rb.insert_field(s, new_val, &[2], TypeRef::State);
+                let modified =
+                    rb.insert_field(s, new_val, &[2], TypeRef::State(StateKind::InputOutput));
                 // field 0 should still be 100, field 1 should be 200
                 let a = rb.extract_field(modified, &[0], I32);
                 let b = rb.extract_field(modified, &[1], I32);
                 let sum = rb.binary(BinaryOp::Add, ArithFlags::default(), a, b, I32);
-                Ok(FnResult {
-                    state,
-                    values: vec![sum],
-                })
+                Ok(vec![sum])
             })
             .unwrap();
         assert_eq!(jit_run_i32(&rvsdg, "test"), 300);
@@ -851,22 +788,22 @@ mod tests {
         let mut rvsdg = RVSDGMod::new_host(String::from("test"));
         let e0 = rvsdg.tables.constants.scalar(I32, ConstValue::Int(0));
         let e1 = rvsdg.tables.constants.scalar(I32, ConstValue::Int(0));
-        let agg_id = rvsdg.tables.constants.aggregate(TypeRef::State, &[e0, e1]);
+        let agg_id = rvsdg
+            .tables
+            .constants
+            .aggregate(TypeRef::State(StateKind::InputOutput), &[e0, e1]);
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg
-            .define_fn(func_id, |rb, state| {
-                let s = rb.const_pool_ref(agg_id, TypeRef::State);
+            .define_fn(func_id, |rb| {
+                let s = rb.const_pool_ref(agg_id, TypeRef::State(StateKind::InputOutput));
                 let ten = rb.const_i32(10);
                 let twenty = rb.const_i32(20);
-                let s1 = rb.insert_field(s, ten, &[0], TypeRef::State);
-                let s2 = rb.insert_field(s1, twenty, &[1], TypeRef::State);
+                let s1 = rb.insert_field(s, ten, &[0], TypeRef::State(StateKind::InputOutput));
+                let s2 = rb.insert_field(s1, twenty, &[1], TypeRef::State(StateKind::InputOutput));
                 let a = rb.extract_field(s2, &[0], I32);
                 let b = rb.extract_field(s2, &[1], I32);
                 let sum = rb.binary(BinaryOp::Add, ArithFlags::default(), a, b, I32);
-                Ok(FnResult {
-                    state,
-                    values: vec![sum],
-                })
+                Ok(vec![sum])
             })
             .unwrap();
         assert_eq!(jit_run_i32(&rvsdg, "test"), 30);
@@ -883,17 +820,16 @@ mod tests {
         let ptr_ty = make_ptr_ty(&mut rvsdg, I32);
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg
-            .define_fn(func_id, |rb, state| {
+            .define_fn(func_id, |rb| {
                 let one = rb.const_i32(1);
-                let alloc = rb.alloca(state, I32, one, ptr_ty, None);
+                let alloc = rb.alloca(I32, one, ptr_ty, None);
                 let ten = rb.const_i32(10);
-                let s1 = rb.store(alloc.state, alloc.ptr, ten, None, false);
+                rb.store(alloc, ten, None, false);
 
                 let expected = rb.const_i32(10);
                 let desired = rb.const_i32(42);
                 let cas = rb.compare_and_swap(
-                    s1,
-                    alloc.ptr,
+                    alloc,
                     expected,
                     desired,
                     MemoryOrdering::SequentiallyConsistent,
@@ -902,10 +838,7 @@ mod tests {
                     false,
                 );
                 // old_value should be 10 (what was there before)
-                Ok(FnResult {
-                    state: cas.state,
-                    values: vec![cas.old_value],
-                })
+                Ok(vec![cas.old_value])
             })
             .unwrap();
         assert_eq!(jit_run_i32(&rvsdg, "test"), 10);
@@ -919,17 +852,16 @@ mod tests {
         let ptr_ty = make_ptr_ty(&mut rvsdg, I32);
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg
-            .define_fn(func_id, |rb, state| {
+            .define_fn(func_id, |rb| {
                 let one = rb.const_i32(1);
-                let alloc = rb.alloca(state, I32, one, ptr_ty, None);
+                let alloc = rb.alloca(I32, one, ptr_ty, None);
                 let ten = rb.const_i32(10);
-                let s1 = rb.store(alloc.state, alloc.ptr, ten, None, false);
+                rb.store(alloc, ten, None, false);
 
                 let expected = rb.const_i32(10);
                 let desired = rb.const_i32(42);
-                let cas = rb.compare_and_swap(
-                    s1,
-                    alloc.ptr,
+                rb.compare_and_swap(
+                    alloc,
                     expected,
                     desired,
                     MemoryOrdering::SequentiallyConsistent,
@@ -938,11 +870,8 @@ mod tests {
                     false,
                 );
                 // load should now return 42
-                let loaded = rb.load(cas.state, alloc.ptr, I32, None, false);
-                Ok(FnResult {
-                    state: loaded.state,
-                    values: vec![loaded.value],
-                })
+                let loaded = rb.load(alloc, I32, None, false);
+                Ok(vec![loaded])
             })
             .unwrap();
         assert_eq!(jit_run_i32(&rvsdg, "test"), 42);
@@ -957,17 +886,16 @@ mod tests {
         let ptr_ty = make_ptr_ty(&mut rvsdg, I32);
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg
-            .define_fn(func_id, |rb, state| {
+            .define_fn(func_id, |rb| {
                 let one = rb.const_i32(1);
-                let alloc = rb.alloca(state, I32, one, ptr_ty, None);
+                let alloc = rb.alloca(I32, one, ptr_ty, None);
                 let ten = rb.const_i32(10);
-                let s1 = rb.store(alloc.state, alloc.ptr, ten, None, false);
+                rb.store(alloc, ten, None, false);
 
                 let wrong_expected = rb.const_i32(99);
                 let desired = rb.const_i32(42);
-                let cas = rb.compare_and_swap(
-                    s1,
-                    alloc.ptr,
+                rb.compare_and_swap(
+                    alloc,
                     wrong_expected,
                     desired,
                     MemoryOrdering::SequentiallyConsistent,
@@ -976,11 +904,8 @@ mod tests {
                     false,
                 );
                 // CAS failed, value unchanged, load should return 10
-                let loaded = rb.load(cas.state, alloc.ptr, I32, None, false);
-                Ok(FnResult {
-                    state: loaded.state,
-                    values: vec![loaded.value],
-                })
+                let loaded = rb.load(alloc, I32, None, false);
+                Ok(vec![loaded])
             })
             .unwrap();
         assert_eq!(jit_run_i32(&rvsdg, "test"), 10);
@@ -994,17 +919,16 @@ mod tests {
         let ptr_ty = make_ptr_ty(&mut rvsdg, I32);
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg
-            .define_fn(func_id, |rb, state| {
+            .define_fn(func_id, |rb| {
                 let one = rb.const_i32(1);
-                let alloc = rb.alloca(state, I32, one, ptr_ty, None);
+                let alloc = rb.alloca(I32, one, ptr_ty, None);
                 let ten = rb.const_i32(10);
-                let s1 = rb.store(alloc.state, alloc.ptr, ten, None, false);
+                rb.store(alloc, ten, None, false);
 
                 let expected = rb.const_i32(10);
                 let desired = rb.const_i32(42);
                 let cas = rb.compare_and_swap(
-                    s1,
-                    alloc.ptr,
+                    alloc,
                     expected,
                     desired,
                     MemoryOrdering::SequentiallyConsistent,
@@ -1013,10 +937,7 @@ mod tests {
                     false,
                 );
                 let flag = rb.cast(CastOp::ZeroExtend, cas.success, I32);
-                Ok(FnResult {
-                    state: cas.state,
-                    values: vec![flag],
-                })
+                Ok(vec![flag])
             })
             .unwrap();
         assert_eq!(jit_run_i32(&rvsdg, "test"), 1);
@@ -1030,17 +951,16 @@ mod tests {
         let ptr_ty = make_ptr_ty(&mut rvsdg, I32);
         let func_id = rvsdg.declare_fn(String::from("test"), &[], &[I32], Linkage::External);
         rvsdg
-            .define_fn(func_id, |rb, state| {
+            .define_fn(func_id, |rb| {
                 let one = rb.const_i32(1);
-                let alloc = rb.alloca(state, I32, one, ptr_ty, None);
+                let alloc = rb.alloca(I32, one, ptr_ty, None);
                 let ten = rb.const_i32(10);
-                let s1 = rb.store(alloc.state, alloc.ptr, ten, None, false);
+                rb.store(alloc, ten, None, false);
 
                 let wrong = rb.const_i32(99);
                 let desired = rb.const_i32(42);
                 let cas = rb.compare_and_swap(
-                    s1,
-                    alloc.ptr,
+                    alloc,
                     wrong,
                     desired,
                     MemoryOrdering::SequentiallyConsistent,
@@ -1049,10 +969,7 @@ mod tests {
                     false,
                 );
                 let flag = rb.cast(CastOp::ZeroExtend, cas.success, I32);
-                Ok(FnResult {
-                    state: cas.state,
-                    values: vec![flag],
-                })
+                Ok(vec![flag])
             })
             .unwrap();
         assert_eq!(jit_run_i32(&rvsdg, "test"), 0);

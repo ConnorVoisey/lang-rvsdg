@@ -3,6 +3,7 @@ use color_eyre::eyre::eyre;
 use crate::rvsdg::{
     MatchArmPool, MatchArmSpan, RVSDGMod, RegionId, RegionPool, RegionsSpan, State, U32Pool,
     U32Span, ValueId, ValueKind, ValuePool, ValuesSpan, function_graph::FunctionGraph,
+    types::TypeRef,
 };
 
 /// Counters only this pass can produce cheaply: slot-level interface
@@ -45,10 +46,14 @@ impl FunctionGraph {
     /// Signature-fixed nodes (calls, loads, compare-and-swap, ...)
     /// own their projection layout: a live node keeps every
     /// projection, used or not, so the adjacency contract
-    /// (projection_of) survives compaction. Gamma/theta
-    /// projections are per-slot and stay dead with their slot. A
-    /// projection's only operand is its node, so this sweep never
-    /// creates new work for the mark loop.
+    /// (projection_of) survives compaction. Gamma/theta projections
+    /// are per-slot and stay dead with their slot -- state projections
+    /// included: a chain the reroute pass stepped around leaves its
+    /// projection unconsumed, and keeping it would carry a dead value
+    /// per bypassed slot to emission. Consumers find surviving state
+    /// projections by type, not position. A projection's only operand
+    /// is its node, so this sweep never creates new work for the mark
+    /// loop.
     fn pin_projections(&self, alive: &mut [bool], effects: &mut DneEffects) {
         for index in 0..self.value_kinds.len() {
             if let ValueKind::Project { call, .. } = self.value_kinds[index] {
@@ -70,9 +75,9 @@ impl FunctionGraph {
         // returns is assumed needed.
         let body = RegionId(0);
         let mut stack = self.region_results(body).to_vec();
-        stack.push(self.get_region(body).exit_state.0);
+        stack.extend_from_slice(self.region_state_results(body));
         stack.extend_from_slice(self.region_params(body));
-        stack.push(self.get_region(body).entry_state.0);
+        stack.extend_from_slice(self.region_state_params(body));
 
         while let Some(value_id) = stack.pop() {
             if alive[value_id.0 as usize] {
@@ -80,102 +85,54 @@ impl FunctionGraph {
             }
             alive[value_id.0 as usize] = true;
 
-            // require a custom walker to traverse operands,
-            // need state and to visit regions, theta and gamma must be handled specially to remove
-            // redundant pass through
+            // Constructs, projections and parameters demand per-slot;
+            // every other kind's operands come from the shared walkers
+            // (data operands via for_each_value_operand, chain operands
+            // via the ValueKind state-operand accessors).
             match self.get_value_kind(value_id) {
-                ValueKind::Fence { state, .. } => {
-                    stack.push(state.0);
-                }
-                ValueKind::Load {
-                    state, addr: val, ..
-                }
-                | ValueKind::Alloca {
-                    state, count: val, ..
-                }
-                | ValueKind::AtomicLoad {
-                    state, addr: val, ..
-                } => {
-                    stack.push(state.0);
-                    stack.push(*val);
-                }
-                ValueKind::AtomicStore {
-                    state, addr, value, ..
-                }
-                | ValueKind::Store {
-                    state, addr, value, ..
-                }
-                | ValueKind::AtomicReadModifyWrite {
-                    state, addr, value, ..
-                } => {
-                    stack.push(state.0);
-                    stack.push(*addr);
-                    stack.push(*value);
-                }
-                ValueKind::CompareAndSwap {
-                    state,
-                    addr,
-                    expected,
-                    desired,
-                    ..
-                } => {
-                    stack.push(state.0);
-                    stack.push(*addr);
-                    stack.push(*expected);
-                    stack.push(*desired);
-                }
-                ValueKind::Intrinsic { state, args, .. } | ValueKind::Call { state, args, .. } => {
-                    stack.push(state.0);
-                    stack.extend_from_slice(self.value_pool.get(*args));
-                }
-                ValueKind::CallIndirect {
-                    state,
-                    callee,
-                    args,
-                    ..
-                } => {
-                    stack.push(state.0);
-                    stack.push(*callee);
-                    stack.extend_from_slice(self.value_pool.get(*args));
-                }
                 // A live theta always needs its repetition predicate and
-                // its body's state chain. Its loop variable slots are NOT
-                // blanket-marked: each slot is demanded individually,
-                // through its projection (used after the loop) or its
-                // body parameter (used by something live inside).
+                // its body's state chains -- both sides: the exit tail
+                // (chains inside) and the entry tail (the parent-side
+                // values the construct chains from). Its loop variable
+                // slots are NOT blanket-marked: each slot is demanded
+                // individually, through its projection (used after the
+                // loop) or its body parameter (used by something live
+                // inside).
                 ValueKind::Theta {
                     condition,
-                    state,
                     region_id,
                     ..
                 } => {
                     stack.push(*condition);
-                    stack.push(state.0);
-                    stack.push(self.regions[region_id.0 as usize].exit_state.0);
+                    stack.extend_from_slice(self.region_state_params(*region_id));
+                    stack.extend_from_slice(self.region_state_results(*region_id));
                 }
-                // Same for a live gamma: predicate, state, and every
-                // arm's state chain. Inputs are demanded through arm
-                // parameters, result slots through projections.
+                // Same for a live gamma: predicate and every arm's state
+                // tails (entries are identical across arms). Inputs are
+                // demanded through arm parameters, result slots through
+                // projections.
                 ValueKind::Gamma {
-                    condition,
-                    state,
-                    regions,
-                    ..
+                    condition, regions, ..
                 } => {
                     stack.push(*condition);
-                    stack.push(state.0);
                     for &arm in self.region_pool.get(*regions) {
-                        stack.push(self.regions[arm.0 as usize].exit_state.0);
+                        stack.extend_from_slice(self.region_state_params(arm));
+                        stack.extend_from_slice(self.region_state_results(arm));
                     }
                 }
                 // A used projection is a demanded result slot: the node
                 // itself, plus the values feeding that slot inside each
                 // subregion. Signature-fixed nodes (calls, loads, ...)
                 // have no per-slot choice; their layout is pinned by the
-                // sweep in opt_dead_node_elimination instead.
+                // sweep in opt_dead_node_elimination instead. A STATE
+                // projection has no value slot: its feeding values are
+                // the exit tails, which the construct marks whole.
                 ValueKind::Project { call, index } => {
                     stack.push(*call);
                     let index = *index;
+                    if matches!(self.get_value_type(value_id), TypeRef::State(_)) {
+                        continue;
+                    }
                     match self.get_value_kind(*call) {
                         ValueKind::Gamma { regions, .. } => {
                             for &arm in self.region_pool.get(*regions) {
@@ -219,9 +176,15 @@ impl FunctionGraph {
                         }
                     }
                 }
-                // this is inefficent since we're rematching, but it prevents duping the logic of
-                // the non special cases
-                _ => self.for_each_value_operand(value_id, |op_id| stack.push(op_id)),
+                kind => {
+                    self.for_each_value_operand(value_id, |op_id| stack.push(op_id));
+                    if let Some(state) = kind.memory_state_operand() {
+                        stack.push(state.0);
+                    }
+                    if let Some(io) = kind.io_state_operand() {
+                        stack.push(io.0);
+                    }
+                }
             }
         }
 
@@ -248,7 +211,6 @@ impl FunctionGraph {
         stack.push(self.projection_of(theta, index));
     }
 
-    #[tracing::instrument(skip_all)]
     fn remove_dead_nodes(&mut self, alive: &[bool], effects: &mut DneEffects) {
         debug_assert_eq!(alive.len(), self.value_kinds.len());
 
@@ -309,10 +271,12 @@ impl FunctionGraph {
         self.value_kinds.truncate(live_values as usize);
         self.value_types.truncate(live_values as usize);
 
-        // Three lists per region, alive together so the shared block
-        // writer sees the whole layout at once (params reuse `scratch`).
+        // The region's lists, alive together so the shared block writer
+        // sees the whole layout at once (params reuse `scratch`).
         let mut results_scratch: Vec<ValueId> = Vec::new();
         let mut nodes_scratch: Vec<ValueId> = Vec::new();
+        let mut state_params_scratch: Vec<ValueId> = Vec::new();
+        let mut state_results_scratch: Vec<ValueId> = Vec::new();
 
         // Slide live regions the same way. This runs after the value
         // pass because remap_kind reads the OLD regions: parameter
@@ -359,30 +323,30 @@ impl FunctionGraph {
                 }
             }
 
+            // State tails: every entry is rooted by the mark phase, so
+            // they are remapped whole, never masked.
+            state_params_scratch.clear();
+            for &state_param in self.region_state_params(RegionId(new)) {
+                state_params_scratch.push(ValueId(value_mapper[state_param.0 as usize]));
+            }
+            state_results_scratch.clear();
+            for &state_result in self.region_state_results(RegionId(new)) {
+                state_results_scratch.push(ValueId(value_mapper[state_result.0 as usize]));
+            }
+
             let region = &mut self.regions[new as usize];
             region.write_blocks(
                 &mut fresh.value_pool,
                 &scratch,
+                &state_params_scratch,
                 &results_scratch,
+                &state_results_scratch,
                 &nodes_scratch,
             );
             effects.result_entries_dropped += (old_results_len - region.results_len) as u64;
             if old != 0 {
                 region.owner = ValueId(value_mapper[owner_old.0 as usize]);
             }
-            // States are remapped poison-blind everywhere else by
-            // design; these two are the only remaps with no assert
-            // between them and a use-site panic, so check here.
-            debug_assert!(
-                alive[region.entry_state.0.0 as usize],
-                "region {old}: entry state target is dead"
-            );
-            debug_assert!(
-                alive[region.exit_state.0.0 as usize],
-                "region {old}: exit state target is dead"
-            );
-            region.entry_state = State(ValueId(value_mapper[region.entry_state.0.0 as usize]));
-            region.exit_state = State(ValueId(value_mapper[region.exit_state.0.0 as usize]));
         }
         self.regions.truncate(live_regions as usize);
 
@@ -627,28 +591,41 @@ fn remap_kind(kind: &mut ValueKind, old_id: ValueId, ctx: &mut RemapContext) {
             *input = ctx.map_value(*input);
             *arms = ctx.repool_match_arms(*arms);
         }
-        ValueKind::Intrinsic { state, args, .. } | ValueKind::Call { state, args, .. } => {
+        ValueKind::Intrinsic { state, args, .. } => {
             *state = ctx.map_state(*state);
             *args = ctx.repool_values(*args);
         }
+        ValueKind::Call {
+            state,
+            io_state,
+            args,
+            ..
+        } => {
+            *state = ctx.map_state(*state);
+            *io_state = ctx.map_state(*io_state);
+            *args = ctx.repool_values(*args);
+        }
+        ValueKind::StateMerge { inputs } => {
+            *inputs = ctx.repool_values(*inputs);
+        }
         ValueKind::CallIndirect {
             state,
+            io_state,
             callee,
             args,
             ..
         } => {
             *state = ctx.map_state(*state);
+            *io_state = ctx.map_state(*io_state);
             *callee = ctx.map_value(*callee);
             *args = ctx.repool_values(*args);
         }
         ValueKind::Theta {
             loop_vars,
             condition,
-            state,
             region_id,
         } => {
             *condition = ctx.map_value(*condition);
-            *state = ctx.map_state(*state);
             let alive = ctx.alive;
             // Copy the graph reference out of ctx so the params slice
             // does not hold a borrow of ctx across the &mut repool call.
@@ -673,11 +650,9 @@ fn remap_kind(kind: &mut ValueKind, old_id: ValueId, ctx: &mut RemapContext) {
         ValueKind::Gamma {
             condition,
             inputs,
-            state,
             regions,
         } => {
             *condition = ctx.map_value(*condition);
-            *state = ctx.map_state(*state);
             // Input slots are aligned across arms, so any arm's
             // parameter liveness is THE slot mask; arms themselves
             // always survive with their construct.
@@ -705,15 +680,24 @@ fn remap_kind(kind: &mut ValueKind, old_id: ValueId, ctx: &mut RemapContext) {
             *call = ctx.map_value(*call);
         }
         ValueKind::RegionParam { index, region, .. } => {
-            // New index = live parameters before this one. The entry
-            // state parameter sits one past the params list (its index
-            // equals the list length), so counting the whole list gives
-            // its new one-past position.
+            // New index = live parameters before this one. The state
+            // parameters sit past the value params at fixed offsets
+            // (memory, io; never masked), so they shift together with
+            // value-param compaction and keep their relative order.
             let params = ctx.graph.region_params(*region);
-            *index = params[..*index as usize]
-                .iter()
-                .filter(|param| ctx.alive[param.0 as usize])
-                .count() as u32;
+            let old = *index as usize;
+            *index = if old >= params.len() {
+                let live = params
+                    .iter()
+                    .filter(|param| ctx.alive[param.0 as usize])
+                    .count();
+                (live + (old - params.len())) as u32
+            } else {
+                params[..old]
+                    .iter()
+                    .filter(|param| ctx.alive[param.0 as usize])
+                    .count() as u32
+            };
             *region = ctx.map_region(*region);
         }
     }
@@ -727,8 +711,7 @@ mod tests {
     use crate::rvsdg::{
         ArithFlags, BinaryOp, ConstValue, ICmpPred, Linkage, RVSDGMod, RegionId, ValueId,
         ValueKind,
-        builder::{BranchResult, LoopResult},
-        func::FnResult,
+        builder::LoopResult,
         function_graph::FunctionGraph,
         types::{BOOL, I32, PtrType, TypeRef},
     };
@@ -827,16 +810,13 @@ mod tests {
         let mut m = RVSDGMod::new_host(String::from("test"));
         let f = m.declare_fn(String::from("f"), &[I32, I32], &[I32], Linkage::Internal);
         let ids: Cell<Option<(ValueId, ValueId, ValueId, ValueId)>> = Cell::new(None);
-        m.define_fn(f, |rb, state| {
+        m.define_fn(f, |rb| {
             let x = rb.param(0);
             let y = rb.param(1);
             let dead = rb.binary(BinaryOp::Mul, ArithFlags::default(), x, y, I32);
             let live = rb.binary(BinaryOp::Add, ArithFlags::default(), x, y, I32);
             ids.set(Some((x, y, dead, live)));
-            Ok(FnResult {
-                state,
-                values: vec![live],
-            })
+            Ok(vec![live])
         })
         .unwrap();
         let (x, y, dead, live) = ids.get().unwrap();
@@ -851,28 +831,36 @@ mod tests {
 
     /// Nothing loads the slot back, so the alloca and both stores are
     /// reachable only through exit_state and then each node's state
-    /// operand. The whole chain must be marked.
+    /// operand. The whole chain must be marked. The builder hands out no
+    /// state node ids, so the targets are located by kind afterwards.
     #[test]
     fn mark_follows_state_chain_from_exit_state() {
         let mut m = RVSDGMod::new_host(String::from("test"));
         let ptr = ptr_ty(&mut m);
         let f = m.declare_fn(String::from("f"), &[I32], &[I32], Linkage::Internal);
-        let ids: Cell<Option<(ValueId, ValueId, ValueId)>> = Cell::new(None);
-        m.define_fn(f, |rb, state| {
+        m.define_fn(f, |rb| {
             let x = rb.param(0);
             let one = rb.const_i32(1);
-            let alloc = rb.alloca(state, I32, one, ptr, None);
-            let s1 = rb.store(alloc.state, alloc.ptr, x, None, false);
+            let slot = rb.alloca(I32, one, ptr, None);
+            rb.store(slot, x, None, false);
             let two = rb.const_i32(2);
-            let s2 = rb.store(s1, alloc.ptr, two, None, false);
-            ids.set(Some((alloc.state.0, s1.0, s2.0)));
-            Ok(FnResult {
-                state: s2,
-                values: vec![x],
-            })
+            rb.store(slot, two, None, false);
+            Ok(vec![x])
         })
         .unwrap();
-        let (alloca, store_1, store_2) = ids.get().unwrap();
+        let graph = graph(&m);
+        let find = |want: fn(&ValueKind) -> bool| -> Vec<ValueId> {
+            (0..graph.value_kinds.len() as u32)
+                .map(ValueId)
+                .filter(|&id| want(graph.get_value_kind(id)))
+                .collect()
+        };
+        let [alloca] = find(|k| matches!(k, ValueKind::Alloca { .. }))[..] else {
+            panic!("expected exactly one alloca");
+        };
+        let [store_1, store_2] = find(|k| matches!(k, ValueKind::Store { .. }))[..] else {
+            panic!("expected exactly two stores");
+        };
 
         let alive = mark_alive(&m);
 
@@ -897,10 +885,10 @@ mod tests {
         let mut m = RVSDGMod::new_host(String::from("test"));
         let f = m.declare_fn(String::from("f"), &[I32, I32], &[I32], Linkage::Internal);
         let ids: Cell<Option<(ValueId, ValueId, ValueId, ValueId)>> = Cell::new(None);
-        m.define_fn(f, |rb, state| {
+        m.define_fn(f, |rb| {
             let init_i = rb.param(0);
             let init_j = rb.param(1);
-            let res = rb.theta(state, &[init_i, init_j], |rb| {
+            let res = rb.theta(&[init_i, init_j], |rb| {
                 let i = rb.param(0);
                 let j = rb.param(1);
                 let one = rb.const_i32(1);
@@ -912,16 +900,12 @@ mod tests {
                 ids.set(Some((j, next_j, next_i, ValueId(0))));
                 Ok(LoopResult {
                     condition,
-                    next_state: state,
                     next_vars: vec![next_i, next_j],
                 })
             })?;
             let (j_param, next_j, next_i, _) = ids.get().unwrap();
             ids.set(Some((j_param, next_j, next_i, res.result(1))));
-            Ok(FnResult {
-                state: res.state,
-                values: vec![res.result(0)],
-            })
+            Ok(vec![res.result(0)])
         })
         .unwrap();
         let (j_param, next_j, next_i, j_projection) = ids.get().unwrap();
@@ -942,7 +926,7 @@ mod tests {
         let mut m = RVSDGMod::new_host(String::from("test"));
         let f = m.declare_fn(String::from("f"), &[I32], &[I32], Linkage::Internal);
         let ids: Cell<Option<(ValueId, ValueId, ValueId)>> = Cell::new(None);
-        m.define_fn(f, |rb, state| {
+        m.define_fn(f, |rb| {
             let x = rb.param(0);
             let dead_input = rb.binary(BinaryOp::Mul, ArithFlags::default(), x, x, I32);
             let flag = rb.constant(BOOL, ConstValue::Int(1));
@@ -951,23 +935,16 @@ mod tests {
             let false_param: Cell<Option<ValueId>> = Cell::new(None);
             let res = rb.gamma(
                 predicate,
-                state,
                 &[dead_input],
                 |rb| {
                     true_param.set(Some(rb.param(0)));
                     let zero = rb.const_i32(0);
-                    Ok(BranchResult {
-                        state,
-                        values: vec![zero],
-                    })
+                    Ok(vec![zero])
                 },
                 |rb| {
                     false_param.set(Some(rb.param(0)));
                     let one = rb.const_i32(1);
-                    Ok(BranchResult {
-                        state,
-                        values: vec![one],
-                    })
+                    Ok(vec![one])
                 },
             )?;
             ids.set(Some((
@@ -975,10 +952,7 @@ mod tests {
                 true_param.get().unwrap(),
                 false_param.get().unwrap(),
             )));
-            Ok(FnResult {
-                state: res.state,
-                values: vec![res.result(0)],
-            })
+            Ok(vec![res.result(0)])
         })
         .unwrap();
         let (dead_input, true_param, false_param) = ids.get().unwrap();
@@ -1004,15 +978,12 @@ mod tests {
     fn remove_drops_flagged_nodes_and_rewires() {
         let mut m = RVSDGMod::new_host(String::from("test"));
         let f = m.declare_fn(String::from("f"), &[I32, I32], &[I32], Linkage::Internal);
-        m.define_fn(f, |rb, state| {
+        m.define_fn(f, |rb| {
             let x = rb.param(0);
             let y = rb.param(1);
             let _dead = rb.binary(BinaryOp::Mul, ArithFlags::default(), x, y, I32);
             let live = rb.binary(BinaryOp::Add, ArithFlags::default(), x, y, I32);
-            Ok(FnResult {
-                state,
-                values: vec![live],
-            })
+            Ok(vec![live])
         })
         .unwrap();
         let nodes_before = count_nodes(&m, |_| true);
@@ -1055,13 +1026,10 @@ mod tests {
     fn remove_with_all_alive_changes_nothing() {
         let mut m = RVSDGMod::new_host(String::from("test"));
         let f = m.declare_fn(String::from("f"), &[I32], &[I32], Linkage::Internal);
-        m.define_fn(f, |rb, state| {
+        m.define_fn(f, |rb| {
             let x = rb.param(0);
             let doubled = rb.binary(BinaryOp::Add, ArithFlags::default(), x, x, I32);
-            Ok(FnResult {
-                state,
-                values: vec![doubled],
-            })
+            Ok(vec![doubled])
         })
         .unwrap();
         let nodes_before = count_nodes(&m, |_| true);
@@ -1073,42 +1041,34 @@ mod tests {
         assert_eq!(count_nodes(&m, |_| true), nodes_before);
     }
 
-    /// A dead gamma leaves dead spans behind (its inputs, both arms'
-    /// results, its regions span): reconstruction repools, so the pools
-    /// shrink to live spans only instead of keeping holes.
+    /// Dead slots leave dead pool spans behind (here: a gamma input
+    /// neither arm reads, and its per-arm parameter): reconstruction
+    /// repools, so the pools shrink to live spans only instead of
+    /// keeping holes.
     #[test]
     fn pools_are_compacted() {
         let mut m = RVSDGMod::new_host(String::from("test"));
         let f = m.declare_fn(String::from("f"), &[I32, I32], &[I32], Linkage::Internal);
-        m.define_fn(f, |rb, state| {
+        m.define_fn(f, |rb| {
             let x = rb.param(0);
             let y = rb.param(1);
             let flag = rb.constant(BOOL, ConstValue::Int(1));
             let predicate = rb.bool_predicate(flag);
-            let _unused = rb.gamma(
+            // Input slot 1 (y) is dead: neither arm reads its param.
+            let res = rb.gamma(
                 predicate,
-                state,
                 &[x, y],
                 |rb| {
                     let a = rb.param(0);
-                    Ok(BranchResult {
-                        state,
-                        values: vec![a],
-                    })
+                    Ok(vec![a])
                 },
                 |rb| {
-                    let b = rb.param(1);
-                    Ok(BranchResult {
-                        state,
-                        values: vec![b],
-                    })
+                    let a = rb.param(0);
+                    Ok(vec![a])
                 },
             )?;
-            let live = rb.binary(BinaryOp::Add, ArithFlags::default(), x, y, I32);
-            Ok(FnResult {
-                state,
-                values: vec![live],
-            })
+            let live = rb.binary(BinaryOp::Add, ArithFlags::default(), res.result(0), y, I32);
+            Ok(vec![live])
         })
         .unwrap();
         let value_pool_before = graph(&m).value_pool.len();
@@ -1119,22 +1079,19 @@ mod tests {
         assert_verified(&m);
         assert!(
             graph(&m).value_pool.len() < value_pool_before,
-            "dead gamma spans reclaimed: {} -> {}",
+            "dead slot spans reclaimed: {} -> {}",
             value_pool_before,
             graph(&m).value_pool.len()
         );
-        assert!(
-            graph(&m).region_pool.len() < region_pool_before,
-            "dead regions span reclaimed: {} -> {}",
-            region_pool_before,
-            graph(&m).region_pool.len()
-        );
-        // The pool holds exactly the body region's rebuilt blocks: two
-        // params + one result (the interface block) + the one live node
-        // (the returned Add). The dead gamma's spans and blocks are all
-        // reclaimed.
-        assert_eq!(graph(&m).value_pool.len(), 4);
-        assert_eq!(graph(&m).region_pool.len(), 0);
+        // The gamma is live (the state chain threads through it), so its
+        // regions span survives whole.
+        assert_eq!(graph(&m).region_pool.len(), region_pool_before);
+        // Rebuilt blocks, live content only. Body: two params + two state
+        // params (memory, io) + one result + two state results + six
+        // nodes (match, gamma, its data projection, its two state
+        // projections, add) + the gamma's one-entry input span. Each arm:
+        // one param + two state params + one result + two state results.
+        assert_eq!(graph(&m).value_pool.len(), 14 + 6 + 6);
     }
 
     /// Layer-1 observability: the pipeline returns one report per pass
@@ -1144,7 +1101,7 @@ mod tests {
     fn pass_report_carries_shape_delta_and_slot_counters() {
         let mut m = RVSDGMod::new_host(String::from("test"));
         let f = m.declare_fn(String::from("f"), &[I32], &[I32], Linkage::Internal);
-        m.define_fn(f, |rb, state| {
+        m.define_fn(f, |rb| {
             let x = rb.param(0);
             // One dead gamma input slot: neither arm reads param 0.
             let dead_input = rb.binary(BinaryOp::Mul, ArithFlags::default(), x, x, I32);
@@ -1152,27 +1109,20 @@ mod tests {
             let predicate = rb.bool_predicate(flag);
             let picked = rb.gamma(
                 predicate,
-                state,
                 &[dead_input],
                 |rb| {
                     let zero = rb.const_i32(0);
-                    Ok(BranchResult {
-                        state,
-                        values: vec![zero],
-                    })
+                    Ok(vec![zero])
                 },
                 |rb| {
                     let one = rb.const_i32(1);
-                    Ok(BranchResult {
-                        state,
-                        values: vec![one],
-                    })
+                    Ok(vec![one])
                 },
             )?;
             // One dead theta slot: j feeds only its own next value. The
             // gamma output inits the LIVE slot i, so the gamma's result
             // slot stays live and the counters below stay independent.
-            let res = rb.theta(picked.state, &[picked.result(0), x], |rb| {
+            let res = rb.theta(&[picked.result(0), x], |rb| {
                 let i = rb.param(0);
                 let j = rb.param(1);
                 let one = rb.const_i32(1);
@@ -1182,25 +1132,21 @@ mod tests {
                 let condition = rb.icmp(ICmpPred::SignedLt, next_i, five);
                 Ok(LoopResult {
                     condition,
-                    next_state: picked.state,
                     next_vars: vec![next_i, next_j],
                 })
             })?;
-            Ok(FnResult {
-                state: res.state,
-                values: vec![res.result(0)],
-            })
+            Ok(vec![res.result(0)])
         })
         .unwrap();
 
         let pipeline = m.optimise_default(true).unwrap();
 
-        assert_eq!(pipeline.passes.len(), 1);
+        assert_eq!(pipeline.passes.len(), 2);
         assert!(
             pipeline.pre_verify_duration > std::time::Duration::ZERO,
             "verify_all times the pre-pass verification"
         );
-        let report = &pipeline.passes[0];
+        let report = &pipeline.passes[1];
         assert_eq!(report.pass, "DeadNodeElimination");
         assert!(
             report.verify_duration > std::time::Duration::ZERO,
@@ -1213,7 +1159,9 @@ mod tests {
             report.shape_after.values
         );
         assert!(report.shape_after.value_pool_entries < report.shape_before.value_pool_entries);
-        let crate::opt::PassEffects::DeadNodeElimination(effects) = report.effects;
+        let crate::opt::PassEffects::DeadNodeElimination(effects) = report.effects else {
+            panic!("second pass reports dead node elimination effects");
+        };
         assert_eq!(effects.gamma_input_slots_dropped, 1);
         assert_eq!(effects.theta_loop_var_slots_dropped, 1);
         // Exactly the dead theta slot's body result entry: the gamma's
@@ -1230,15 +1178,12 @@ mod tests {
     fn dead_pure_node_is_removed() {
         let mut m = RVSDGMod::new_host(String::from("test"));
         let f = m.declare_fn(String::from("f"), &[I32, I32], &[I32], Linkage::Internal);
-        m.define_fn(f, |rb, state| {
+        m.define_fn(f, |rb| {
             let x = rb.param(0);
             let y = rb.param(1);
             let _dead = rb.binary(BinaryOp::Mul, ArithFlags::default(), x, y, I32);
             let live = rb.binary(BinaryOp::Add, ArithFlags::default(), x, y, I32);
-            Ok(FnResult {
-                state,
-                values: vec![live],
-            })
+            Ok(vec![live])
         })
         .unwrap();
         assert_eq!(count_muls(&m), 1);
@@ -1260,14 +1205,11 @@ mod tests {
     fn dead_chain_is_removed() {
         let mut m = RVSDGMod::new_host(String::from("test"));
         let f = m.declare_fn(String::from("f"), &[I32], &[I32], Linkage::Internal);
-        m.define_fn(f, |rb, state| {
+        m.define_fn(f, |rb| {
             let x = rb.param(0);
             let dead_a = rb.binary(BinaryOp::Mul, ArithFlags::default(), x, x, I32);
             let _dead_b = rb.binary(BinaryOp::Mul, ArithFlags::default(), dead_a, x, I32);
-            Ok(FnResult {
-                state,
-                values: vec![x],
-            })
+            Ok(vec![x])
         })
         .unwrap();
         assert_eq!(count_muls(&m), 2);
@@ -1284,15 +1226,12 @@ mod tests {
     fn fully_live_function_is_untouched() {
         let mut m = RVSDGMod::new_host(String::from("test"));
         let f = m.declare_fn(String::from("f"), &[I32, I32], &[I32], Linkage::Internal);
-        m.define_fn(f, |rb, state| {
+        m.define_fn(f, |rb| {
             let x = rb.param(0);
             let y = rb.param(1);
             let sum = rb.binary(BinaryOp::Add, ArithFlags::default(), x, y, I32);
             let scaled = rb.binary(BinaryOp::Mul, ArithFlags::default(), sum, y, I32);
-            Ok(FnResult {
-                state,
-                values: vec![scaled],
-            })
+            Ok(vec![scaled])
         })
         .unwrap();
         let nodes_before = count_nodes(&m, |_| true);
@@ -1315,17 +1254,14 @@ mod tests {
         let mut m = RVSDGMod::new_host(String::from("test"));
         let ptr = ptr_ty(&mut m);
         let f = m.declare_fn(String::from("f"), &[I32], &[I32], Linkage::Internal);
-        m.define_fn(f, |rb, state| {
+        m.define_fn(f, |rb| {
             let x = rb.param(0);
             let one = rb.const_i32(1);
-            let alloc = rb.alloca(state, I32, one, ptr, None);
-            let s1 = rb.store(alloc.state, alloc.ptr, x, None, false);
+            let alloc = rb.alloca(I32, one, ptr, None);
+            rb.store(alloc, x, None, false);
             let two = rb.const_i32(2);
-            let s2 = rb.store(s1, alloc.ptr, two, None, false);
-            Ok(FnResult {
-                state: s2,
-                values: vec![x],
-            })
+            rb.store(alloc, two, None, false);
+            Ok(vec![x])
         })
         .unwrap();
 
@@ -1351,17 +1287,14 @@ mod tests {
         let mut m = RVSDGMod::new_host(String::from("test"));
         let ptr = ptr_ty(&mut m);
         let f = m.declare_fn(String::from("f"), &[I32], &[I32], Linkage::Internal);
-        m.define_fn(f, |rb, state| {
+        m.define_fn(f, |rb| {
             let x = rb.param(0);
             let one = rb.const_i32(1);
-            let alloc = rb.alloca(state, I32, one, ptr, None);
-            let s1 = rb.store(alloc.state, alloc.ptr, x, None, false);
+            let alloc = rb.alloca(I32, one, ptr, None);
+            rb.store(alloc, x, None, false);
             let _dead = rb.binary(BinaryOp::Mul, ArithFlags::default(), x, x, I32);
-            let s2 = rb.store(s1, alloc.ptr, x, None, false);
-            Ok(FnResult {
-                state: s2,
-                values: vec![x],
-            })
+            rb.store(alloc, x, None, false);
+            Ok(vec![x])
         })
         .unwrap();
 
@@ -1372,46 +1305,41 @@ mod tests {
         assert_eq!(count_nodes(&m, |k| matches!(k, ValueKind::Store { .. })), 2);
     }
 
-    /// A gamma whose outputs are unused and whose state output is
-    /// bypassed (the function threads its entry state to the result):
-    /// the whole construct, its projections, and its arm contents die.
+    /// A gamma whose data outputs are all unused still survives DNE
+    /// alone: construction threads the state chain through every
+    /// construct, so the function's exit state roots it. Removing it
+    /// takes the passthrough-reroute pass, which runs before this one
+    /// in the default pipeline; this test runs elimination by itself,
+    /// so the construct survives. What liveness alone reclaims here:
+    /// the unused data projection, its output slot, and through the
+    /// dead slot the arm contents feeding it.
     #[test]
-    fn dead_gamma_construct_is_removed() {
+    fn state_threaded_gamma_survives_dne() {
         let mut m = RVSDGMod::new_host(String::from("test"));
         let f = m.declare_fn(String::from("f"), &[I32, I32], &[I32], Linkage::Internal);
-        m.define_fn(f, |rb, state| {
+        m.define_fn(f, |rb| {
             let x = rb.param(0);
             let y = rb.param(1);
             let flag = rb.constant(BOOL, ConstValue::Int(1));
             let predicate = rb.bool_predicate(flag);
             let _unused = rb.gamma(
                 predicate,
-                state,
                 &[x, y],
                 |rb| {
                     let a = rb.param(0);
                     let b = rb.param(1);
                     let v = rb.binary(BinaryOp::Mul, ArithFlags::default(), a, b, I32);
-                    Ok(BranchResult {
-                        state,
-                        values: vec![v],
-                    })
+                    Ok(vec![v])
                 },
                 |rb| {
                     let a = rb.param(0);
                     let b = rb.param(1);
                     let v = rb.binary(BinaryOp::Mul, ArithFlags::default(), b, a, I32);
-                    Ok(BranchResult {
-                        state,
-                        values: vec![v],
-                    })
+                    Ok(vec![v])
                 },
             )?;
             let live = rb.binary(BinaryOp::Add, ArithFlags::default(), x, y, I32);
-            Ok(FnResult {
-                state,
-                values: vec![live],
-            })
+            Ok(vec![live])
         })
         .unwrap();
 
@@ -1420,14 +1348,18 @@ mod tests {
         assert_verified(&m);
         assert_eq!(
             count_nodes(&m, |k| matches!(k, ValueKind::Gamma { .. })),
-            0,
-            "an unused pure gamma must be removed entirely"
+            1,
+            "the state chain roots the construct"
         );
-        assert_eq!(count_muls(&m), 0, "arm contents die with the construct");
+        assert_eq!(
+            count_muls(&m),
+            0,
+            "dead output slots reclaim arm contents even while the construct lives"
+        );
         assert_eq!(
             count_nodes(&m, |k| matches!(k, ValueKind::Project { .. })),
-            0,
-            "projections of a dead construct must not survive it"
+            2,
+            "the unused data projection is reclaimed; the state projections stay pinned"
         );
     }
 
@@ -1437,38 +1369,28 @@ mod tests {
     fn dead_node_inside_gamma_arm_is_removed() {
         let mut m = RVSDGMod::new_host(String::from("test"));
         let f = m.declare_fn(String::from("f"), &[I32, I32], &[I32], Linkage::Internal);
-        m.define_fn(f, |rb, state| {
+        m.define_fn(f, |rb| {
             let x = rb.param(0);
             let y = rb.param(1);
             let flag = rb.constant(BOOL, ConstValue::Int(1));
             let predicate = rb.bool_predicate(flag);
             let res = rb.gamma(
                 predicate,
-                state,
                 &[x, y],
                 |rb| {
                     let a = rb.param(0);
                     let b = rb.param(1);
                     let _dead = rb.binary(BinaryOp::Mul, ArithFlags::default(), a, b, I32);
                     let v = rb.binary(BinaryOp::Add, ArithFlags::default(), a, b, I32);
-                    Ok(BranchResult {
-                        state,
-                        values: vec![v],
-                    })
+                    Ok(vec![v])
                 },
                 |rb| {
                     let a = rb.param(0);
                     let v = rb.binary(BinaryOp::Add, ArithFlags::default(), a, a, I32);
-                    Ok(BranchResult {
-                        state,
-                        values: vec![v],
-                    })
+                    Ok(vec![v])
                 },
             )?;
-            Ok(FnResult {
-                state: res.state,
-                values: vec![res.result(0)],
-            })
+            Ok(vec![res.result(0)])
         })
         .unwrap();
         assert_eq!(count_muls(&m), 1);
@@ -1494,40 +1416,30 @@ mod tests {
     fn unused_gamma_result_slot_is_removed() {
         let mut m = RVSDGMod::new_host(String::from("test"));
         let f = m.declare_fn(String::from("f"), &[I32, I32], &[I32], Linkage::Internal);
-        m.define_fn(f, |rb, state| {
+        m.define_fn(f, |rb| {
             let x = rb.param(0);
             let y = rb.param(1);
             let flag = rb.constant(BOOL, ConstValue::Int(1));
             let predicate = rb.bool_predicate(flag);
             let res = rb.gamma(
                 predicate,
-                state,
                 &[x, y],
                 |rb| {
                     let a = rb.param(0);
                     let b = rb.param(1);
                     let used = rb.binary(BinaryOp::Add, ArithFlags::default(), a, b, I32);
                     let unused = rb.binary(BinaryOp::Mul, ArithFlags::default(), a, b, I32);
-                    Ok(BranchResult {
-                        state,
-                        values: vec![used, unused],
-                    })
+                    Ok(vec![used, unused])
                 },
                 |rb| {
                     let a = rb.param(0);
                     let b = rb.param(1);
                     let used = rb.binary(BinaryOp::Add, ArithFlags::default(), b, a, I32);
                     let unused = rb.binary(BinaryOp::Mul, ArithFlags::default(), b, a, I32);
-                    Ok(BranchResult {
-                        state,
-                        values: vec![used, unused],
-                    })
+                    Ok(vec![used, unused])
                 },
             )?;
-            Ok(FnResult {
-                state: res.state,
-                values: vec![res.result(0)],
-            })
+            Ok(vec![res.result(0)])
         })
         .unwrap();
         assert_eq!(count_muls(&m), 2);
@@ -1553,8 +1465,8 @@ mod tests {
                 &m,
                 |k| matches!(k, ValueKind::Project { call, .. } if *call == gamma)
             ),
-            1,
-            "only the consumed projection remains"
+            3,
+            "the consumed data projection and the two pinned state projections remain"
         );
     }
 
@@ -1565,34 +1477,24 @@ mod tests {
     fn unused_gamma_input_is_removed() {
         let mut m = RVSDGMod::new_host(String::from("test"));
         let f = m.declare_fn(String::from("f"), &[I32], &[I32], Linkage::Internal);
-        m.define_fn(f, |rb, state| {
+        m.define_fn(f, |rb| {
             let x = rb.param(0);
             let dead_input = rb.binary(BinaryOp::Mul, ArithFlags::default(), x, x, I32);
             let flag = rb.constant(BOOL, ConstValue::Int(1));
             let predicate = rb.bool_predicate(flag);
             let res = rb.gamma(
                 predicate,
-                state,
                 &[dead_input],
                 |rb| {
                     let zero = rb.const_i32(0);
-                    Ok(BranchResult {
-                        state,
-                        values: vec![zero],
-                    })
+                    Ok(vec![zero])
                 },
                 |rb| {
                     let one = rb.const_i32(1);
-                    Ok(BranchResult {
-                        state,
-                        values: vec![one],
-                    })
+                    Ok(vec![one])
                 },
             )?;
-            Ok(FnResult {
-                state: res.state,
-                values: vec![res.result(0)],
-            })
+            Ok(vec![res.result(0)])
         })
         .unwrap();
 
@@ -1633,10 +1535,10 @@ mod tests {
     fn unused_theta_loop_var_is_removed() {
         let mut m = RVSDGMod::new_host(String::from("test"));
         let f = m.declare_fn(String::from("f"), &[I32, I32], &[I32], Linkage::Internal);
-        m.define_fn(f, |rb, state| {
+        m.define_fn(f, |rb| {
             let init_i = rb.param(0);
             let unused_init = rb.param(1);
-            let res = rb.theta(state, &[init_i, unused_init], |rb| {
+            let res = rb.theta(&[init_i, unused_init], |rb| {
                 let i = rb.param(0);
                 let unused = rb.param(1);
                 let one = rb.const_i32(1);
@@ -1645,14 +1547,10 @@ mod tests {
                 let condition = rb.icmp(ICmpPred::SignedLt, next_i, five);
                 Ok(LoopResult {
                     condition,
-                    next_state: state,
                     next_vars: vec![next_i, unused],
                 })
             })?;
-            Ok(FnResult {
-                state: res.state,
-                values: vec![res.result(0)],
-            })
+            Ok(vec![res.result(0)])
         })
         .unwrap();
 
@@ -1694,10 +1592,10 @@ mod tests {
     fn self_referential_dead_loop_var_is_removed() {
         let mut m = RVSDGMod::new_host(String::from("test"));
         let f = m.declare_fn(String::from("f"), &[I32, I32], &[I32], Linkage::Internal);
-        m.define_fn(f, |rb, state| {
+        m.define_fn(f, |rb| {
             let init_i = rb.param(0);
             let init_j = rb.param(1);
-            let res = rb.theta(state, &[init_i, init_j], |rb| {
+            let res = rb.theta(&[init_i, init_j], |rb| {
                 let i = rb.param(0);
                 let j = rb.param(1);
                 let one = rb.const_i32(1);
@@ -1708,14 +1606,10 @@ mod tests {
                 let condition = rb.icmp(ICmpPred::SignedLt, next_i, five);
                 Ok(LoopResult {
                     condition,
-                    next_state: state,
                     next_vars: vec![next_i, next_j],
                 })
             })?;
-            Ok(FnResult {
-                state: res.state,
-                values: vec![res.result(0)],
-            })
+            Ok(vec![res.result(0)])
         })
         .unwrap();
         assert_eq!(count_muls(&m), 1);

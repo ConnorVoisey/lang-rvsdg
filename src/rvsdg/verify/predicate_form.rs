@@ -174,6 +174,7 @@ impl FunctionGraph {
                 | ValueKind::GlobalRef(_)
                 | ValueKind::FuncAddr(_)
                 | ValueKind::Fence { .. }
+                | ValueKind::StateMerge { .. }
                 | ValueKind::RegionParam { .. } => {}
             }
         }

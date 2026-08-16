@@ -1,6 +1,6 @@
 use crate::rvsdg::{
-    RegionId, State, ValueId, ValueKind, function_graph::FunctionGraph,
-    module_tables::ModuleTables, verify::RVSDGVerificationError,
+    RegionId, ValueId, ValueKind, function_graph::FunctionGraph, module_tables::ModuleTables,
+    verify::RVSDGVerificationError,
 };
 
 impl FunctionGraph {
@@ -168,6 +168,11 @@ impl FunctionGraph {
                 ValueKind::Match { input, .. } => {
                     self.valid_val(errs, input);
                 }
+                ValueKind::StateMerge { inputs } => {
+                    for val_id in self.value_pool.get(inputs).iter() {
+                        self.valid_val(errs, *val_id);
+                    }
+                }
                 ValueKind::Intrinsic { state, args, .. } => {
                     self.valid_val(errs, state.0);
                     for val_id in self.value_pool.get(args).iter() {
@@ -177,38 +182,36 @@ impl FunctionGraph {
                 ValueKind::Theta {
                     loop_vars,
                     condition,
-                    state,
                     region_id,
                 } => {
                     for val_id in self.value_pool.get(loop_vars).iter() {
                         self.valid_val(errs, *val_id);
                     }
                     self.valid_val(errs, condition);
-                    self.valid_val(errs, state.0);
                     self.valid_region(errs, region_id);
                 }
                 ValueKind::Gamma {
                     condition,
                     inputs,
-                    state,
                     regions,
                 } => {
                     self.valid_val(errs, condition);
                     for val_id in self.value_pool.get(inputs).iter() {
                         self.valid_val(errs, *val_id);
                     }
-                    self.valid_val(errs, state.0);
                     for region_id in self.region_pool.get(regions).iter() {
                         self.valid_region(errs, *region_id);
                     }
                 }
                 ValueKind::Call {
                     state,
+                    io_state,
                     fn_id,
                     sig: _,
                     args,
                 } => {
                     self.valid_val(errs, state.0);
+                    self.valid_val(errs, io_state.0);
                     if (fn_id.0 as usize) >= module_tables.functions.len() {
                         errs.push(RVSDGVerificationError::InvalidFnId(fn_id));
                     }
@@ -218,11 +221,13 @@ impl FunctionGraph {
                 }
                 ValueKind::CallIndirect {
                     state,
+                    io_state,
                     callee,
                     sig: _,
                     args,
                 } => {
                     self.valid_val(errs, state.0);
+                    self.valid_val(errs, io_state.0);
                     self.valid_val(errs, callee);
                     for val_id in self.value_pool.get(args).iter() {
                         self.valid_val(errs, *val_id);
@@ -242,11 +247,11 @@ impl FunctionGraph {
             for &result in self.region_results(region_id) {
                 self.valid_val(errs, result);
             }
-            self.valid_val(errs, self.regions[index].entry_state.0);
-            let exit = self.regions[index].exit_state;
-            // An unset exit state is its own error (RegionExitStateUnset).
-            if exit != State::INVALID {
-                self.valid_val(errs, exit.0);
+            for &state_param in self.region_state_params(region_id) {
+                self.valid_val(errs, state_param);
+            }
+            for &state_result in self.region_state_results(region_id) {
+                self.valid_val(errs, state_result);
             }
         }
     }
@@ -255,9 +260,7 @@ impl FunctionGraph {
 #[cfg(test)]
 mod tests {
     use crate::rvsdg::{
-        ConstValue, Linkage, RVSDGMod, State, ValueId,
-        builder::BranchResult,
-        func::FnResult,
+        ConstValue, Linkage, RVSDGMod, ValueId,
         types::{BOOL, I32},
         verify::RVSDGVerificationError,
     };
@@ -266,32 +269,18 @@ mod tests {
     fn build_gamma_module() -> RVSDGMod {
         let mut m = RVSDGMod::new_host(String::from("test"));
         let f = m.declare_fn(String::from("f"), &[I32, I32], &[I32], Linkage::Internal);
-        m.define_fn(f, |rb, state| {
+        m.define_fn(f, |rb| {
             let x = rb.param(0);
             let y = rb.param(1);
             let flag = rb.constant(BOOL, ConstValue::Int(1));
             let predicate = rb.bool_predicate(flag);
             let picked = rb.gamma(
                 predicate,
-                state,
                 &[x, y],
-                |rb| {
-                    Ok(BranchResult {
-                        state,
-                        values: vec![rb.param(0)],
-                    })
-                },
-                |rb| {
-                    Ok(BranchResult {
-                        state,
-                        values: vec![rb.param(1)],
-                    })
-                },
+                |rb| Ok(vec![rb.param(0)]),
+                |rb| Ok(vec![rb.param(1)]),
             )?;
-            Ok(FnResult {
-                state: picked.state,
-                values: vec![picked.result(0)],
-            })
+            Ok(vec![picked.result(0)])
         })
         .unwrap();
         m
@@ -305,7 +294,8 @@ mod tests {
     fn dangling_region_exit_state_id_is_reported() {
         let mut m = build_gamma_module();
         let graph = m.graphs[0].as_mut().unwrap();
-        graph.regions[1].exit_state = State(ValueId(0xFFFF_0000));
+        let region = graph.regions[1].clone();
+        region.state_results_mut(&mut graph.value_pool)[0] = ValueId(0xFFFF_0000);
         let errs = m.verify();
         assert!(
             errs.iter()
@@ -319,7 +309,8 @@ mod tests {
     fn dangling_region_entry_state_id_is_reported() {
         let mut m = build_gamma_module();
         let graph = m.graphs[0].as_mut().unwrap();
-        graph.regions[2].entry_state = State(ValueId(0xFFFF_0000));
+        let region = graph.regions[2].clone();
+        region.state_params_mut(&mut graph.value_pool)[0] = ValueId(0xFFFF_0000);
         let errs = m.verify();
         assert!(
             errs.iter()
@@ -334,7 +325,7 @@ mod tests {
     fn unsealed_region_is_reported() {
         let mut m = build_gamma_module();
         let graph = m.graphs[0].as_mut().unwrap();
-        graph.regions[1].interface_start = crate::rvsdg::Region::UNSEALED;
+        graph.regions[1].interface_start = crate::rvsdg::region::Region::UNSEALED;
         let errs = m.verify();
         assert!(
             errs.iter()

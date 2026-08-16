@@ -194,11 +194,11 @@ fn fmt_region_body(
     continue_if: Option<ValueId>,
     terminator: Terminator,
 ) -> std::fmt::Result {
-    let region = graph.get_region(region_id);
-
     if show_entry_state {
-        pad(f, indent)?;
-        write!(f, "state_in {}\n", region.entry_state)?;
+        if let Some(&state) = graph.region_state_params(region_id).first() {
+            pad(f, indent)?;
+            write!(f, "state_in {state}\n")?;
+        }
     }
 
     if print_args && !graph.region_params(region_id).is_empty() {
@@ -297,16 +297,22 @@ fn fmt_node(
         }
         ValueKind::Call {
             state,
+            io_state,
             fn_id,
             sig,
             args,
         } => {
             write!(f, "call {fn_id} {sig} args ")?;
             fmt_value_list(f, m, graph, *args)?;
-            write!(f, " state_in {state} state_out %s{}", node_id.0)
+            write!(
+                f,
+                " state_in {state} io_in {io_state} state_out %s{}",
+                node_id.0
+            )
         }
         ValueKind::CallIndirect {
             state,
+            io_state,
             callee,
             sig,
             args,
@@ -315,17 +321,20 @@ fn fmt_node(
             fmt_value_ref(f, m, graph, *callee)?;
             f.write_str(" args ")?;
             fmt_value_list(f, m, graph, *args)?;
-            write!(f, " state_in {state} state_out %s{}", node_id.0)
+            write!(
+                f,
+                " state_in {state} io_in {io_state} state_out %s{}",
+                node_id.0
+            )
         }
         ValueKind::Gamma {
             condition,
             inputs,
-            state,
             regions,
         } => {
             f.write_str("gamma predicate ")?;
             fmt_value_ref(f, m, graph, *condition)?;
-            write!(f, " state_in {state} state_out %s{} {{\n", node_id.0)?;
+            f.write_str(" {\n")?;
 
             pad(f, indent + 4)?;
             f.write_str("in ")?;
@@ -355,10 +364,9 @@ fn fmt_node(
         ValueKind::Theta {
             loop_vars,
             condition,
-            state,
             region_id,
         } => {
-            write!(f, "theta state_in {state} state_out %s{} {{\n", node_id.0)?;
+            f.write_str("theta {\n")?;
 
             pad(f, indent + 4)?;
             f.write_str("in ")?;
@@ -509,7 +517,7 @@ impl Display for ScalarType {
 impl TypeRef {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>, type_arena: &TypeArena) -> std::fmt::Result {
         match self {
-            TypeRef::State => f.write_str("state"),
+            TypeRef::State(_) => f.write_str("state"),
             TypeRef::Scalar(scalar_type) => write!(f, "{scalar_type}"),
             TypeRef::Ptr(ptr_type_id) => type_arena.get_ptr(*ptr_type_id).fmt(f, type_arena),
             TypeRef::Array(array_type_id) => write!(f, "{array_type_id}"),

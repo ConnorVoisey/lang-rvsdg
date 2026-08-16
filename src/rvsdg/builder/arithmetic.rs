@@ -1,11 +1,11 @@
 use crate::rvsdg::{
-    ArithFlags, BinaryOp, CastOp, ConstValue, FCmpPred, FuncId, ICmpPred, IntrinsicOp, State,
-    UnaryOp, Value, ValueId, ValueKind,
+    AliasClassId, ArithFlags, BinaryOp, CastOp, ConstValue, FCmpPred, FuncId, ICmpPred,
+    IntrinsicOp, StateKind, UnaryOp, Value, ValueId, ValueKind,
     constant::ConstId,
     types::{BOOL, I32, I64, TypeRef},
 };
 
-use super::{IntrinsicResult, OverflowResult, RegionBuilder};
+use super::{OverflowResult, RegionBuilder};
 
 impl<'a> RegionBuilder<'a> {
     // Constants and symbol references are region-free: interned
@@ -113,68 +113,59 @@ impl<'a> RegionBuilder<'a> {
         })
     }
 
-    /// Emit a stateful intrinsic that produces only a new state (no data output).
+    // Stateful intrinsics thread as writes: the input state (pending
+    // reads flattened) comes from the region's scratch registers.
+
+    /// Emit a stateful intrinsic that produces no data output.
     /// Use for MemCopy, MemMove, MemSet, LifetimeStart, LifetimeEnd, Unreachable.
     #[inline]
-    pub fn intrinsic_void(&mut self, op: IntrinsicOp, state: State, args: &[ValueId]) -> State {
+    pub fn intrinsic_void(&mut self, op: IntrinsicOp, args: &[ValueId]) {
         let args_span = self.graph.value_pool.push_slice(args);
-        let val = self.add_value(Value {
-            ty: TypeRef::State,
+        self.graph.state_write(self.region_id, |state| Value {
+            ty: TypeRef::State(StateKind::MemoryWrite(AliasClassId(0))),
             kind: ValueKind::Intrinsic {
                 op,
                 state,
                 args: args_span,
             },
         });
-        State(val)
     }
 
-    /// Emit an intrinsic that produces one data result plus a new state.
+    /// Emit an intrinsic that produces one data result, returned.
     /// Use for IntAbs, FloatFma, FloatMin, FloatMax, FloatCopySign,
     /// saturating arithmetic, and min/max.
     #[inline]
-    pub fn intrinsic(
-        &mut self,
-        op: IntrinsicOp,
-        state: State,
-        args: &[ValueId],
-        ret_type: TypeRef,
-    ) -> IntrinsicResult {
+    pub fn intrinsic(&mut self, op: IntrinsicOp, args: &[ValueId], ret_type: TypeRef) -> ValueId {
         let args_span = self.graph.value_pool.push_slice(args);
-        let val = self.add_value(Value {
-            ty: TypeRef::State,
+        let out_state = self.graph.state_write(self.region_id, |state| Value {
+            ty: TypeRef::State(StateKind::MemoryWrite(AliasClassId(0))),
             kind: ValueKind::Intrinsic {
                 op,
                 state,
                 args: args_span,
             },
         });
-        let result = self.add_value(Value {
+        self.add_value(Value {
             ty: ret_type,
             kind: ValueKind::Project {
-                call: val,
+                call: out_state.0,
                 index: 0,
             },
-        });
-        IntrinsicResult {
-            state: State(val),
-            value: result,
-        }
+        })
     }
 
     /// Emit an overflow-checked arithmetic intrinsic.
-    /// Returns (result, overflow_flag) plus a new state.
+    /// Returns the result value and the overflow flag.
     #[inline]
     pub fn intrinsic_overflow(
         &mut self,
         op: IntrinsicOp,
-        state: State,
         args: &[ValueId],
         ret_type: TypeRef,
     ) -> OverflowResult {
         let args_span = self.graph.value_pool.push_slice(args);
-        let val = self.add_value(Value {
-            ty: TypeRef::State,
+        let out_state = self.graph.state_write(self.region_id, |state| Value {
+            ty: TypeRef::State(StateKind::MemoryWrite(AliasClassId(0))),
             kind: ValueKind::Intrinsic {
                 op,
                 state,
@@ -184,19 +175,18 @@ impl<'a> RegionBuilder<'a> {
         let result = self.add_value(Value {
             ty: ret_type,
             kind: ValueKind::Project {
-                call: val,
+                call: out_state.0,
                 index: 0,
             },
         });
         let overflow = self.add_value(Value {
             ty: BOOL,
             kind: ValueKind::Project {
-                call: val,
+                call: out_state.0,
                 index: 1,
             },
         });
         OverflowResult {
-            state: State(val),
             value: result,
             overflow,
         }

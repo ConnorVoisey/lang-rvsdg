@@ -1,54 +1,50 @@
 use crate::rvsdg::{
-    AtomicRMWOp, MemoryOrdering, State, Value, ValueId, ValueKind,
+    AliasClassId, AtomicRMWOp, MemoryOrdering, StateKind, Value, ValueId, ValueKind,
     types::{BOOL, TypeRef},
 };
 
-use super::{AllocaResult, CompareAndSwapResult, LoadResult, RegionBuilder};
+use super::{CompareAndSwapResult, RegionBuilder};
+
+// State threading is internal: every op pulls its input state from the
+// region's scratch registers (reads fan out from the chain's newest
+// write; writes flatten pending reads behind them), so ops take and
+// return data values only.
 
 impl<'a> RegionBuilder<'a> {
+    /// Returns the loaded value.
     #[inline]
     pub fn load(
         &mut self,
-        state: State,
         addr: ValueId,
         loaded_type: TypeRef,
         align: Option<u32>,
         volatile: bool,
-    ) -> LoadResult {
+    ) -> ValueId {
+        let input_state = self.graph.state_current(self.region_id);
         let load_val = self.add_value(Value {
-            ty: TypeRef::State,
+            ty: TypeRef::State(StateKind::MemoryRead(AliasClassId(0))),
             kind: ValueKind::Load {
-                state,
+                state: input_state,
                 addr,
                 loaded_type,
                 align,
                 volatile,
             },
         });
-        let value = self.add_value(Value {
+        self.graph.state_read(self.region_id, load_val);
+        self.add_value(Value {
             ty: loaded_type,
             kind: ValueKind::Project {
                 call: load_val,
                 index: 0,
             },
-        });
-        LoadResult {
-            state: State(load_val),
-            value,
-        }
+        })
     }
 
     #[inline]
-    pub fn store(
-        &mut self,
-        state: State,
-        addr: ValueId,
-        value: ValueId,
-        align: Option<u32>,
-        volatile: bool,
-    ) -> State {
-        let store_val = self.add_value(Value {
-            ty: TypeRef::State,
+    pub fn store(&mut self, addr: ValueId, value: ValueId, align: Option<u32>, volatile: bool) {
+        self.graph.state_write(self.region_id, |state| Value {
+            ty: TypeRef::State(StateKind::MemoryWrite(AliasClassId(0))),
             kind: ValueKind::Store {
                 state,
                 addr,
@@ -57,20 +53,19 @@ impl<'a> RegionBuilder<'a> {
                 volatile,
             },
         });
-        State(store_val)
     }
 
+    /// Returns the allocated pointer.
     #[inline]
     pub fn alloca(
         &mut self,
-        state: State,
         elem_type: TypeRef,
         count: ValueId,
         ptr_type: TypeRef,
         align: Option<u32>,
-    ) -> AllocaResult {
-        let alloca_val = self.add_value(Value {
-            ty: TypeRef::State,
+    ) -> ValueId {
+        let alloca_state = self.graph.state_write(self.region_id, |state| Value {
+            ty: TypeRef::State(StateKind::MemoryWrite(AliasClassId(0))),
             kind: ValueKind::Alloca {
                 state,
                 elem_type,
@@ -78,31 +73,29 @@ impl<'a> RegionBuilder<'a> {
                 align,
             },
         });
-        let ptr = self.add_value(Value {
+        self.add_value(Value {
             ty: ptr_type,
             kind: ValueKind::Project {
-                call: alloca_val,
+                call: alloca_state.0,
                 index: 0,
             },
-        });
-        AllocaResult {
-            state: State(alloca_val),
-            ptr,
-        }
+        })
     }
 
+    /// Returns the loaded value.
     #[inline]
     pub fn atomic_load(
         &mut self,
-        state: State,
         addr: ValueId,
         loaded_type: TypeRef,
         ordering: MemoryOrdering,
         align: Option<u32>,
         volatile: bool,
-    ) -> LoadResult {
-        let load_val = self.add_value(Value {
-            ty: TypeRef::State,
+    ) -> ValueId {
+        // Atomic loads thread as writes: their ordering constraint must
+        // hold every later op behind them, which read fan-out would lose.
+        let load_state = self.graph.state_write(self.region_id, |state| Value {
+            ty: TypeRef::State(StateKind::MemoryWrite(AliasClassId(0))),
             kind: ValueKind::AtomicLoad {
                 state,
                 addr,
@@ -112,31 +105,26 @@ impl<'a> RegionBuilder<'a> {
                 volatile,
             },
         });
-        let value = self.add_value(Value {
+        self.add_value(Value {
             ty: loaded_type,
             kind: ValueKind::Project {
-                call: load_val,
+                call: load_state.0,
                 index: 0,
             },
-        });
-        LoadResult {
-            state: State(load_val),
-            value,
-        }
+        })
     }
 
     #[inline]
     pub fn atomic_store(
         &mut self,
-        state: State,
         addr: ValueId,
         value: ValueId,
         ordering: MemoryOrdering,
         align: Option<u32>,
         volatile: bool,
-    ) -> State {
-        let val = self.add_value(Value {
-            ty: TypeRef::State,
+    ) {
+        self.graph.state_write(self.region_id, |state| Value {
+            ty: TypeRef::State(StateKind::MemoryWrite(AliasClassId(0))),
             kind: ValueKind::AtomicStore {
                 state,
                 addr,
@@ -146,22 +134,21 @@ impl<'a> RegionBuilder<'a> {
                 volatile,
             },
         });
-        State(val)
     }
 
+    /// Returns the old value.
     #[inline]
     pub fn atomic_read_modify_write(
         &mut self,
-        state: State,
         addr: ValueId,
         value: ValueId,
         op: AtomicRMWOp,
         ordering: MemoryOrdering,
         value_type: TypeRef,
         volatile: bool,
-    ) -> LoadResult {
-        let rmw_val = self.add_value(Value {
-            ty: TypeRef::State,
+    ) -> ValueId {
+        let rmw_state = self.graph.state_write(self.region_id, |state| Value {
+            ty: TypeRef::State(StateKind::MemoryWrite(AliasClassId(0))),
             kind: ValueKind::AtomicReadModifyWrite {
                 state,
                 addr,
@@ -171,24 +158,19 @@ impl<'a> RegionBuilder<'a> {
                 volatile,
             },
         });
-        let old_value = self.add_value(Value {
+        self.add_value(Value {
             ty: value_type,
             kind: ValueKind::Project {
-                call: rmw_val,
+                call: rmw_state.0,
                 index: 0,
             },
-        });
-        LoadResult {
-            state: State(rmw_val),
-            value: old_value,
-        }
+        })
     }
 
     #[inline]
     #[allow(clippy::too_many_arguments)]
     pub fn compare_and_swap(
         &mut self,
-        state: State,
         addr: ValueId,
         expected: ValueId,
         desired: ValueId,
@@ -197,8 +179,8 @@ impl<'a> RegionBuilder<'a> {
         value_type: TypeRef,
         volatile: bool,
     ) -> CompareAndSwapResult {
-        let cas_val = self.add_value(Value {
-            ty: TypeRef::State,
+        let cas_state = self.graph.state_write(self.region_id, |state| Value {
+            ty: TypeRef::State(StateKind::MemoryWrite(AliasClassId(0))),
             kind: ValueKind::CompareAndSwap {
                 state,
                 addr,
@@ -212,31 +194,30 @@ impl<'a> RegionBuilder<'a> {
         let old_value = self.add_value(Value {
             ty: value_type,
             kind: ValueKind::Project {
-                call: cas_val,
+                call: cas_state.0,
                 index: 0,
             },
         });
         let success = self.add_value(Value {
             ty: BOOL,
             kind: ValueKind::Project {
-                call: cas_val,
+                call: cas_state.0,
                 index: 1,
             },
         });
         CompareAndSwapResult {
-            state: State(cas_val),
+            node: cas_state.0,
             old_value,
             success,
         }
     }
 
     #[inline]
-    pub fn fence(&mut self, state: State, ordering: MemoryOrdering) -> State {
-        let val = self.add_value(Value {
-            ty: TypeRef::State,
+    pub fn fence(&mut self, ordering: MemoryOrdering) {
+        self.graph.state_write(self.region_id, |state| Value {
+            ty: TypeRef::State(StateKind::MemoryWrite(AliasClassId(0))),
             kind: ValueKind::Fence { state, ordering },
         });
-        State(val)
     }
 
     #[inline]
