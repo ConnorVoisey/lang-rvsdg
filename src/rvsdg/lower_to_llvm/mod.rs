@@ -779,11 +779,14 @@ impl<'m, 'a, 'ctx> FunctionLowerer<'m, 'a, 'ctx> {
 /// borrow this from: LLVM's C API takes the raw u64 with no constructor,
 /// inkwell adds nothing, and llvm-ir's decoder is crate-private. The
 /// layout (two may-read/may-write bits per location; argmem at bits 0-1,
-/// inaccessible memory at 2-3, everything else at 4-5; read is 0b01,
-/// write 0b10) mirrors LLVM's ModRef.h and llvm-ir's decoder of the same
-/// value. It cannot silently drift: the fidelity tests round-trip
-/// memory(none) and memory(read) functions through LLVM's printer and
-/// llvm-ir's decoder, so a wrong encoding fails those tests.
+/// inaccessible memory at 2-3, errno at 4-5, everything else at 6-7,
+/// then LLVM 22's two target-specific locations at 8-11; read is 0b01,
+/// write 0b10) mirrors the linked LLVM's ModRef.h. We do not model
+/// target memory separately, so those slots carry the `other` bits --
+/// the fold LLVM's own printer makes visible, and the reason
+/// memory(read) round-trips exactly. The fidelity tests push a
+/// memory(read) function through LLVM's own printer, so a stale layout
+/// fails against the linked LLVM rather than only against our decoder.
 fn memory_effects_to_llvm(memory: MemoryEffects) -> u64 {
     let bits = |m: ModRef| -> u64 {
         match m {
@@ -793,7 +796,13 @@ fn memory_effects_to_llvm(memory: MemoryEffects) -> u64 {
             ModRef::ModRef => 0b11,
         }
     };
-    bits(memory.arg_mem) | (bits(memory.inaccessible_mem) << 2) | (bits(memory.other) << 4)
+    let other = bits(memory.other);
+    bits(memory.arg_mem)
+        | (bits(memory.inaccessible_mem) << 2)
+        | (bits(memory.errno_mem) << 4)
+        | (other << 6)
+        | (other << 8)
+        | (other << 10)
 }
 
 /// The numeric LLVM calling-convention id. The numbers come from LLVM's

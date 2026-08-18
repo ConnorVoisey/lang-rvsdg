@@ -206,6 +206,12 @@ fn diff_headers(input: &Module, ours: &Module) -> Vec<String> {
         );
         diff_attr_sets(
             &mut gaps,
+            &format!("{what}: function_attributes"),
+            &attr_set(&d.function_attributes),
+            &attr_set(&o.function_attributes),
+        );
+        diff_attr_sets(
+            &mut gaps,
             &format!("{what}: return_attributes"),
             &attr_set(&d.return_attributes),
             &attr_set(&o.return_attributes),

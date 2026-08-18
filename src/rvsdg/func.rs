@@ -77,15 +77,18 @@ bitflags::bitflags! {
 
 /// How a function may touch each class of memory, mirroring LLVM's
 /// composite memory(...) attribute (which replaced the old readnone/
-/// readonly/writeonly/argmemonly function attributes in LLVM 16).
+/// readonly/writeonly/argmemonly function attributes in LLVM 16;
+/// LLVM 20 split errno out as its own location).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct MemoryEffects {
-    /// Everything not covered by the other two classes.
+    /// Everything not covered by the other classes.
     pub other: ModRef,
     /// Memory reached through pointer arguments.
     pub arg_mem: ModRef,
-    /// Memory not reachable from the caller (e.g. errno-like state).
+    /// Memory not reachable from the caller.
     pub inaccessible_mem: ModRef,
+    /// The thread's errno.
+    pub errno_mem: ModRef,
 }
 
 /// May-read / may-write for one memory class.

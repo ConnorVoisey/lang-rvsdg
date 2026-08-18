@@ -521,6 +521,7 @@ trait FnSignature {
     fn sig_calling_convention(&self) -> llvm_ir::function::CallingConvention;
     fn sig_alignment(&self) -> u32;
     fn sig_dll_storage_class(&self) -> llvm_ir::module::DLLStorageClass;
+    fn sig_attributes(&self) -> &[llvm_ir::function::FunctionAttribute];
 }
 
 macro_rules! impl_fn_signature {
@@ -555,6 +556,9 @@ macro_rules! impl_fn_signature {
             }
             fn sig_dll_storage_class(&self) -> llvm_ir::module::DLLStorageClass {
                 self.dll_storage_class
+            }
+            fn sig_attributes(&self) -> &[llvm_ir::function::FunctionAttribute] {
+                &self.function_attributes
             }
         }
     };
@@ -628,7 +632,7 @@ impl FnDecl {
         let ret_ty = types.convert_type_ref(func.sig_return_type(), module)?;
         let return_types = if ret_ty == VOID { vec![] } else { vec![ret_ty] };
 
-        Ok(Self {
+        let mut decl = Self {
             name: func.sig_name().to_string(),
             params: func
                 .sig_parameters()
@@ -659,13 +663,16 @@ impl FnDecl {
                 },
                 section: None,
                 memory: None,
-                // Function attributes (including string attributes) are
-                // layered on by from_fn; llvm-ir does not expose them on
-                // bare declarations.
                 string_attrs: Vec::new(),
             },
             dll_storage_class: convert_dll_storage_class(func.sig_dll_storage_class()),
-        })
+        };
+        convert_fn_attributes(
+            func.sig_attributes(),
+            &mut decl.attrs,
+            &mut decl.inline_hint,
+        );
+        Ok(decl)
     }
 
     /// Convert an external function DECLARATION. The exhaustive
@@ -689,6 +696,7 @@ impl FnDecl {
             dll_storage_class: _,
             calling_convention: _,
             alignment: _,
+            function_attributes: _,
             garbage_collector_name,
             // No debug info support yet.
             debugloc: _debugloc,
@@ -721,10 +729,10 @@ impl FnDecl {
             dll_storage_class: _,
             calling_convention: _,
             alignment: _,
+            function_attributes: _,
             // Lowered by lower_fn_body after declaration.
             basic_blocks: _,
             // Converted below.
-            function_attributes: _,
             section: _,
             // COMDAT selection only matters for C++ ODR-style link dedup;
             // linkonce/weak linkage covers the C corpus. Dropped until a
@@ -747,112 +755,126 @@ impl FnDecl {
         }
 
         // Read the signature fields directly off the `Function` (it and
-        // `FunctionDeclaration` both implement `FnSignature`) -- no temporary
-        // clone -- then layer on the function-level attributes declarations lack.
+        // `FunctionDeclaration` both implement `FnSignature`) -- no
+        // temporary clone -- then layer on the definition-only fields.
         let mut decl = Self::from_signature(func, types, module)?;
-
-        // Apply function-level attributes that declarations don't have
-        use llvm_ir::function::FunctionAttribute;
-        let none = MemoryEffects {
-            other: ModRef::NoModRef,
-            arg_mem: ModRef::NoModRef,
-            inaccessible_mem: ModRef::NoModRef,
-        };
-        for attr in &func.function_attributes {
-            match attr {
-                FunctionAttribute::NoReturn => decl.attrs.flags |= FnAttrFlags::NO_RETURN,
-                FunctionAttribute::NoUnwind => decl.attrs.flags |= FnAttrFlags::NO_UNWIND,
-                FunctionAttribute::NoRecurse => decl.attrs.flags |= FnAttrFlags::NO_RECURSE,
-                FunctionAttribute::Cold => decl.attrs.flags |= FnAttrFlags::COLD,
-                FunctionAttribute::StackProtect => decl.attrs.flags |= FnAttrFlags::STACK_PROTECT,
-                FunctionAttribute::StackProtectReq => {
-                    decl.attrs.flags |= FnAttrFlags::STACK_PROTECT_REQ;
-                }
-                FunctionAttribute::StackProtectStrong => {
-                    decl.attrs.flags |= FnAttrFlags::STACK_PROTECT_STRONG;
-                }
-                FunctionAttribute::UWTable => decl.attrs.flags |= FnAttrFlags::UWTABLE,
-                FunctionAttribute::WillReturn => decl.attrs.flags |= FnAttrFlags::WILL_RETURN,
-                FunctionAttribute::NoSync => decl.attrs.flags |= FnAttrFlags::NO_SYNC,
-                FunctionAttribute::NoFree => decl.attrs.flags |= FnAttrFlags::NO_FREE,
-                FunctionAttribute::NoInline => {
-                    decl.attrs.flags |= FnAttrFlags::NO_INLINE;
-                    decl.inline_hint = InlineHint::Never;
-                }
-                FunctionAttribute::AlwaysInline => {
-                    decl.attrs.flags |= FnAttrFlags::ALWAYS_INLINE;
-                    decl.inline_hint = InlineHint::Always;
-                }
-                // Memory behaviour: LLVM 16+ input carries the composite
-                // memory(...) attribute; the bare variants are its pre-16
-                // spellings, mapped onto the same structure.
-                FunctionAttribute::Memory {
-                    default,
-                    argmem,
-                    inaccessible_mem,
-                } => {
-                    let conv = |e: &llvm_ir::function::MemoryEffect| match e {
-                        llvm_ir::function::MemoryEffect::None => ModRef::NoModRef,
-                        llvm_ir::function::MemoryEffect::Read => ModRef::Ref,
-                        llvm_ir::function::MemoryEffect::Write => ModRef::Mod,
-                        llvm_ir::function::MemoryEffect::ReadWrite => ModRef::ModRef,
-                    };
-                    decl.attrs.memory = Some(MemoryEffects {
-                        other: conv(default),
-                        arg_mem: conv(argmem),
-                        inaccessible_mem: conv(inaccessible_mem),
-                    });
-                }
-                FunctionAttribute::ReadNone => decl.attrs.memory = Some(none),
-                FunctionAttribute::ReadOnly => {
-                    decl.attrs.memory = Some(MemoryEffects {
-                        other: ModRef::Ref,
-                        arg_mem: ModRef::Ref,
-                        inaccessible_mem: ModRef::Ref,
-                    });
-                }
-                FunctionAttribute::WriteOnly => {
-                    decl.attrs.memory = Some(MemoryEffects {
-                        other: ModRef::Mod,
-                        arg_mem: ModRef::Mod,
-                        inaccessible_mem: ModRef::Mod,
-                    });
-                }
-                FunctionAttribute::ArgMemOnly => {
-                    decl.attrs.memory = Some(MemoryEffects {
-                        arg_mem: ModRef::ModRef,
-                        ..none
-                    });
-                }
-                FunctionAttribute::InaccessibleMemOnly => {
-                    decl.attrs.memory = Some(MemoryEffects {
-                        inaccessible_mem: ModRef::ModRef,
-                        ..none
-                    });
-                }
-                FunctionAttribute::InaccessibleMemOrArgMemOnly => {
-                    decl.attrs.memory = Some(MemoryEffects {
-                        arg_mem: ModRef::ModRef,
-                        inaccessible_mem: ModRef::ModRef,
-                        ..none
-                    });
-                }
-                // Carried verbatim: these steer codegen (target features,
-                // stack-protector sizing, frame pointer policy, ...).
-                FunctionAttribute::StringAttribute { kind, value } => {
-                    decl.attrs.string_attrs.push((kind.clone(), value.clone()));
-                }
-                // Not modeled yet; the fidelity net surfaces any of these
-                // the moment a real input carries them.
-                _ => {}
-            }
-        }
 
         if let Some(section) = &func.section {
             decl.attrs.section = Some(section.clone());
         }
 
         Ok(decl)
+    }
+}
+
+/// Convert the function-level attribute list into the RVSDG
+/// representation, shared by definitions and declarations -- a
+/// declaration's attributes are promises about the unseen body (memory
+/// behaviour above all), which summary propagation seeds from.
+fn convert_fn_attributes(
+    source: &[llvm_ir::function::FunctionAttribute],
+    attrs: &mut FnAttrs,
+    inline_hint: &mut InlineHint,
+) {
+    use llvm_ir::function::FunctionAttribute;
+    let none = MemoryEffects {
+        other: ModRef::NoModRef,
+        arg_mem: ModRef::NoModRef,
+        inaccessible_mem: ModRef::NoModRef,
+        errno_mem: ModRef::NoModRef,
+    };
+    for attr in source {
+        match attr {
+            FunctionAttribute::NoReturn => attrs.flags |= FnAttrFlags::NO_RETURN,
+            FunctionAttribute::NoUnwind => attrs.flags |= FnAttrFlags::NO_UNWIND,
+            FunctionAttribute::NoRecurse => attrs.flags |= FnAttrFlags::NO_RECURSE,
+            FunctionAttribute::Cold => attrs.flags |= FnAttrFlags::COLD,
+            FunctionAttribute::StackProtect => attrs.flags |= FnAttrFlags::STACK_PROTECT,
+            FunctionAttribute::StackProtectReq => {
+                attrs.flags |= FnAttrFlags::STACK_PROTECT_REQ;
+            }
+            FunctionAttribute::StackProtectStrong => {
+                attrs.flags |= FnAttrFlags::STACK_PROTECT_STRONG;
+            }
+            FunctionAttribute::UWTable => attrs.flags |= FnAttrFlags::UWTABLE,
+            FunctionAttribute::WillReturn => attrs.flags |= FnAttrFlags::WILL_RETURN,
+            FunctionAttribute::NoSync => attrs.flags |= FnAttrFlags::NO_SYNC,
+            FunctionAttribute::NoFree => attrs.flags |= FnAttrFlags::NO_FREE,
+            FunctionAttribute::NoInline => {
+                attrs.flags |= FnAttrFlags::NO_INLINE;
+                *inline_hint = InlineHint::Never;
+            }
+            FunctionAttribute::AlwaysInline => {
+                attrs.flags |= FnAttrFlags::ALWAYS_INLINE;
+                *inline_hint = InlineHint::Always;
+            }
+            // Memory behaviour: LLVM 16+ input carries the composite
+            // memory(...) attribute; the bare variants are its pre-16
+            // spellings, mapped onto the same structure.
+            FunctionAttribute::Memory {
+                default,
+                argmem,
+                inaccessible_mem,
+                errno_mem,
+            } => {
+                let conv = |e: &llvm_ir::function::MemoryEffect| match e {
+                    llvm_ir::function::MemoryEffect::None => ModRef::NoModRef,
+                    llvm_ir::function::MemoryEffect::Read => ModRef::Ref,
+                    llvm_ir::function::MemoryEffect::Write => ModRef::Mod,
+                    llvm_ir::function::MemoryEffect::ReadWrite => ModRef::ModRef,
+                };
+                attrs.memory = Some(MemoryEffects {
+                    other: conv(default),
+                    arg_mem: conv(argmem),
+                    inaccessible_mem: conv(inaccessible_mem),
+                    errno_mem: conv(errno_mem),
+                });
+            }
+            FunctionAttribute::ReadNone => attrs.memory = Some(none),
+            FunctionAttribute::ReadOnly => {
+                attrs.memory = Some(MemoryEffects {
+                    other: ModRef::Ref,
+                    arg_mem: ModRef::Ref,
+                    inaccessible_mem: ModRef::Ref,
+                    errno_mem: ModRef::Ref,
+                });
+            }
+            FunctionAttribute::WriteOnly => {
+                attrs.memory = Some(MemoryEffects {
+                    other: ModRef::Mod,
+                    arg_mem: ModRef::Mod,
+                    inaccessible_mem: ModRef::Mod,
+                    errno_mem: ModRef::Mod,
+                });
+            }
+            FunctionAttribute::ArgMemOnly => {
+                attrs.memory = Some(MemoryEffects {
+                    arg_mem: ModRef::ModRef,
+                    ..none
+                });
+            }
+            FunctionAttribute::InaccessibleMemOnly => {
+                attrs.memory = Some(MemoryEffects {
+                    inaccessible_mem: ModRef::ModRef,
+                    ..none
+                });
+            }
+            FunctionAttribute::InaccessibleMemOrArgMemOnly => {
+                attrs.memory = Some(MemoryEffects {
+                    arg_mem: ModRef::ModRef,
+                    inaccessible_mem: ModRef::ModRef,
+                    ..none
+                });
+            }
+            // Carried verbatim: these steer codegen (target features,
+            // stack-protector sizing, frame pointer policy, ...).
+            FunctionAttribute::StringAttribute { kind, value } => {
+                attrs.string_attrs.push((kind.clone(), value.clone()));
+            }
+            // Not modeled yet; the fidelity net surfaces any of these
+            // the moment a real input carries them.
+            _ => {}
+        }
     }
 }
 

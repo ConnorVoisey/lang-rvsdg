@@ -30,6 +30,19 @@ tracing = "0.1.41"
 tracing-subscriber = "0.3.19"
 tracing-chrome = "0.7.2"
 thiserror = "2.0.18"
+# Heap profiling behind the dhat-heap feature: per-site allocation
+# attribution (counts, bytes, lifetimes) written to dhat-heap.json.
+dhat = { version = "0.3", optional = true }
+
+[features]
+dhat-heap = ["dep:dhat"]
 
 [dev-dependencies]
 pretty_assertions = "1.4.1"
+
+# Heap-profiling builds: release code with debug symbols so dhat's
+# backtraces resolve to source lines.
+# Usage: cargo build --profile dhat --features dhat-heap
+[profile.dhat]
+inherits = "release"
+debug = true
