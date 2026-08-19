@@ -171,6 +171,13 @@ impl SymbolScopes {
         id
     }
 
+    /// What `id` names: an LLVM SSA name, a restructuring auxiliary, or
+    /// the return value. Construct assembly uses this to look symbols up
+    /// in the read-sites table.
+    pub(in crate::llvm_parser) fn symbol(&self, id: SymbolId) -> &Symbol {
+        &self.symbols[id.0 as usize]
+    }
+
     /// Intern an LLVM name. Numbered names index an array directly; string
     /// names pay one hash.
     pub(in crate::llvm_parser) fn intern_name(&mut self, name: &Name) -> SymbolId {

@@ -41,7 +41,7 @@ use crate::{
             analysis::signature::{phi_incoming_from, phi_instructions_at},
             overlay::{AuxAssign, AuxVar, AuxVertexKind, Overlay, Vertex},
             partition::{Partitioner, SeedArc},
-            scopes::{Frame, RET_VAL, SymbolId},
+            scopes::{Frame, RET_VAL, Symbol, SymbolId, SymbolScopes},
             view::{Membership, PhiCopies, RegionView, TraversedArc},
         },
         instructions::RegionLowerer,
@@ -150,6 +150,28 @@ struct EmitScratch {
 }
 
 impl<'m> Emitter<'m> {
+    /// Should `symbol` become an output slot of a construct whose
+    /// member blocks satisfy `inside`? True when some read is
+    /// attributable outside the construct -- or when reads are
+    /// unknowable (auxiliary selectors, the return value, string-named
+    /// locals the read-sites table does not index), which
+    /// conservatively keeps the slot. Dead node elimination removes any
+    /// over-kept slot exactly as it did before this filter existed.
+    fn symbol_read_outside(
+        &self,
+        scopes: &SymbolScopes,
+        symbol: SymbolId,
+        inside: impl Fn(BasicBlockId) -> bool,
+    ) -> bool {
+        let Symbol::Name(name) = scopes.symbol(symbol) else {
+            return true;
+        };
+        let Some(reads) = self.fn_ctx.use_sites.read_blocks(name) else {
+            return true;
+        };
+        reads.iter().any(|&block| !inside(block))
+    }
+
     fn view<'v>(&'v self, region: &'v EmitRegion<'v>) -> RegionView<'v> {
         RegionView {
             mapper: self.fn_ctx.bb_mapper,
@@ -369,9 +391,22 @@ impl<'m> Emitter<'m> {
         input_values.clear();
         output_types.clear();
 
+        // A written symbol earns an output slot only if it is read
+        // somewhere the arms cannot see; a symbol only read inside the
+        // arms resolves within their frames, and a symbol read nowhere
+        // needs nothing. Skipped slots are exactly the ones dead node
+        // elimination would remove, minus ever creating them.
         for frame in &arm_frames {
             for &symbol in &frame.write_order {
-                if output_seen.insert(symbol) {
+                if output_seen.insert(symbol)
+                    && self.symbol_read_outside(lowerer.scopes, symbol, |block| {
+                        let vertex = match region.collapse[block.0 as usize] {
+                            Some(scc) => Vertex::Loop(scc),
+                            None => Vertex::Block(block),
+                        };
+                        arm_sets.iter().any(|set| set.contains(&vertex))
+                    })
+                {
                     outputs.push(symbol);
                 }
             }
@@ -643,8 +678,15 @@ impl<'m> Emitter<'m> {
                 slots.push(capture.symbol);
             }
         }
+        // A written-only symbol earns a loop-variable slot only if
+        // something reads it at all: inside the body (loop-carried
+        // values read their previous iteration there) or after the
+        // loop. Written-never-read symbols were the bulk of
+        // construction garbage.
         for &symbol in &frame.write_order {
-            if slot_seen.insert(symbol) {
+            if slot_seen.insert(symbol)
+                && self.symbol_read_outside(lowerer.scopes, symbol, |_| false)
+            {
                 slots.push(symbol);
             }
         }

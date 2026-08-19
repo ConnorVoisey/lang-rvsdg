@@ -4,6 +4,7 @@ use crate::{
         control_flow::scopes::SymbolScopes,
         instructions::RegionLowerer,
         scc::SccTree,
+        use_sites::UseSites,
     },
     rvsdg::{
         GlobalId, GlobalInit, InlineHint, Linkage, RVSDGMod, ThreadLocalMode, Visibility,
@@ -31,6 +32,7 @@ pub mod instructions;
 pub mod scc;
 #[cfg(test)]
 pub mod test_utils;
+pub mod use_sites;
 pub mod vector_instructions;
 
 struct FnCtx<'m> {
@@ -42,6 +44,9 @@ struct FnCtx<'m> {
     /// detection. (The synthetic exit block id lives on the overlay, which
     /// every consumer of it also holds.)
     pub scc_tree: &'m SccTree,
+    /// Per-name read blocks; construct assembly consults it so output
+    /// slots exist only for symbols something reads.
+    pub use_sites: &'m UseSites,
 }
 
 /// Intern every basic block of `func` to a dense [`BasicBlockId`], append the
@@ -322,12 +327,14 @@ impl RVSDGMod {
         // component to recover nested-loop structure. See the `scc` module
         // for the algorithm.
         let scc_tree = SccTree::build(&bb_mapper);
+        let use_sites = UseSites::scan(func, &bb_mapper);
 
         let fn_ctx = FnCtx {
             llvm_mod: module,
             func,
             bb_mapper: &bb_mapper,
             scc_tree: &scc_tree,
+            use_sites: &use_sites,
         };
 
         // Two-phase construction: restructure the control flow into overlay
