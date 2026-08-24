@@ -1,128 +1,232 @@
 # lang-rvsdg
 
-A RVSDG (Regionalized Value State Dependence Graph) compiler middle-end written in Rust. The goal is to compete with LLVM's optimization quality while being architecturally simpler and achieving significantly faster compile times.
+An optimising compiler middle-end built on the RVSDG (Regionalized Value
+State Dependence Graph) intermediate representation. Written in Rust, around
+24k lines, solo project. It consumes LLVM IR produced by clang and emits
+LLVM IR back out, which means every stage gets validated and benchmarked
+against real C codebases rather than toy inputs.
 
-## What is RVSDG?
+The goal is runtime performance near LLVM -O2 at a fraction of the compile
+time, with a simpler architecture than LLVM's. The construction, testing and
+measurement infrastructure is done and solid; the optimisation passes that
+will close the runtime gap are the current work. The status section below
+gives an accurate picture of both halves.
 
-RVSDG is a graph-based intermediate representation where:
+## What works today
 
-- **All control flow is structured** — no CFG, no basic blocks, no phi nodes in the traditional sense. Instead, control flow is represented by hierarchical structural nodes:
-  - **Gamma nodes** — conditionals (if/else), with a condition input and two sub-regions
-  - **Theta nodes** — tail-controlled loops, with loop variables threaded through a body region
-  - **Lambda nodes** — functions, with a body region
-  - **Phi nodes** — mutual recursion (not SSA phi)
-- **Data dependencies are explicit edges** — values flow along edges between nodes, making def-use chains trivially available
-- **Side effects are explicit via state edges** — memory operations are ordered by threading state tokens, making alias analysis and reordering opportunities visible in the graph structure itself
-- **Regions nest hierarchically** — every structural node contains one or more regions, which in turn contain nodes. This gives natural scope boundaries for optimization
+The full pipeline runs on real code. The SQLite amalgamation (roughly 250k
+lines of C), Lua, and all 30 PolyBench kernels compile end to end: LLVM IR
+in, RVSDG construction, optimisation, LLVM IR out, native binary. The
+resulting SQLite shell and Lua interpreter produce output identical to
+clang-built references on smoke workloads covering a broad SQL feature sweep
+and Lua language semantics.
 
-The key insight is that many optimizations that require complex analysis on a CFG (dead code elimination, common subexpression elimination, loop-invariant code motion) become structurally obvious or significantly simpler on an RVSDG because the graph encodes the information that CFG-based IRs must recompute.
+Construction and control-flow reconstruction follow Bahmann, Reissmann,
+Jahre and Meyer, "Perfect Reconstructability of Control Flow from Demand
+Dependence Graphs" (2015). That paper's approach, predicate continuation
+form with gamma/theta restructuring, handles arbitrary control flow without
+imposing structure on the generated code.
 
-For the foundational papers, see:
-- Bahmann et al., *"Perfect Reconstructability of Control Flow from Demand Dependence Graphs"* (2015)
-- Reissmann et al., *"RVSDG: An Intermediate Representation for Optimizing Compilers"* (2020)
+Correctness is tested through fuzzing, unit and integration tests. A differential
+tester compiles each input with this compiler and with clang, runs both
+binaries and diffs their behaviour. In fuzzing mode it generates programs
+with Csmith; failing cases get minimised with llvm-reduce. This has caught,
+and led to fixes for, a long list of real miscompilations. The most recent
+run of 10,000 generated programs found zero behavioural mismatches and one
+compiler crash on an unsupported construct. Alongside that sit a
+structural graph verifier (IDs, ownership, scoping, typing, state edges,
+predicate form) and around 300 unit tests.
+
+Performance work is measured, not guessed at. A purpose-built compile-time
+harness uses Cachegrind instruction counts as the primary signal, because
+they are deterministic and do not drown regressions in wall-clock noise,
+plus per-phase breakdowns and HTML regression reports against saved
+baselines. A separate harness runs PolyBench for runtime and compile-time
+comparisons against clang -O2.
+
+## Current numbers, with their caveats
+
+From the PolyBench suite, large dataset, all 30 kernels passing:
+
+- Runtime: median 1.9x slower than clang -O2, ranging from parity to 3.7x.
+  This is expected. The mid-end currently performs only dead node
+  elimination, so the comparison is roughly mem2reg plus codegen against
+  LLVM's full -O2 pipeline. Closing this gap is what the project is for.
+  Branch-heavy binaries like Lua and SQLite are also slower than clang's
+  builds; a known contributor is that the RVSDG destruction step, which
+  rebuilds control flow for LLVM emission, is currently naive.
+- Compile time, IR to object, both compilers given the same input bitcode:
+  median 0.86x of clang -O2, i.e. currently faster, though partly because
+  less optimisation work is being done. How much of that headroom survives
+  as real passes land is exactly the question the benchmark harness exists
+  to answer.
+
+## Why RVSDG
+
+RVSDG is a graph IR in which all control flow is structured. There is no
+CFG and there are no basic blocks. Instead:
+
+- Gamma nodes represent conditionals, with a predicate input and one
+  sub-region per branch.
+- Theta nodes represent tail-controlled loops, with loop variables threaded
+  through a body region.
+- Lambda nodes represent functions.
+- Data dependencies are explicit edges, so def-use chains come for free.
+- Side effects are ordered by explicit state edges. Memory operations
+  thread state tokens, which makes aliasing and reordering opportunities
+  visible in the graph itself.
+- Regions nest, giving natural scope boundaries for optimisation.
+
+The payoff is that optimisations needing substantial analysis on a CFG,
+such as dead code elimination, common subexpression elimination and
+loop-invariant code motion, become structurally simple, because the graph
+already encodes what CFG-based IRs have to recompute.
+
+Foundational papers: Bahmann et al. 2015 (construction and destruction)
+and Reissmann et al. 2020 (the RVSDG IR itself). Links at the bottom.
 
 ## Architecture
 
-### Pipeline
-
 ```
 C source
-  │
-  ▼
-clang -O1 -disable-llvm-passes    (frontend only, no LLVM opts)
-  │
-  ▼
-opt -passes=mem2reg                (promote allocas to SSA — required for clean IR)
-  │
-  ▼
+   |
+   v
+clang -O1 -Xclang -disable-llvm-passes    frontend only, no LLVM optimisation
+   |
+   v
+opt -passes=mem2reg                       promote locals to SSA
+   |
+   v
 LLVM bitcode (.bc)
-  │
-  ▼
-┌─────────────────────────────┐
-│  lang-rvsdg                 │
-│                             │
-│  LLVM IR → RVSDG (parse)    │
-│  Optimization passes        │
-│  RVSDG → LLVM IR (emit)     │
-└─────────────────────────────┘
-  │
-  ▼
+   |
+   v
++------------------------------------+
+|  lang-rvsdg                        |
+|                                    |
+|  parse LLVM IR, construct RVSDG    |
+|  (control-flow restructuring)      |
+|  optimisation passes               |
+|  graph verification                |
+|  emit LLVM IR                      |
++------------------------------------+
+   |
+   v
 LLVM bitcode (.bc)
-  │
-  ▼
-llc / clang                        (codegen to native)
+   |
+   v
+clang / llc                               codegen to native
 ```
 
-This is the same approach used by the [JLM compiler](https://github.com/phate/jlm). Consuming and emitting LLVM IR means we can:
+This is the same approach the [JLM compiler](https://github.com/phate/jlm)
+takes. Only mem2reg runs before construction. LLVM's restructuring and
+optimisation passes are deliberately disabled: restructuring control flow
+is the RVSDG construction's own job, and mid-level optimisation is what
+this project is here to do, so letting LLVM do either would bias every
+later benchmark.
 
-1. **Benchmark against real-world code** — any C/C++ project that compiles with clang can be fed through the pipeline
-2. **Use existing benchmark suites** — SPEC, Embench, compiler benchmarks all work out of the box
-3. **Compare optimization quality directly** — run the same code through `clang -O2` vs `clang -O0 | lang-rvsdg | llc` and diff the output
-4. **Swap codegen backends** — the plan is to also target Cranelift as an output layer, enabling a comparison of LLVM vs Cranelift codegen quality when lang-rvsdg is doing all the optimization work
+## Status
 
-### Compile time measurement
+As of August 2026.
 
-The LLVM IR round-trip (serialize → deserialize) is inherently slow and will dominate early compile-time numbers. To get meaningful measurements of actual optimization time, we use chrome tracing (`chrome://tracing`) to instrument passes and isolate the time spent within lang-rvsdg's own work from the LLVM IR I/O overhead.
+Working:
 
-## Current status
+- LLVM IR parsing and RVSDG construction, including globals, function
+  attributes, and the restructuring of arbitrary control flow into
+  gamma/theta form per the 2015 paper
+- RVSDG to LLVM IR emission and native codegen via clang/llc
+- Optimisation passes: dead node elimination, plus state-edge rerouting
+  around constructs that merely pass state through (which is what lets the
+  liveness pass collect pure constructs)
+- Structural verifier: ID validity, node ownership, scoping, typing, state
+  edge discipline, predicate form
+- Differential tester and Csmith fuzzer, compile-time benchmark harness,
+  PolyBench runtime harness, chrome-tracing instrumentation, heap profiling
 
-**Prototyping.** The core data structures exist but the LLVM IR parser does not yet construct RVSDG nodes — it iterates the LLVM module and prints debug output. No optimization passes are implemented. No RVSDG-to-LLVM emission exists.
+In progress:
 
-### What exists
+- Memory alias analysis. Pointer provenance tracking and escape analysis
+  run at construction time already; splitting the single memory state chain
+  into per-alias-class chains, so independent memory operations stop being
+  artificially ordered, is designed and being built.
 
-- Core RVSDG data structures: nodes, regions, values, state edges
-- Type system with arena-based interning and deduplication (scalars, pointers, arrays, functions, structs)
-- Builder API for constructing RVSDG graphs (partial — gamma/theta scaffolding)
-- LLVM bitcode ingestion pipeline (clang → opt → `llvm-ir` crate)
-- LLVM IR parser skeleton
+Planned:
 
-### What's next
+- The passes that will actually close the runtime gap: common subexpression
+  elimination, loop-invariant code motion, scalar promotion, induction
+  variable analysis
+- Smarter RVSDG destruction; the current control-flow reconstruction is
+  naive, which costs runtime performance on branch-heavy code
+- Function summaries for interprocedural precision
+- A non-LLVM codegen backend (Cranelift, potentially custom) for comparing backends while this
+  project does all the optimisation
 
-- Complete the LLVM IR → RVSDG construction
-- RVSDG → LLVM IR emission
-- First optimization passes (dead node elimination, constant folding)
-- Tracing instrumentation
-- Test infrastructure
+## Correctness testing
+
+The differential tester compiles a C file with both this compiler and
+clang, runs both binaries, and compares stdout and exit codes. With
+`--count N` it fuzzes instead: Csmith generates programs and the same
+comparison runs in a loop, in parallel, with every subprocess under a
+timeout, so a compiler crash, an abort() or an infinite loop becomes a
+reported finding rather than a stuck driver. Failing inputs are saved to
+`difftest-findings/`.
+
+```sh
+# test specific files
+cargo run --release --bin difftest -- some.c
+
+# fuzz 1000 csmith programs
+cargo run --release --bin difftest -- --count 1000
+```
+
+A found miscompilation is then shrunk with llvm-reduce while preserving the
+behavioural mismatch:
+
+```sh
+clang -I /usr/include/csmith-2.3.0 -O1 -Xclang -disable-llvm-passes \
+  -emit-llvm -c difftest-findings/7015.c -o difftest-findings/7015.bc
+opt -passes=mem2reg -S difftest-findings/7015.bc -o difftest-findings/7015.ll
+llvm-reduce --test interesting.sh difftest-findings/7015.ll -j $(nproc)
+```
+
+## Benchmarking
+
+`compile_bench` measures compile time with Cachegrind instruction counts as
+the primary signal, so regressions are not lost in wall-clock noise, plus
+optional wall/RSS/phase-breakdown passes, and renders an HTML report
+comparing runs against saved baselines. Both compilers are timed on the same
+pre-staged bitcode, so neither is charged for the shared clang frontend.
+
+```sh
+cargo run --release --bin compile_bench -- --polybench path/to/polybench
+```
+
+Results are recorded under `bench-results/` with the git SHA and machine
+metadata, so numbers are reproducible and comparable across commits.
 
 ## Building
 
 Requires:
-- Rust
-- clang-19 and opt-19 on `$PATH`
-- LLVM 19 development headers (for the `llvm-ir` crate)
+
+- Rust (edition 2024)
+- LLVM 22: `clang` and `opt` on `$PATH`, plus the LLVM 22 development
+  libraries (for inkwell and the llvm-ir crate)
 
 ```bash
-cargo build
-cargo cargo r --example cat
+cargo build --release
 
-# depending on how you've installed llvm19 you may need to provide the path
-LLVM_SYS_191_PREFIX=$(llvm-config-19 --prefix) cargo r --example cat
+# if llvm-config isn't the system default, point the llvm-sys build at it:
+LLVM_SYS_221_PREFIX=$(llvm-config --prefix) cargo build --release
 
-# this is the same for tests
-LLVM_SYS_191_PREFIX=$(llvm-config-19 --prefix) cargo t
+# run the test suite
+cargo test
 ```
 
 ## References
 
-- [JLM](https://github.com/phate/jlm) — RVSDG-based compiler that inspired this project's approach
-- [RVSDG paper](https://arxiv.org/abs/1912.05036) — Reissmann et al., 2020
-- [Cranelift](https://cranelift.dev/) — planned alternative codegen backend
-
-
-## Fuzzing
-
-There is a start of fuzzing using csmith. The difftest binary can be given a seed which will then start fuzzing at that seed. This compiles against clang and compares the binaries outputs.
-Once you've found a mismatch you can convert into llvm ir like this:
-
-```sh
-clang -I /usr/include/csmith-2.3.0 difftest-findings/7015.c -o clang_out
-
-opt-19 -passes=mem2reg -S -o difftest-findings/7015.ll difftest-findings/7015.bc
-```
-
-Then use llvm-reduce to simplify the IR whilst preserving the mismatch
-
-```sh
-llvm-reduce-19 --test interesting_mm.sh difftest-findings/7015.ll -j $(nproc)
-```
-
+- [JLM](https://github.com/phate/jlm), the RVSDG-based compiler whose
+  LLVM-IR-round-trip approach this project shares
+- [Bahmann et al. 2015](https://dl.acm.org/doi/10.1145/2693261), the
+  construction and destruction algorithms this project implements
+- [Reissmann et al. 2020](https://arxiv.org/abs/1912.05036), the RVSDG IR
+- [Cranelift](https://cranelift.dev/), the planned alternative codegen
+  backend
