@@ -33,6 +33,7 @@ thiserror = "2.0.18"
 # Heap profiling behind the dhat-heap feature: per-site allocation
 # attribution (counts, bytes, lifetimes) written to dhat-heap.json.
 dhat = { version = "0.3", optional = true }
+fixedbitset = "0.5.7"
 
 [features]
 dhat-heap = ["dep:dhat"]

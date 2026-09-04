@@ -1,5 +1,3 @@
-use smallvec::SmallVec;
-
 use crate::rvsdg::{
     RegionId, ValueId, ValuePool,
     function_graph::FunctionGraph,
@@ -182,15 +180,18 @@ impl Region {
 /// appends parameters to every region between a binding and its use),
 /// so each open region owns its own buffers; the free list recycles
 /// them so steady-state construction allocates nothing per region.
-/// The lists are SmallVecs deliberately: the inline slots mean a fresh
-/// scratch never allocates for the common shallow region (measured: a
-/// plain Vec for params costs about 22k extra allocations on a sqlite
-/// compile), while heavy regions grow past them either way.
+/// The lists are plain Vecs: scratches are recycled across regions AND
+/// functions (ConstructionScratch), so the free list carries warm heap
+/// capacity and steady state allocates nothing -- recycling is what
+/// retired the earlier SmallVec choice (its inline slots gain nothing
+/// from a free list and cost a 32+ byte memcpy every scratch move; the
+/// old "Vec costs ~22k extra allocations" measurement predates
+/// cross-function recycling).
 #[derive(Debug)]
 pub(crate) struct RegionScratch {
-    pub(crate) params: SmallVec<[ValueId; 8]>,
-    pub(crate) nodes: SmallVec<[ValueId; 8]>,
-    pub(crate) pending_read_states: SmallVec<[State; 2]>,
+    pub(crate) params: Vec<ValueId>,
+    pub(crate) nodes: Vec<ValueId>,
+    pub(crate) pending_read_states: Vec<State>,
     /// The chains' entry group, recorded at region open; seal writes it
     /// into the state-params tail.
     pub(crate) entry_state: StateGroup,
@@ -204,9 +205,9 @@ pub(crate) struct RegionScratch {
 impl Default for RegionScratch {
     fn default() -> Self {
         RegionScratch {
-            params: SmallVec::new(),
-            nodes: SmallVec::new(),
-            pending_read_states: SmallVec::new(),
+            params: Vec::new(),
+            nodes: Vec::new(),
+            pending_read_states: Vec::new(),
             entry_state: StateGroup::INVALID,
             exit_state: StateGroup::INVALID,
         }

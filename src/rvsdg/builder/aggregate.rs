@@ -1,4 +1,4 @@
-use crate::rvsdg::{Value, ValueId, ValueKind, types::TypeRef};
+use crate::rvsdg::{Value, ValueId, ValueKind, memory_alias::origin::MemoryOrigin, types::TypeRef};
 
 use super::RegionBuilder;
 
@@ -10,10 +10,16 @@ impl<'a> RegionBuilder<'a> {
         index: ValueId,
         element_type: TypeRef,
     ) -> ValueId {
-        self.add_value(Value {
-            ty: element_type,
-            kind: ValueKind::ExtractLane { vector, index },
-        })
+        // Origins do not follow pointers through vectors or aggregates
+        // (packing one in is an escape), so anything extracted back out
+        // is an Unknown-origin pointer at best.
+        self.add_value(
+            Value {
+                ty: element_type,
+                kind: ValueKind::ExtractLane { vector, index },
+            },
+            MemoryOrigin::unknown_if_ptr(element_type),
+        )
     }
 
     #[inline]
@@ -24,14 +30,19 @@ impl<'a> RegionBuilder<'a> {
         value: ValueId,
         vector_type: TypeRef,
     ) -> ValueId {
-        self.add_value(Value {
-            ty: vector_type,
-            kind: ValueKind::InsertLane {
-                vector,
-                index,
-                value,
+        // Same packing rule as insert_field.
+        self.graph.record_escape_event(value);
+        self.add_value(
+            Value {
+                ty: vector_type,
+                kind: ValueKind::InsertLane {
+                    vector,
+                    index,
+                    value,
+                },
             },
-        })
+            MemoryOrigin::None,
+        )
     }
 
     #[inline]
@@ -43,14 +54,17 @@ impl<'a> RegionBuilder<'a> {
         result_type: TypeRef,
     ) -> ValueId {
         let mask_span = self.graph.value_pool.push_slice(mask);
-        self.add_value(Value {
-            ty: result_type,
-            kind: ValueKind::ShuffleLanes {
-                left,
-                right,
-                mask: mask_span,
+        self.add_value(
+            Value {
+                ty: result_type,
+                kind: ValueKind::ShuffleLanes {
+                    left,
+                    right,
+                    mask: mask_span,
+                },
             },
-        })
+            MemoryOrigin::None,
+        )
     }
 
     #[inline]
@@ -61,13 +75,16 @@ impl<'a> RegionBuilder<'a> {
         field_type: TypeRef,
     ) -> ValueId {
         let indices_span = self.graph.u32_pool.push_slice(indices);
-        self.add_value(Value {
-            ty: field_type,
-            kind: ValueKind::ExtractField {
-                aggregate,
-                indices: indices_span,
+        self.add_value(
+            Value {
+                ty: field_type,
+                kind: ValueKind::ExtractField {
+                    aggregate,
+                    indices: indices_span,
+                },
             },
-        })
+            MemoryOrigin::unknown_if_ptr(field_type),
+        )
     }
 
     #[inline]
@@ -79,14 +96,22 @@ impl<'a> RegionBuilder<'a> {
         aggregate_type: TypeRef,
     ) -> ValueId {
         let indices_span = self.graph.u32_pool.push_slice(indices);
-        self.add_value(Value {
-            ty: aggregate_type,
-            kind: ValueKind::InsertField {
-                aggregate,
-                value,
-                indices: indices_span,
+        // A pointer packed into an aggregate escapes: its address is now
+        // inside a value origins cannot see into. (shuffle_lanes needs
+        // no hook -- vector lanes either escaped at their insert or came
+        // out of memory with no named origin.)
+        self.graph.record_escape_event(value);
+        self.add_value(
+            Value {
+                ty: aggregate_type,
+                kind: ValueKind::InsertField {
+                    aggregate,
+                    value,
+                    indices: indices_span,
+                },
             },
-        })
+            MemoryOrigin::None,
+        )
     }
 
     #[inline]
@@ -99,14 +124,17 @@ impl<'a> RegionBuilder<'a> {
         inbounds: bool,
     ) -> ValueId {
         let indices_span = self.graph.value_pool.push_slice(indices);
-        self.add_value(Value {
-            ty: result_type,
-            kind: ValueKind::PtrOffset {
-                base,
-                base_type,
-                indices: indices_span,
-                inbounds,
+        self.add_value(
+            Value {
+                ty: result_type,
+                kind: ValueKind::PtrOffset {
+                    base,
+                    base_type,
+                    indices: indices_span,
+                    inbounds,
+                },
             },
-        })
+            MemoryOrigin::Derived(base),
+        )
     }
 }

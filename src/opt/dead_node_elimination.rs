@@ -31,12 +31,17 @@ impl RVSDGMod {
         let mut effects = DneEffects::default();
         // Graph-sized mark scratch, reused across the function loop.
         let mut alive: Vec<bool> = Vec::new();
-        for graph in self.graphs.iter_mut().flatten() {
+        for (function_index, graph_slot) in self.graphs.iter_mut().enumerate() {
+            let Some(graph) = graph_slot else { continue };
             alive.clear();
             alive.resize(graph.value_kinds.len(), false);
             graph.mark_alive_nodes(&mut alive)?;
             graph.pin_projections(&mut alive, &mut effects);
-            graph.remove_dead_nodes(&alive, &mut effects);
+            let value_mapper = graph.remove_dead_nodes(&alive, &mut effects);
+            // Facts hold ValueIds (escaped origins, CallFact payloads);
+            // bring them through the same compaction or the barrier
+            // reads renumbered strangers.
+            self.facts[function_index].remap_ids(&value_mapper);
         }
         Ok(effects)
     }
@@ -211,7 +216,7 @@ impl FunctionGraph {
         stack.push(self.projection_of(theta, index));
     }
 
-    fn remove_dead_nodes(&mut self, alive: &[bool], effects: &mut DneEffects) {
+    fn remove_dead_nodes(&mut self, alive: &[bool], effects: &mut DneEffects) -> Vec<u32> {
         debug_assert_eq!(alive.len(), self.value_kinds.len());
 
         // Both mappers are plain prefix sums of the mark, complete
@@ -267,9 +272,17 @@ impl FunctionGraph {
             );
             self.value_kinds[value_mapper[old] as usize] = value;
             self.value_types[value_mapper[old] as usize] = self.value_types[old];
+            self.memory_origins[value_mapper[old] as usize] =
+                self.memory_origins[old].remap(&value_mapper);
         }
         self.value_kinds.truncate(live_values as usize);
         self.value_types.truncate(live_values as usize);
+        self.memory_origins.truncate(live_values as usize);
+        debug_assert_eq!(
+            self.memory_origins.len(),
+            self.value_kinds.len(),
+            "memory_origins desynced from value_kinds in DNE rebuild"
+        );
 
         // The region's lists, alive together so the shared block writer
         // sees the whole layout at once (params reuse `scratch`).
@@ -353,6 +366,9 @@ impl FunctionGraph {
         fresh.install(self);
 
         self.remap_interned_values(alive, &value_mapper);
+        // The caller remaps module-side id holders (facts) through the
+        // same mapper.
+        value_mapper
     }
 }
 

@@ -6,6 +6,7 @@ pub mod func;
 pub mod function_graph;
 pub mod global;
 pub mod lower_to_llvm;
+pub mod memory_alias;
 pub mod module_tables;
 pub mod ops;
 pub mod region;
@@ -40,6 +41,10 @@ pub struct RVSDGMod {
     pub module_asm: String,
     pub tables: ModuleTables,
     pub graphs: Vec<Option<FunctionGraph>>,
+    /// Per-function facts from construction, FuncId-indexed in lockstep
+    /// with `graphs` (declarations hold `FunctionFacts::empty()`).
+    /// Consumed by the barrier and classing; a pre-DNE snapshot.
+    pub facts: Vec<memory_alias::FunctionFacts>,
 }
 
 impl RVSDGMod {
@@ -51,6 +56,7 @@ impl RVSDGMod {
             module_asm: String::new(),
             tables: ModuleTables::default(),
             graphs: Vec::default(),
+            facts: Vec::default(),
         }
     }
 

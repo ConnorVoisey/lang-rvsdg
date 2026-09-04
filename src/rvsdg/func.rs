@@ -1,8 +1,9 @@
 use crate::rvsdg::{
     FuncId, InlineHint, Linkage, RVSDGMod, ValueId, Visibility,
     builder::RegionBuilder,
-    function_graph::FunctionGraph,
+    function_graph::{ConstructionScratch, FunctionGraph},
     global::DllStorageClass,
+    memory_alias::FunctionFacts,
     types::{FuncTypeId, TypeRef},
 };
 use rustc_hash::FxHashMap;
@@ -81,23 +82,24 @@ bitflags::bitflags! {
 /// LLVM 20 split errno out as its own location).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct MemoryEffects {
-    /// Everything not covered by the other classes.
-    pub other: ModRef,
     /// Memory reached through pointer arguments.
-    pub arg_mem: ModRef,
+    pub fn_args_mem: MemReadWrite,
     /// Memory not reachable from the caller.
-    pub inaccessible_mem: ModRef,
-    /// The thread's errno.
-    pub errno_mem: ModRef,
+    pub inaccessible_mem: MemReadWrite,
+    /// The thread's errno(libc error storage location).
+    pub errno_mem: MemReadWrite,
+    /// Everything not covered by the other classes.
+    pub other: MemReadWrite,
 }
 
 /// May-read / may-write for one memory class.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ModRef {
-    NoModRef,
-    Ref,
-    Mod,
-    ModRef,
+#[repr(u8)]
+pub enum MemReadWrite {
+    None = 0b00,
+    ReadOnly = 0b01,
+    WriteOnly = 0b10,
+    ReadAndWrite = 0b11,
 }
 
 /// Function-level attributes that affect codegen and optimisation.
@@ -295,6 +297,7 @@ impl RVSDGMod {
             .tables
             .declare_fn(name, params, ret_types, linkage_type);
         self.graphs.push(None);
+        self.facts.push(FunctionFacts::empty());
         id
     }
 
@@ -303,6 +306,7 @@ impl RVSDGMod {
     pub fn declare_fn_full(&mut self, decl: FnDecl) -> FuncId {
         let id = self.tables.declare_fn_full(decl);
         self.graphs.push(None);
+        self.facts.push(FunctionFacts::empty());
         id
     }
 
@@ -315,6 +319,23 @@ impl RVSDGMod {
         func_id: FuncId,
         rb_fn: impl FnOnce(&mut RegionBuilder) -> color_eyre::Result<Vec<ValueId>>,
     ) -> color_eyre::Result<()> {
+        // Convenience for tests and one-off definitions: fresh scratch,
+        // dropped after. Bulk construction (the parser loop) threads one
+        // scratch through define_fn_recycled instead.
+        self.define_fn_recycled(func_id, &mut ConstructionScratch::default(), rb_fn)
+    }
+
+    /// [`define_fn`](Self::define_fn) with caller-owned construction
+    /// scratch: the buffers move into the graph for the build and back
+    /// out at the end, so one scratch serves a whole module's
+    /// construction with warm capacity and zero steady-state
+    /// allocation.
+    pub fn define_fn_recycled(
+        &mut self,
+        func_id: FuncId,
+        scratch: &mut ConstructionScratch,
+        rb_fn: impl FnOnce(&mut RegionBuilder) -> color_eyre::Result<Vec<ValueId>>,
+    ) -> color_eyre::Result<()> {
         debug_assert_eq!(
             self.graphs.len(),
             self.tables.functions.len(),
@@ -322,16 +343,34 @@ impl RVSDGMod {
         );
         debug_assert!(self.graphs[func_id.0 as usize].is_none());
 
-        let mut graph = FunctionGraph::new(func_id);
+        let mut graph = FunctionGraph::new(func_id, std::mem::take(scratch));
         let mut rb = RegionBuilder::new_from_func(&mut graph, &mut self.tables, func_id);
         let region_id = rb.region_id;
-        let values = rb_fn(&mut rb)?;
+        let values = match rb_fn(&mut rb) {
+            Ok(values) => values,
+            Err(error) => {
+                // The failed body leaves open regions behind; salvage
+                // the scratch buffers and keep the function undefined
+                // (see recover_scratch for why that is sound).
+                *scratch = graph.recover_scratch();
+                return Err(error);
+            }
+        };
+        // Returned pointers escape (with return-specific handling for
+        // call results). Recorded HERE and never in seal_region: gamma
+        // arms and theta bodies seal through the same call, and their
+        // results are not returns.
+        for &value in &values {
+            graph.record_return_event(value);
+        }
         graph.seal_region(region_id, &values);
-        graph.finish_building();
+        let facts = graph.resolve_facts(&self.tables);
+        *scratch = graph.finish_building();
 
         // TODO: if in debug mode check that the return values match the declerations return types
         // Also consider if it is variadic
         self.graphs[func_id.0 as usize] = Some(graph);
+        self.facts[func_id.0 as usize] = facts;
         Ok(())
     }
 }

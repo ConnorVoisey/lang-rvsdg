@@ -3,10 +3,25 @@ use rustc_hash::FxHashMap;
 use crate::rvsdg::{
     ConstId, ConstValue, FuncId, GlobalId, MatchArmPool, RegionId, RegionPool, StateKind, U32Pool,
     Value, ValueId, ValueKind, ValuePool,
+    memory_alias::{MemoryFactScratch, origin::MemoryOrigin},
     region::{Region, RegionBuilding},
     state::StateGroup,
     types::TypeRef,
 };
+
+/// Construction-worker scratch: one set of heap buffers serving every
+/// function a driver builds, in sequence. It RESIDES on the
+/// FunctionGraph for the duration of one function (moved in at `new`,
+/// back out at `finish_building`) so the graph's internal accessors
+/// never change, and it is owned by the construction loop between
+/// functions -- the seam that becomes one-scratch-per-worker under
+/// parallel construction. Warm capacity from function 1 is what
+/// function 1800 builds in.
+#[derive(Debug, Default)]
+pub struct ConstructionScratch {
+    pub(crate) building: RegionBuilding,
+    pub(crate) mem_facts: MemoryFactScratch,
+}
 
 /// A construct's per-chain state projections; either may be absent once
 /// a bypassed chain's projection has been removed.
@@ -37,10 +52,16 @@ pub struct FunctionGraph {
     /// Open-region scratch; empty between construction and pass
     /// mutations.
     pub(crate) building: RegionBuilding,
+    /// Event scratch for fact collection; same residence pattern as
+    /// `building` (see [`ConstructionScratch`]).
+    pub(crate) mem_facts: MemoryFactScratch,
+
+    /// Pointer provenance per value indexed by ValueId.
+    pub(crate) memory_origins: Vec<MemoryOrigin>,
 }
 
 impl FunctionGraph {
-    pub fn new(func_id: FuncId) -> Self {
+    pub fn new(func_id: FuncId, scratch: ConstructionScratch) -> Self {
         Self {
             func_id,
             value_kinds: Vec::default(),
@@ -51,7 +72,9 @@ impl FunctionGraph {
             u32_pool: U32Pool(vec![]),
             match_arm_pool: MatchArmPool(vec![]),
             interned_values: FxHashMap::default(),
-            building: RegionBuilding::default(),
+            building: scratch.building,
+            mem_facts: scratch.mem_facts,
+            memory_origins: Vec::default(),
         }
     }
 
@@ -152,13 +175,46 @@ impl FunctionGraph {
     /// Release the construction scratch, called once when construction
     /// attaches the finished graph. Every region must be sealed by then;
     /// the accessors' sealed fast path never reads the table again.
-    pub(crate) fn finish_building(&mut self) {
+    /// Salvage the construction scratch from a build that failed
+    /// mid-way: open regions are recycled (their buffers cleared into
+    /// the free list) and the event scratch is emptied. The caller
+    /// discards the graph; the function stays undefined -- graphs[f]
+    /// None and empty facts, which the barrier treats exactly like a
+    /// declaration (TOP seeding), so a failed body is sound even if
+    /// compilation continues past the error.
+    pub(crate) fn recover_scratch(mut self) -> ConstructionScratch {
+        let mut building = std::mem::take(&mut self.building);
+        for slot in building.open.iter_mut() {
+            if let Some(mut region_scratch) = slot.take() {
+                region_scratch.params.clear();
+                region_scratch.nodes.clear();
+                region_scratch.pending_read_states.clear();
+                building.free.push(region_scratch);
+            }
+        }
+        let mut mem_facts = std::mem::take(&mut self.mem_facts);
+        mem_facts.clear();
+        ConstructionScratch {
+            building,
+            mem_facts,
+        }
+    }
+
+    pub(crate) fn finish_building(&mut self) -> ConstructionScratch {
         debug_assert!(
             self.building.open.iter().all(Option::is_none),
             "graph for {:?} attached with unsealed regions",
             self.func_id
         );
-        self.building = RegionBuilding::default();
+        let mut scratch = ConstructionScratch {
+            building: std::mem::take(&mut self.building),
+            mem_facts: std::mem::take(&mut self.mem_facts),
+        };
+        // resolve_facts cleared the events on the normal path; this
+        // backstop keeps a recycled scratch clean for callers that
+        // attach a graph without resolving.
+        scratch.mem_facts.clear();
+        scratch
     }
 
     /// The region's parameters, in input order. The seal check comes
@@ -209,11 +265,17 @@ impl FunctionGraph {
     /// Push a value and record it as a node of `region` (emission
     /// order). The single creation path for region-owned values; the
     /// builder and the state threading both go through it.
-    #[inline]
-    pub(crate) fn add_region_value(&mut self, region: RegionId, value: Value) -> ValueId {
+    #[inline(always)]
+    pub(crate) fn add_region_value(
+        &mut self,
+        region: RegionId,
+        value: Value,
+        memory_origin: MemoryOrigin,
+    ) -> ValueId {
         let id = ValueId(self.value_kinds.len() as u32);
         self.value_kinds.push(value.kind);
         self.value_types.push(value.ty);
+        self.memory_origins.push(memory_origin);
         self.push_region_node(region, id);
         id
     }
@@ -237,7 +299,12 @@ impl FunctionGraph {
     /// by the emitter's capture-on-demand: a region acquires an input
     /// the moment its body first reads an outer value, so parameter
     /// values interleave with body values in the value arrays.
-    pub(crate) fn append_region_param(&mut self, region: RegionId, ty: TypeRef) -> ValueId {
+    pub(crate) fn append_region_param(
+        &mut self,
+        region: RegionId,
+        ty: TypeRef,
+        memory_origin: MemoryOrigin,
+    ) -> ValueId {
         let id = ValueId(self.value_kinds.len() as u32);
         let func_id = self.func_id;
         let scratch = self.building.open[region.0 as usize]
@@ -248,6 +315,7 @@ impl FunctionGraph {
         self.value_kinds
             .push(ValueKind::RegionParam { index, ty, region });
         self.value_types.push(ty);
+        self.memory_origins.push(memory_origin);
         id
     }
 
@@ -315,51 +383,82 @@ impl FunctionGraph {
     /// them) and the emitter materialises LLVM constants on demand.
     #[inline]
     pub fn intern_const(&mut self, ty: TypeRef, value: ConstValue) -> ValueId {
-        self.intern_value(Value {
-            ty,
-            kind: ValueKind::Const(value),
-        })
+        // A pointer-typed constant (null, poison) has no base: Unknown.
+        let origin = MemoryOrigin::unknown_if_ptr(ty);
+        self.intern_value(
+            Value {
+                ty,
+                kind: ValueKind::Const(value),
+            },
+            origin,
+        )
     }
 
     /// Intern the address of a global: one node per global, module-wide.
     #[inline]
     pub fn intern_global_ref(&mut self, global: GlobalId, ptr_type: TypeRef) -> ValueId {
-        self.intern_value(Value {
-            ty: ptr_type,
-            kind: ValueKind::GlobalRef(global),
-        })
+        self.intern_value(
+            Value {
+                ty: ptr_type,
+                kind: ValueKind::GlobalRef(global),
+            },
+            MemoryOrigin::Global(global),
+        )
     }
 
     /// Intern the address of a function: one node per function,
     /// module-wide.
     #[inline]
     pub fn intern_func_addr(&mut self, func: FuncId, ptr_type: TypeRef) -> ValueId {
-        self.intern_value(Value {
-            ty: ptr_type,
-            kind: ValueKind::FuncAddr(func),
-        })
+        // Func is an origin of its own so the address survives
+        // derivation: `cond ? &f : &g` must widen into escapes that
+        // still NAME both functions.
+        self.intern_value(
+            Value {
+                ty: ptr_type,
+                kind: ValueKind::FuncAddr(func),
+            },
+            MemoryOrigin::Func(func),
+        )
     }
 
     /// Intern a reference to a pooled constant (aggregates, strings,
-    /// constant address expressions): one node per pool entry.
+    /// constant address expressions): one node per pool entry. The
+    /// caller resolves the origin (MemoryOrigin::of_constant) -- the
+    /// graph cannot see the constant pool.
     #[inline]
-    pub fn intern_const_pool_ref(&mut self, constant: ConstId, ty: TypeRef) -> ValueId {
-        self.intern_value(Value {
-            ty,
-            kind: ValueKind::ConstPoolRef(constant),
-        })
+    pub fn intern_const_pool_ref(
+        &mut self,
+        constant: ConstId,
+        ty: TypeRef,
+        memory_origin: MemoryOrigin,
+    ) -> ValueId {
+        self.intern_value(
+            Value {
+                ty,
+                kind: ValueKind::ConstPoolRef(constant),
+            },
+            memory_origin,
+        )
     }
 
     /// Shared by the intern_* constructors above, which are the only
     /// callers and only ever build region-free kinds.
     #[inline]
-    fn intern_value(&mut self, value: Value) -> ValueId {
+    fn intern_value(&mut self, value: Value, memory_origin: MemoryOrigin) -> ValueId {
         if let Some(&id) = self.interned_values.get(&value) {
+            // An interned value's origin is a function of its kind, so a
+            // cache hit must agree with what the caller derived.
+            debug_assert_eq!(
+                self.memory_origins[id.0 as usize], memory_origin,
+                "interned value re-derived with a different origin"
+            );
             return id;
         }
         let id = ValueId(self.value_kinds.len() as u32);
         self.value_kinds.push(value.kind);
         self.value_types.push(value.ty);
+        self.memory_origins.push(memory_origin);
         self.interned_values.insert(value, id);
         id
     }

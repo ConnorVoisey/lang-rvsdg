@@ -24,8 +24,9 @@ use serde::Serialize;
 use crate::rvsdg::{
     ConstValue, RVSDGMod, RegionId, Value, ValueId, ValueKind,
     alias::{BaseObject, may_alias_resolved},
-    func::{FnAttrs, ModRef},
+    func::{FnAttrs, MemReadWrite},
     function_graph::FunctionGraph,
+    memory_alias::{classing::ClassingCensus, origin::MemoryOrigin},
     ops::IntrinsicOp,
     types::TypeRef,
     verify::scope::Owner,
@@ -213,6 +214,14 @@ pub struct ModuleCensus {
     pub total_values: u64,
     pub live_values: u64,
     pub kind_counts: FxHashMap<&'static str, u64>,
+    /// Memory-origin histogram over the side table (post-resolution
+    /// when the census runs after construction): how much pointer
+    /// provenance the classing pass will actually have to work with,
+    /// and how much is Unknown (= class 0).
+    pub memory_origin_counts: FxHashMap<&'static str, u64>,
+    /// Where alloca origins went at the facts-only classing tier:
+    /// private classes vs class 0, split by cause (disjoint buckets).
+    pub alias_classing: ClassingCensus,
     /// Projection counts grouped by the kind of the projected node.
     pub projections_by_parent: FxHashMap<&'static str, u64>,
     /// Value-operand fan-out samples, concatenated across functions.
@@ -379,8 +388,8 @@ fn owner_region(owner: &[Owner], value: ValueId) -> Option<u32> {
 fn effects_are_readonly(attrs: &FnAttrs) -> bool {
     match attrs.memory {
         Some(effects) => {
-            let ok = |m: ModRef| matches!(m, ModRef::NoModRef | ModRef::Ref);
-            ok(effects.other) && ok(effects.arg_mem) && ok(effects.inaccessible_mem)
+            let ok = |m: MemReadWrite| matches!(m, MemReadWrite::None | MemReadWrite::ReadOnly);
+            ok(effects.other) && ok(effects.fn_args_mem) && ok(effects.inaccessible_mem)
         }
         None => false,
     }
@@ -994,7 +1003,7 @@ pub fn collect(m: &RVSDGMod) -> ModuleCensus {
     let mut budget = MemoryBudget::default();
     let mut top_candidates: Vec<(String, ValueId, &'static str, u32)> = Vec::new();
 
-    for (function, graph) in m.tables.functions.iter().zip(&m.graphs) {
+    for ((function, graph), facts) in m.tables.functions.iter().zip(&m.graphs).zip(&m.facts) {
         let Some(graph) = graph else { continue };
         census.total_values += graph.value_kinds.len() as u64;
         census.value_pool_len += graph.value_pool.len();
@@ -1010,6 +1019,23 @@ pub fn collect(m: &RVSDGMod) -> ModuleCensus {
                 *census.projections_by_parent.entry(parent).or_insert(0) += 1;
             }
         }
+
+        // Memory-origin histogram over the parallel side table.
+        for origin in &graph.memory_origins {
+            let name = match origin {
+                MemoryOrigin::None => "None",
+                MemoryOrigin::Alloca(_) => "Alloca",
+                MemoryOrigin::Param(_) => "Param",
+                MemoryOrigin::Global(_) => "Global",
+                MemoryOrigin::Derived(_) => "Derived (unresolved)",
+                MemoryOrigin::CallResult(_) => "CallResult",
+                MemoryOrigin::Func(_) => "Func",
+                MemoryOrigin::Unknown => "Unknown",
+            };
+            *census.memory_origin_counts.entry(name).or_insert(0) += 1;
+        }
+
+        census.alias_classing.accumulate(facts.classing_census());
 
         // Fan-out: value-operand uses plus region results.
         let mut fanout = vec![0u32; graph.value_kinds.len()];
@@ -1053,7 +1079,8 @@ pub fn collect(m: &RVSDGMod) -> ModuleCensus {
         // Byte budget of the backing arrays. Kinds and types are split
         // vectors since the SoA change, so both are counted explicitly.
         budget.values_bytes += graph.value_kinds.len() * size_of::<ValueKind>()
-            + graph.value_types.len() * size_of::<TypeRef>();
+            + graph.value_types.len() * size_of::<TypeRef>()
+            + graph.memory_origins.len() * size_of::<MemoryOrigin>();
         budget.value_pool_bytes += graph.value_pool.len() * size_of::<ValueId>();
         budget.region_structs_bytes +=
             graph.regions.len() * size_of::<crate::rvsdg::region::Region>();
@@ -1276,6 +1303,32 @@ impl ModuleCensus {
             writeln!(out, "-- projections by parent --")?;
             for (name, count) in parents {
                 writeln!(out, "  {name:<22} {count}")?;
+            }
+        }
+
+        if !self.memory_origin_counts.is_empty() {
+            let mut origins: Vec<(&&str, &u64)> = self.memory_origin_counts.iter().collect();
+            origins.sort_unstable_by_key(|(_, count)| std::cmp::Reverse(**count));
+            writeln!(out, "-- memory origins --")?;
+            for (name, count) in origins {
+                writeln!(out, "  {name:<22} {count}")?;
+            }
+        }
+
+        if self.alias_classing.total_allocas != 0 {
+            let classing = &self.alias_classing;
+            let percent = |part: u64| part as f64 * 100.0 / classing.total_allocas as f64;
+            writeln!(out, "-- alias classing (facts tier) --")?;
+            writeln!(out, "  allocas                {}", classing.total_allocas)?;
+            let buckets = [
+                ("private", classing.private),
+                ("escaped", classing.escaped),
+                ("retained by call", classing.retained_by_call),
+                ("folded volatile/atomic", classing.folded_volatile_atomic),
+                ("folded multi-address", classing.folded_multi_address),
+            ];
+            for (name, count) in buckets {
+                writeln!(out, "  {name:<22} {count} ({:.1}%)", percent(count))?;
             }
         }
 

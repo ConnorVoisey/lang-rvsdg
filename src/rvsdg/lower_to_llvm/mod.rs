@@ -2,8 +2,8 @@ use crate::rvsdg::{
     FuncId, GlobalId, GlobalInit, Linkage, RVSDGMod, RegionId, ThreadLocalMode, ValueId,
     Visibility,
     func::{
-        CallingConvention, FnAttrFlags, FnAttrs, Function, MemoryEffects, ModRef, ParamAttrFlags,
-        ParamAttrsExtra, Signature,
+        CallingConvention, FnAttrFlags, FnAttrs, Function, MemReadWrite, MemoryEffects,
+        ParamAttrFlags, ParamAttrsExtra, Signature,
     },
     function_graph::FunctionGraph,
     global::{DllStorageClass, GlobalDef, UnnamedAddr},
@@ -788,16 +788,16 @@ impl<'m, 'a, 'ctx> FunctionLowerer<'m, 'a, 'ctx> {
 /// memory(read) function through LLVM's own printer, so a stale layout
 /// fails against the linked LLVM rather than only against our decoder.
 fn memory_effects_to_llvm(memory: MemoryEffects) -> u64 {
-    let bits = |m: ModRef| -> u64 {
+    let bits = |m: MemReadWrite| -> u64 {
         match m {
-            ModRef::NoModRef => 0b00,
-            ModRef::Ref => 0b01,
-            ModRef::Mod => 0b10,
-            ModRef::ModRef => 0b11,
+            MemReadWrite::None => 0b00,
+            MemReadWrite::ReadOnly => 0b01,
+            MemReadWrite::WriteOnly => 0b10,
+            MemReadWrite::ReadAndWrite => 0b11,
         }
     };
     let other = bits(memory.other);
-    bits(memory.arg_mem)
+    bits(memory.fn_args_mem)
         | (bits(memory.inaccessible_mem) << 2)
         | (bits(memory.errno_mem) << 4)
         | (other << 6)

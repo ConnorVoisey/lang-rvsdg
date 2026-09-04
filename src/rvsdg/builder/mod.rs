@@ -6,6 +6,7 @@ mod memory;
 use crate::rvsdg::{
     AliasClassId, FuncId, RegionId, State, StateKind, Value, ValueId, ValueKind,
     function_graph::FunctionGraph,
+    memory_alias::origin::MemoryOrigin,
     module_tables::ModuleTables,
     state::{MemoryStates, StateGroup},
     types::TypeRef,
@@ -45,7 +46,10 @@ impl<'a> RegionBuilder<'a> {
     ) -> Self {
         let region = graph.create_region(entry);
         for &ty in param_types {
-            graph.append_region_param(region, ty);
+            // Subregion parameters cannot be tagged at creation (their
+            // aligned inputs are only known at construct assembly);
+            // finish_gamma/finish_theta set the Derived links.
+            graph.append_region_param(region, ty, MemoryOrigin::None);
         }
         Self {
             region_id: region,
@@ -70,8 +74,15 @@ impl<'a> RegionBuilder<'a> {
         };
         let region = graph.create_region(invalid);
         let function = module_tables.get_function(func_id);
-        for param in &function.params {
-            graph.append_region_param(region, param.ty);
+        for (index, param) in function.params.iter().enumerate() {
+            // Origins describe pointers; a non-pointer parameter carries
+            // None like every other non-pointer value.
+            let origin = if matches!(param.ty, TypeRef::Ptr(_)) {
+                MemoryOrigin::Param(index as u32)
+            } else {
+                MemoryOrigin::None
+            };
+            graph.append_region_param(region, param.ty, origin);
         }
 
         // Add one state parameter per chain after all value params, in
@@ -87,6 +98,7 @@ impl<'a> RegionBuilder<'a> {
                 region,
             });
             graph.value_types.push(ty);
+            graph.memory_origins.push(MemoryOrigin::None);
             State(id)
         };
         let memory = state_param(
@@ -129,8 +141,9 @@ impl<'a> RegionBuilder<'a> {
     }
 
     #[inline(always)]
-    pub(crate) fn add_value(&mut self, data: Value) -> ValueId {
-        self.graph.add_region_value(self.region_id, data)
+    pub(crate) fn add_value(&mut self, data: Value, memory_origin: MemoryOrigin) -> ValueId {
+        self.graph
+            .add_region_value(self.region_id, data, memory_origin)
     }
 }
 
@@ -186,10 +199,51 @@ pub struct LoopResult {
 
 #[cfg(test)]
 mod test {
+    use color_eyre::eyre::eyre;
+
     use crate::rvsdg::{
         ArithFlags, BinaryOp, ICmpPred, Linkage, RVSDGMod,
+        function_graph::ConstructionScratch,
         types::{BOOL, I32},
     };
+
+    // A body that fails mid-build must leave the function undefined
+    // (graphs[f] None, facts[f] empty -- the barrier then treats it
+    // like a declaration) and salvage the scratch buffers for the next
+    // function.
+    #[test]
+    fn failed_define_recovers_scratch() {
+        let mut module = RVSDGMod::new_host(String::from("test"));
+        let failing = module.declare_fn(String::from("bad"), &[], &[I32], Linkage::Internal);
+        let succeeding = module.declare_fn(String::from("good"), &[], &[I32], Linkage::Internal);
+
+        let mut scratch = ConstructionScratch::default();
+        let result = module.define_fn_recycled(failing, &mut scratch, |rb| {
+            // Real work in flight -- the body region is open when the
+            // failure hits.
+            let five = rb.const_i32(5);
+            let three = rb.const_i32(3);
+            let _sum = rb.binary(BinaryOp::Add, ArithFlags::default(), five, three, I32);
+            Err(eyre!("front-end failure"))
+        });
+        assert!(result.is_err());
+        assert!(
+            module.graphs[failing.0 as usize].is_none(),
+            "stays undefined"
+        );
+        assert!(
+            !scratch.building.free.is_empty(),
+            "the open body region's buffers were salvaged"
+        );
+
+        // The recovered scratch serves the next function.
+        module
+            .define_fn_recycled(succeeding, &mut scratch, |rb| Ok(vec![rb.const_i32(0)]))
+            .unwrap();
+        assert!(module.graphs[succeeding.0 as usize].is_some());
+        let errors = module.verify();
+        assert!(errors.is_empty(), "{errors:?}");
+    }
 
     #[test]
     fn test_example() {

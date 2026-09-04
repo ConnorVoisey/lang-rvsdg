@@ -322,7 +322,12 @@ impl SymbolScopes {
         for depth in top.depth + 1..=current {
             let region = self.frames[depth as usize].region;
             let ty = graph.get_value_type(value);
-            let param = graph.append_region_param(region, *ty);
+            // Tagged at construct assembly like every subregion param.
+            let param = graph.append_region_param(
+                region,
+                *ty,
+                crate::rvsdg::memory_alias::origin::MemoryOrigin::None,
+            );
             self.frames[depth as usize].captures.push(Capture {
                 symbol: id,
                 outer: value,

@@ -460,7 +460,13 @@ impl<'m> Emitter<'m> {
                     .map(|capture| capture.param);
                 let param = existing.unwrap_or_else(|| {
                     let ty = graph.get_value_type(input_values[i]);
-                    graph.append_region_param(region_id, *ty)
+                    // Subregion params are tagged at construct assembly
+                    // (finish_gamma sets the Derived links), not here.
+                    graph.append_region_param(
+                        region_id,
+                        *ty,
+                        crate::rvsdg::memory_alias::origin::MemoryOrigin::None,
+                    )
                 });
                 params.push(param);
             }
@@ -718,7 +724,11 @@ impl<'m> Emitter<'m> {
                         None => lowerer.rb.constant(ty, ConstValue::Poison),
                     };
                     loop_var_inputs.push(init);
-                    params.push(lowerer.rb.graph.append_region_param(body_region_id, ty));
+                    params.push(lowerer.rb.graph.append_region_param(
+                        body_region_id,
+                        ty,
+                        crate::rvsdg::memory_alias::origin::MemoryOrigin::None,
+                    ));
                 }
             }
         }

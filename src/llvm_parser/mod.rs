@@ -9,9 +9,10 @@ use crate::{
     rvsdg::{
         GlobalId, GlobalInit, InlineHint, Linkage, RVSDGMod, ThreadLocalMode, Visibility,
         func::{
-            CallingConvention, FnAttrFlags, FnAttrs, FnDecl, MemoryEffects, ModRef, Param,
+            CallingConvention, FnAttrFlags, FnAttrs, FnDecl, MemReadWrite, MemoryEffects, Param,
             ParamAttrFlags, ParamAttrs, ParamAttrsExtra,
         },
+        function_graph::ConstructionScratch,
         global::{DllStorageClass, GlobalDef, UnnamedAddr},
         types::{
             ArrayType, FuncType, PtrType, ScalarType, StructDef, StructField, TypeArena, TypeRef,
@@ -301,9 +302,11 @@ impl RVSDGMod {
         // TODO: lower types
         // pub types: Types,
 
-        // lower function bodies
+        // lower function bodies; one construction scratch serves them
+        // all in sequence (warm buffers, zero steady-state allocation)
+        let mut scratch = ConstructionScratch::default();
         for func in &module.functions {
-            rvsdg_mod.lower_fn_body(func, &module)?;
+            rvsdg_mod.lower_fn_body(func, &module, &mut scratch)?;
         }
 
         Ok(rvsdg_mod)
@@ -314,6 +317,7 @@ impl RVSDGMod {
         &mut self,
         func: &llvm_ir::Function,
         module: &Module,
+        scratch: &mut ConstructionScratch,
     ) -> color_eyre::Result<()> {
         let fn_id = self
             .tables
@@ -348,7 +352,7 @@ impl RVSDGMod {
             .chain(std::iter::once(false))
             .collect();
         let overlay = control_flow::build_overlay(&bb_mapper, &scc_tree, diverging);
-        self.define_fn(fn_id, |rb| {
+        self.define_fn_recycled(fn_id, scratch, |rb| {
             let mut scopes = SymbolScopes::new(rb.region_id);
             // Register function parameters as root-frame bindings.
             for (i, param) in func.parameters.iter().enumerate() {
@@ -785,10 +789,10 @@ fn convert_fn_attributes(
 ) {
     use llvm_ir::function::FunctionAttribute;
     let none = MemoryEffects {
-        other: ModRef::NoModRef,
-        arg_mem: ModRef::NoModRef,
-        inaccessible_mem: ModRef::NoModRef,
-        errno_mem: ModRef::NoModRef,
+        other: MemReadWrite::None,
+        fn_args_mem: MemReadWrite::None,
+        inaccessible_mem: MemReadWrite::None,
+        errno_mem: MemReadWrite::None,
     };
     for attr in source {
         match attr {
@@ -825,14 +829,14 @@ fn convert_fn_attributes(
                 errno_mem,
             } => {
                 let conv = |e: &llvm_ir::function::MemoryEffect| match e {
-                    llvm_ir::function::MemoryEffect::None => ModRef::NoModRef,
-                    llvm_ir::function::MemoryEffect::Read => ModRef::Ref,
-                    llvm_ir::function::MemoryEffect::Write => ModRef::Mod,
-                    llvm_ir::function::MemoryEffect::ReadWrite => ModRef::ModRef,
+                    llvm_ir::function::MemoryEffect::None => MemReadWrite::None,
+                    llvm_ir::function::MemoryEffect::Read => MemReadWrite::ReadOnly,
+                    llvm_ir::function::MemoryEffect::Write => MemReadWrite::WriteOnly,
+                    llvm_ir::function::MemoryEffect::ReadWrite => MemReadWrite::ReadAndWrite,
                 };
                 attrs.memory = Some(MemoryEffects {
                     other: conv(default),
-                    arg_mem: conv(argmem),
+                    fn_args_mem: conv(argmem),
                     inaccessible_mem: conv(inaccessible_mem),
                     errno_mem: conv(errno_mem),
                 });
@@ -840,36 +844,36 @@ fn convert_fn_attributes(
             FunctionAttribute::ReadNone => attrs.memory = Some(none),
             FunctionAttribute::ReadOnly => {
                 attrs.memory = Some(MemoryEffects {
-                    other: ModRef::Ref,
-                    arg_mem: ModRef::Ref,
-                    inaccessible_mem: ModRef::Ref,
-                    errno_mem: ModRef::Ref,
+                    other: MemReadWrite::ReadOnly,
+                    fn_args_mem: MemReadWrite::ReadOnly,
+                    inaccessible_mem: MemReadWrite::ReadOnly,
+                    errno_mem: MemReadWrite::ReadOnly,
                 });
             }
             FunctionAttribute::WriteOnly => {
                 attrs.memory = Some(MemoryEffects {
-                    other: ModRef::Mod,
-                    arg_mem: ModRef::Mod,
-                    inaccessible_mem: ModRef::Mod,
-                    errno_mem: ModRef::Mod,
+                    other: MemReadWrite::WriteOnly,
+                    fn_args_mem: MemReadWrite::WriteOnly,
+                    inaccessible_mem: MemReadWrite::WriteOnly,
+                    errno_mem: MemReadWrite::WriteOnly,
                 });
             }
             FunctionAttribute::ArgMemOnly => {
                 attrs.memory = Some(MemoryEffects {
-                    arg_mem: ModRef::ModRef,
+                    fn_args_mem: MemReadWrite::ReadAndWrite,
                     ..none
                 });
             }
             FunctionAttribute::InaccessibleMemOnly => {
                 attrs.memory = Some(MemoryEffects {
-                    inaccessible_mem: ModRef::ModRef,
+                    inaccessible_mem: MemReadWrite::ReadAndWrite,
                     ..none
                 });
             }
             FunctionAttribute::InaccessibleMemOrArgMemOnly => {
                 attrs.memory = Some(MemoryEffects {
-                    arg_mem: ModRef::ModRef,
-                    inaccessible_mem: ModRef::ModRef,
+                    fn_args_mem: MemReadWrite::ReadAndWrite,
+                    inaccessible_mem: MemReadWrite::ReadAndWrite,
                     ..none
                 });
             }

@@ -1,6 +1,6 @@
 use crate::rvsdg::{
-    RegionId, Value, ValueId, ValueKind, function_graph::FunctionGraph, region::RegionScratch,
-    types::TypeRef,
+    RegionId, Value, ValueId, ValueKind, function_graph::FunctionGraph,
+    memory_alias::origin::MemoryOrigin, region::RegionScratch, types::TypeRef,
 };
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
@@ -107,6 +107,7 @@ impl FunctionGraph {
                         ty: TypeRef::State(StateKind::MemoryRead(AliasClassId(0))),
                         kind: ValueKind::StateMerge { inputs },
                     },
+                    MemoryOrigin::None,
                 );
                 State(value)
             }
@@ -121,10 +122,11 @@ impl FunctionGraph {
     pub(crate) fn state_write(
         &mut self,
         region_id: RegionId,
-        make: impl FnOnce(State) -> Value,
+        make: impl FnOnce(State) -> (Value, MemoryOrigin),
     ) -> State {
         let input_state = self.state_read_flatten(region_id);
-        let out_state = State(self.add_region_value(region_id, make(input_state)));
+        let (value, memory_origin) = make(input_state);
+        let out_state = State(self.add_region_value(region_id, value, memory_origin));
         let memory = &mut self.get_scratch(region_id).exit_state.memory;
         memory.write = out_state;
         memory.read = out_state;

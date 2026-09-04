@@ -1,13 +1,22 @@
 use crate::rvsdg::{
     FuncId, GlobalId, MatchArmSpan, RegionId, RegionsSpan, State, U32Span, ValueId, ValuesSpan,
     constant::ConstId,
-    func::SignatureId,
+    func::{MemReadWrite, SignatureId},
     ops::{
         ArithFlags, AtomicRMWOp, BinaryOp, CastOp, FCmpPred, ICmpPred, IntrinsicOp, MemoryOrdering,
         UnaryOp,
     },
     types::TypeRef,
 };
+
+/// A single-address memory access: the op's address operand and
+/// whether the op may read or write through it. See
+/// [`ValueKind::memory_access`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryAccess {
+    pub addr: ValueId,
+    pub effect: MemReadWrite,
+}
 
 /// The data associated with a Value in the pool.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -360,6 +369,63 @@ impl ValueKind {
             | ValueKind::Call { state, .. }
             | ValueKind::CallIndirect { state, .. } => Some(*state),
             ValueKind::StateMerge { .. }
+            | ValueKind::Gamma { .. }
+            | ValueKind::Theta { .. }
+            | ValueKind::Const(_)
+            | ValueKind::ConstPoolRef(_)
+            | ValueKind::GlobalRef(_)
+            | ValueKind::FuncAddr(_)
+            | ValueKind::Unary { .. }
+            | ValueKind::Binary { .. }
+            | ValueKind::ICmp { .. }
+            | ValueKind::FCmp { .. }
+            | ValueKind::Ternary { .. }
+            | ValueKind::Cast { .. }
+            | ValueKind::ExtractLane { .. }
+            | ValueKind::InsertLane { .. }
+            | ValueKind::ShuffleLanes { .. }
+            | ValueKind::ExtractField { .. }
+            | ValueKind::InsertField { .. }
+            | ValueKind::PtrOffset { .. }
+            | ValueKind::Freeze { .. }
+            | ValueKind::Match { .. }
+            | ValueKind::Project { .. }
+            | ValueKind::RegionParam { .. } => None,
+        }
+    }
+
+    /// The single-address memory access an op performs, when it has
+    /// one: the address operand plus whether the op may read or write
+    /// through it. The single definition of per-op access direction;
+    /// deliberately exhaustive so a new variant forces a decision.
+    /// Multi-address ops (memory-class intrinsics: memcpy touches a
+    /// source AND a destination) and address-free ops (fences) return
+    /// None and are handled by their callers explicitly.
+    pub fn memory_access(&self) -> Option<MemoryAccess> {
+        match self {
+            ValueKind::Load { addr, .. } | ValueKind::AtomicLoad { addr, .. } => {
+                Some(MemoryAccess {
+                    addr: *addr,
+                    effect: MemReadWrite::ReadOnly,
+                })
+            }
+            ValueKind::Store { addr, .. } | ValueKind::AtomicStore { addr, .. } => {
+                Some(MemoryAccess {
+                    addr: *addr,
+                    effect: MemReadWrite::WriteOnly,
+                })
+            }
+            ValueKind::AtomicReadModifyWrite { addr, .. }
+            | ValueKind::CompareAndSwap { addr, .. } => Some(MemoryAccess {
+                addr: *addr,
+                effect: MemReadWrite::ReadAndWrite,
+            }),
+            ValueKind::Alloca { .. }
+            | ValueKind::Fence { .. }
+            | ValueKind::Intrinsic { .. }
+            | ValueKind::Call { .. }
+            | ValueKind::CallIndirect { .. }
+            | ValueKind::StateMerge { .. }
             | ValueKind::Gamma { .. }
             | ValueKind::Theta { .. }
             | ValueKind::Const(_)

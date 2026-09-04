@@ -2,6 +2,7 @@ use crate::rvsdg::{
     AliasClassId, ArithFlags, BinaryOp, CastOp, ConstValue, FCmpPred, FuncId, ICmpPred,
     IntrinsicOp, StateKind, UnaryOp, Value, ValueId, ValueKind,
     constant::ConstId,
+    memory_alias::origin::MemoryOrigin,
     types::{BOOL, I32, I64, TypeRef},
 };
 
@@ -30,7 +31,14 @@ impl<'a> RegionBuilder<'a> {
 
     #[inline]
     pub fn const_pool_ref(&mut self, const_id: ConstId, ty: TypeRef) -> ValueId {
-        self.graph.intern_const_pool_ref(const_id, ty)
+        // The graph cannot see the constant pool, so the base global of
+        // a pointer-typed pool constant resolves here.
+        let origin = if matches!(ty, TypeRef::Ptr(_)) {
+            MemoryOrigin::of_constant(&self.module_tables.constants, const_id)
+        } else {
+            MemoryOrigin::None
+        };
+        self.graph.intern_const_pool_ref(const_id, ty, origin)
     }
 
     #[inline]
@@ -45,10 +53,13 @@ impl<'a> RegionBuilder<'a> {
 
     #[inline]
     pub fn unary(&mut self, op: UnaryOp, operand: ValueId, ret_type: TypeRef) -> ValueId {
-        self.add_value(Value {
-            ty: ret_type,
-            kind: ValueKind::Unary { op, operand },
-        })
+        self.add_value(
+            Value {
+                ty: ret_type,
+                kind: ValueKind::Unary { op, operand },
+            },
+            MemoryOrigin::None,
+        )
     }
 
     #[inline]
@@ -60,31 +71,42 @@ impl<'a> RegionBuilder<'a> {
         right: ValueId,
         ret_type: TypeRef,
     ) -> ValueId {
-        self.add_value(Value {
-            ty: ret_type,
-            kind: ValueKind::Binary {
-                op,
-                flags,
-                left,
-                right,
+        // Pointer arithmetic never comes through here (that is
+        // ptr_offset); integer results carry no origin.
+        self.add_value(
+            Value {
+                ty: ret_type,
+                kind: ValueKind::Binary {
+                    op,
+                    flags,
+                    left,
+                    right,
+                },
             },
-        })
+            MemoryOrigin::None,
+        )
     }
 
     #[inline]
     pub fn icmp(&mut self, pred: ICmpPred, left: ValueId, right: ValueId) -> ValueId {
-        self.add_value(Value {
-            ty: BOOL,
-            kind: ValueKind::ICmp { pred, left, right },
-        })
+        self.add_value(
+            Value {
+                ty: BOOL,
+                kind: ValueKind::ICmp { pred, left, right },
+            },
+            MemoryOrigin::None,
+        )
     }
 
     #[inline]
     pub fn fcmp(&mut self, pred: FCmpPred, left: ValueId, right: ValueId) -> ValueId {
-        self.add_value(Value {
-            ty: BOOL,
-            kind: ValueKind::FCmp { pred, left, right },
-        })
+        self.add_value(
+            Value {
+                ty: BOOL,
+                kind: ValueKind::FCmp { pred, left, right },
+            },
+            MemoryOrigin::None,
+        )
     }
 
     #[inline]
@@ -95,22 +117,55 @@ impl<'a> RegionBuilder<'a> {
         false_val: ValueId,
         ret_type: TypeRef,
     ) -> ValueId {
-        self.add_value(Value {
-            ty: ret_type,
-            kind: ValueKind::Ternary {
-                condition,
-                true_val,
-                false_val,
+        // A pointer select is a JOIN: link one side now (never a copy,
+        // the one rule); the other side becomes a join event once the
+        // event scratch lands, and resolution widens disagreements.
+        let is_ptr = matches!(ret_type, TypeRef::Ptr(_));
+        let origin = if is_ptr {
+            MemoryOrigin::Derived(true_val)
+        } else {
+            MemoryOrigin::None
+        };
+        let result = self.add_value(
+            Value {
+                ty: ret_type,
+                kind: ValueKind::Ternary {
+                    condition,
+                    true_val,
+                    false_val,
+                },
             },
-        })
+            origin,
+        );
+        if is_ptr {
+            self.graph.record_join_event(result, false_val);
+        }
+        result
     }
 
     #[inline]
     pub fn cast(&mut self, op: CastOp, value: ValueId, result_type: TypeRef) -> ValueId {
-        self.add_value(Value {
-            ty: result_type,
-            kind: ValueKind::Cast { op, value },
-        })
+        let origin = match op {
+            // The same pointer under a different name.
+            CastOp::Bitcast if matches!(result_type, TypeRef::Ptr(_)) => {
+                MemoryOrigin::Derived(value)
+            }
+            // A laundered pointer: origins cannot follow integers.
+            CastOp::IntToPtr => MemoryOrigin::Unknown,
+            // Everything else produces non-pointers.
+            _ => MemoryOrigin::None,
+        };
+        if matches!(op, CastOp::PtrToInt) {
+            // The address becomes a number origins cannot follow.
+            self.graph.record_escape_event(value);
+        }
+        self.add_value(
+            Value {
+                ty: result_type,
+                kind: ValueKind::Cast { op, value },
+            },
+            origin,
+        )
     }
 
     // Stateful intrinsics thread as writes: the input state (pending
@@ -121,14 +176,20 @@ impl<'a> RegionBuilder<'a> {
     #[inline]
     pub fn intrinsic_void(&mut self, op: IntrinsicOp, args: &[ValueId]) {
         let args_span = self.graph.value_pool.push_slice(args);
-        self.graph.state_write(self.region_id, |state| Value {
-            ty: TypeRef::State(StateKind::MemoryWrite(AliasClassId(0))),
-            kind: ValueKind::Intrinsic {
-                op,
-                state,
-                args: args_span,
-            },
+        let out_state = self.graph.state_write(self.region_id, |state| {
+            (
+                Value {
+                    ty: TypeRef::State(StateKind::MemoryWrite(AliasClassId(0))),
+                    kind: ValueKind::Intrinsic {
+                        op,
+                        state,
+                        args: args_span,
+                    },
+                },
+                MemoryOrigin::None,
+            )
         });
+        self.graph.record_access_event(out_state.0);
     }
 
     /// Emit an intrinsic that produces one data result, returned.
@@ -137,21 +198,30 @@ impl<'a> RegionBuilder<'a> {
     #[inline]
     pub fn intrinsic(&mut self, op: IntrinsicOp, args: &[ValueId], ret_type: TypeRef) -> ValueId {
         let args_span = self.graph.value_pool.push_slice(args);
-        let out_state = self.graph.state_write(self.region_id, |state| Value {
-            ty: TypeRef::State(StateKind::MemoryWrite(AliasClassId(0))),
-            kind: ValueKind::Intrinsic {
-                op,
-                state,
-                args: args_span,
-            },
+        let out_state = self.graph.state_write(self.region_id, |state| {
+            (
+                Value {
+                    ty: TypeRef::State(StateKind::MemoryWrite(AliasClassId(0))),
+                    kind: ValueKind::Intrinsic {
+                        op,
+                        state,
+                        args: args_span,
+                    },
+                },
+                MemoryOrigin::None,
+            )
         });
-        self.add_value(Value {
-            ty: ret_type,
-            kind: ValueKind::Project {
-                call: out_state.0,
-                index: 0,
+        self.graph.record_access_event(out_state.0);
+        self.add_value(
+            Value {
+                ty: ret_type,
+                kind: ValueKind::Project {
+                    call: out_state.0,
+                    index: 0,
+                },
             },
-        })
+            MemoryOrigin::unknown_if_ptr(ret_type),
+        )
     }
 
     /// Emit an overflow-checked arithmetic intrinsic.
@@ -164,28 +234,40 @@ impl<'a> RegionBuilder<'a> {
         ret_type: TypeRef,
     ) -> OverflowResult {
         let args_span = self.graph.value_pool.push_slice(args);
-        let out_state = self.graph.state_write(self.region_id, |state| Value {
-            ty: TypeRef::State(StateKind::MemoryWrite(AliasClassId(0))),
-            kind: ValueKind::Intrinsic {
-                op,
-                state,
-                args: args_span,
-            },
+        let out_state = self.graph.state_write(self.region_id, |state| {
+            (
+                Value {
+                    ty: TypeRef::State(StateKind::MemoryWrite(AliasClassId(0))),
+                    kind: ValueKind::Intrinsic {
+                        op,
+                        state,
+                        args: args_span,
+                    },
+                },
+                MemoryOrigin::None,
+            )
         });
-        let result = self.add_value(Value {
-            ty: ret_type,
-            kind: ValueKind::Project {
-                call: out_state.0,
-                index: 0,
+        self.graph.record_access_event(out_state.0);
+        let result = self.add_value(
+            Value {
+                ty: ret_type,
+                kind: ValueKind::Project {
+                    call: out_state.0,
+                    index: 0,
+                },
             },
-        });
-        let overflow = self.add_value(Value {
-            ty: BOOL,
-            kind: ValueKind::Project {
-                call: out_state.0,
-                index: 1,
+            MemoryOrigin::None,
+        );
+        let overflow = self.add_value(
+            Value {
+                ty: BOOL,
+                kind: ValueKind::Project {
+                    call: out_state.0,
+                    index: 1,
+                },
             },
-        });
+            MemoryOrigin::None,
+        );
         OverflowResult {
             value: result,
             overflow,

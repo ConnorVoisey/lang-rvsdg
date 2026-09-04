@@ -3,6 +3,7 @@ use color_eyre::eyre::eyre;
 use crate::rvsdg::{
     AliasClassId, FuncId, MatchArm, RegionId, State, StateKind, Value, ValueId, ValueKind,
     func::SignatureId,
+    memory_alias::origin::MemoryOrigin,
     types::{ScalarType, TypeRef, VOID},
 };
 
@@ -88,31 +89,65 @@ impl<'a> RegionBuilder<'a> {
         let region = self.region_id;
         self.graph
             .debug_assert_seeds_are_current(region, branch_regions[0]);
-        let gamma_val = self.add_value(Value {
-            ty: TypeRef::Scalar(ScalarType::Void),
-            kind: ValueKind::Gamma {
-                condition,
-                inputs: inputs_span,
-                regions,
+        let gamma_val = self.add_value(
+            Value {
+                ty: TypeRef::Scalar(ScalarType::Void),
+                kind: ValueKind::Gamma {
+                    condition,
+                    inputs: inputs_span,
+                    regions,
+                },
             },
-        });
+            MemoryOrigin::None,
+        );
         for &arm in branch_regions {
             self.graph.get_region_mut(arm).owner = gamma_val;
+        }
+
+        // Pointer-typed arm parameters link to their aligned inputs
+        // now that both exist -- a link, never a copy (the input's own
+        // tag may widen later). Origins for the parameters were pushed
+        // as None at creation; this is the one sanctioned rewrite.
+        for &arm in branch_regions {
+            for (j, &input) in inputs.iter().enumerate() {
+                let param = self.graph.region_params(arm)[j];
+                if matches!(self.graph.get_value_type(param), TypeRef::Ptr(_)) {
+                    self.graph
+                        .set_memory_origin(param, MemoryOrigin::Derived(input));
+                }
+            }
         }
 
         let first_result = ValueId(self.graph.value_kinds.len() as u32);
         let first_region = branch_regions[0];
         for i in 0..result_count {
-            let ty = *self
-                .graph
-                .get_value_type(self.graph.region_results(first_region)[i as usize]);
-            self.add_value(Value {
-                ty,
-                kind: ValueKind::Project {
-                    call: gamma_val,
-                    index: i,
+            // A pointer-typed output projection is a JOIN of the arms'
+            // results: its slot links arm 0's result, every other arm's
+            // result is a join event.
+            let src = self.graph.region_results(first_region)[i as usize];
+            let ty = *self.graph.get_value_type(src);
+            let is_ptr = matches!(ty, TypeRef::Ptr(_));
+            let origin = if is_ptr {
+                MemoryOrigin::Derived(src)
+            } else {
+                MemoryOrigin::None
+            };
+            let projection = self.add_value(
+                Value {
+                    ty,
+                    kind: ValueKind::Project {
+                        call: gamma_val,
+                        index: i,
+                    },
                 },
-            });
+                origin,
+            );
+            if is_ptr {
+                for &arm in &branch_regions[1..] {
+                    let other = self.graph.region_results(arm)[i as usize];
+                    self.graph.record_join_event(projection, other);
+                }
+            }
         }
         self.add_state_projections(gamma_val, result_count);
 
@@ -127,20 +162,26 @@ impl<'a> RegionBuilder<'a> {
     /// subregions' exit tails ([memory, io]). The parent's chains
     /// continue on them.
     fn add_state_projections(&mut self, construct: ValueId, result_count: u16) {
-        let memory = self.add_value(Value {
-            ty: TypeRef::State(StateKind::MemoryWrite(AliasClassId(0))),
-            kind: ValueKind::Project {
-                call: construct,
-                index: result_count,
+        let memory = self.add_value(
+            Value {
+                ty: TypeRef::State(StateKind::MemoryWrite(AliasClassId(0))),
+                kind: ValueKind::Project {
+                    call: construct,
+                    index: result_count,
+                },
             },
-        });
-        let io = self.add_value(Value {
-            ty: TypeRef::State(StateKind::InputOutput),
-            kind: ValueKind::Project {
-                call: construct,
-                index: result_count + 1,
+            MemoryOrigin::None,
+        );
+        let io = self.add_value(
+            Value {
+                ty: TypeRef::State(StateKind::InputOutput),
+                kind: ValueKind::Project {
+                    call: construct,
+                    index: result_count + 1,
+                },
             },
-        });
+            MemoryOrigin::None,
+        );
         self.graph
             .state_construct_outputs(self.region_id, State(memory), State(io));
     }
@@ -163,26 +204,54 @@ impl<'a> RegionBuilder<'a> {
         let region = self.region_id;
         self.graph
             .debug_assert_seeds_are_current(region, body_region);
-        let theta_val = self.add_value(Value {
-            ty: TypeRef::Scalar(ScalarType::Void),
-            kind: ValueKind::Theta {
-                loop_vars: loop_span,
-                condition,
-                region_id: body_region,
+        let theta_val = self.add_value(
+            Value {
+                ty: TypeRef::Scalar(ScalarType::Void),
+                kind: ValueKind::Theta {
+                    loop_vars: loop_span,
+                    condition,
+                    region_id: body_region,
+                },
             },
-        });
+            MemoryOrigin::None,
+        );
         self.graph.get_region_mut(body_region).owner = theta_val;
+
+        // A pointer-typed body parameter joins its initial input and
+        // its own recirculated result: the slot links the initial
+        // input, the recirculation is a join event (resolution handles
+        // the cycle through the parameter).
+        for (j, &initial) in loop_vars.iter().enumerate() {
+            let param = self.graph.region_params(body_region)[j];
+            if matches!(self.graph.get_value_type(param), TypeRef::Ptr(_)) {
+                self.graph
+                    .set_memory_origin(param, MemoryOrigin::Derived(initial));
+                let recirculated = self.graph.region_results(body_region)[j];
+                self.graph.record_join_event(param, recirculated);
+            }
+        }
 
         let first_result = ValueId(self.graph.value_kinds.len() as u32);
         for i in 0..result_count {
+            // A pointer-typed theta output is the body's result for
+            // that slot (theta is tail-controlled: the body always ran).
+            let src = self.graph.region_results(body_region)[i as usize];
             let ty = *self.graph.get_value_type(loop_vars[i as usize]);
-            self.add_value(Value {
-                ty,
-                kind: ValueKind::Project {
-                    call: theta_val,
-                    index: i,
+            let origin = if matches!(ty, TypeRef::Ptr(_)) {
+                MemoryOrigin::Derived(src)
+            } else {
+                MemoryOrigin::None
+            };
+            self.add_value(
+                Value {
+                    ty,
+                    kind: ValueKind::Project {
+                        call: theta_val,
+                        index: i,
+                    },
                 },
-            });
+                origin,
+            );
         }
         self.add_state_projections(theta_val, result_count);
 
@@ -221,15 +290,18 @@ impl<'a> RegionBuilder<'a> {
         alternatives: u32,
     ) -> ValueId {
         let arms_span = self.graph.match_arm_pool.push_slice(arms);
-        self.add_value(Value {
-            ty: TypeRef::Control(alternatives),
-            kind: ValueKind::Match {
-                input,
-                arms: arms_span,
-                default,
-                alternatives,
+        self.add_value(
+            Value {
+                ty: TypeRef::Control(alternatives),
+                kind: ValueKind::Match {
+                    input,
+                    arms: arms_span,
+                    default,
+                    alternatives,
+                },
             },
-        })
+            MemoryOrigin::None,
+        )
     }
 
     /// Control predicate for an LLVM `i1` condition: `true` (1) selects arm 0,
@@ -327,30 +399,47 @@ impl<'a> RegionBuilder<'a> {
         // perform io); the call value is the output state of both.
         let region = self.region_id;
         let io_state = self.graph.state_io_current(region);
-        let out_state = self.graph.state_write(region, |state| Value {
-            ty: TypeRef::Scalar(ScalarType::Void),
-            kind: ValueKind::Call {
-                state,
-                io_state,
-                fn_id,
-                sig,
-                args: args_span,
-            },
+        let out_state = self.graph.state_write(region, |state| {
+            (
+                Value {
+                    ty: TypeRef::Scalar(ScalarType::Void),
+                    kind: ValueKind::Call {
+                        state,
+                        io_state,
+                        fn_id,
+                        sig,
+                        args: args_span,
+                    },
+                },
+                MemoryOrigin::None,
+            )
         });
         let call_val = out_state.0;
         self.graph.state_io(region, call_val);
+        self.graph.record_call_site(call_val);
 
         let first_res = ValueId(self.graph.value_kinds.len() as u32);
         let result_count = self.module_tables.get_function(fn_id).return_types.len() as u16;
         for i in 0..result_count {
             let ty = self.module_tables.get_function(fn_id).return_types[i as usize];
-            self.add_value(Value {
-                ty,
-                kind: ValueKind::Project {
-                    call: call_val,
-                    index: i,
+            // A returned pointer's origin depends on the callee's
+            // return provenance -- interprocedural, so the tag stays
+            // symbolic until classing resolves it through the summary.
+            let origin = if matches!(ty, TypeRef::Ptr(_)) {
+                MemoryOrigin::CallResult(call_val)
+            } else {
+                MemoryOrigin::None
+            };
+            self.add_value(
+                Value {
+                    ty,
+                    kind: ValueKind::Project {
+                        call: call_val,
+                        index: i,
+                    },
                 },
-            });
+                origin,
+            );
         }
 
         NodeResults {
@@ -375,18 +464,29 @@ impl<'a> RegionBuilder<'a> {
 
         let region = self.region_id;
         let io_state = self.graph.state_io_current(region);
-        let out_state = self.graph.state_write(region, |state| Value {
-            ty: TypeRef::Scalar(ScalarType::Void),
-            kind: ValueKind::CallIndirect {
-                state,
-                io_state,
-                callee,
-                sig,
-                args: args_span,
-            },
+        let out_state = self.graph.state_write(region, |state| {
+            (
+                Value {
+                    ty: TypeRef::Scalar(ScalarType::Void),
+                    kind: ValueKind::CallIndirect {
+                        state,
+                        io_state,
+                        callee,
+                        sig,
+                        args: args_span,
+                    },
+                },
+                MemoryOrigin::None,
+            )
         });
         let call_val = out_state.0;
         self.graph.state_io(region, call_val);
+        self.graph.record_call_site(call_val);
+        // Calling through a pointer is an escaping use of the callee
+        // value: a function only ever called indirectly must still be
+        // marked externally callable (its Func origin survives any
+        // derivation to say which one).
+        self.graph.record_escape_event(callee);
 
         let first_res = ValueId(self.graph.value_kinds.len() as u32);
         let ret = self
@@ -396,13 +496,21 @@ impl<'a> RegionBuilder<'a> {
             .ret;
         let result_count = u16::from(ret != VOID);
         for i in 0..result_count {
-            self.add_value(Value {
-                ty: ret,
-                kind: ValueKind::Project {
-                    call: call_val,
-                    index: i,
+            let origin = if matches!(ret, TypeRef::Ptr(_)) {
+                MemoryOrigin::CallResult(call_val)
+            } else {
+                MemoryOrigin::None
+            };
+            self.add_value(
+                Value {
+                    ty: ret,
+                    kind: ValueKind::Project {
+                        call: call_val,
+                        index: i,
+                    },
                 },
-            });
+                origin,
+            );
         }
 
         NodeResults {
